@@ -1,0 +1,28 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Binary output
+bin/
+ai-gateway
+
+# Config (contains API keys)
+config/gateway.json
+
+# Dependencies
+third_party/nlohmann/
+
+# Core dumps
+core
+*.core
+docs/interview-qa.md
