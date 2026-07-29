@@ -62,7 +62,9 @@ int HttpServer::create_listen_socket() {
 
   // SO_REUSEADDR 允许快速重启（避免 TIME_WAIT 阻塞 bind）
   int opt = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    LOG_WARN("setsockopt SO_REUSEADDR failed: {}", std::strerror(errno));
+  }
 
   set_nonblocking(fd);
 
