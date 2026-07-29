@@ -172,7 +172,16 @@ void HttpServer::handle_client(int client_fd) {
   auto req = parse_request(buf, static_cast<size_t>(n));
   if (!req.valid) {
     auto resp = make_bad_request(R"({"error":"Invalid request"})");
-    send(client_fd, resp.data(), resp.size(), MSG_NOSIGNAL);
+    {
+    const char* p = resp.data();
+    size_t remaining = resp.size();
+    while (remaining > 0) {
+      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
+      if (sent <= 0) break;
+      p += sent;
+      remaining -= sent;
+    }
+  }
     return;
   }
 
@@ -180,7 +189,16 @@ void HttpServer::handle_client(int client_fd) {
   if (req.method != "POST") {
     auto resp = make_response(405, "application/json",
                               R"({"error":"Method not allowed"})");
-    send(client_fd, resp.data(), resp.size(), MSG_NOSIGNAL);
+    {
+    const char* p = resp.data();
+    size_t remaining = resp.size();
+    while (remaining > 0) {
+      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
+      if (sent <= 0) break;
+      p += sent;
+      remaining -= sent;
+    }
+  }
     return;
   }
 
@@ -189,14 +207,32 @@ void HttpServer::handle_client(int client_fd) {
   if (!handler) {
     auto resp = make_response(404, "application/json",
                               R"({"error":"Not found"})");
-    send(client_fd, resp.data(), resp.size(), MSG_NOSIGNAL);
+    {
+    const char* p = resp.data();
+    size_t remaining = resp.size();
+    while (remaining > 0) {
+      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
+      if (sent <= 0) break;
+      p += sent;
+      remaining -= sent;
+    }
+  }
     return;
   }
 
   // 调用注册的 handler（由 main.cpp 注入转发逻辑）
   if (!handler_) {
     auto resp = make_service_unavailable(R"({"error":"No handler registered"})");
-    send(client_fd, resp.data(), resp.size(), MSG_NOSIGNAL);
+    {
+    const char* p = resp.data();
+    size_t remaining = resp.size();
+    while (remaining > 0) {
+      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
+      if (sent <= 0) break;
+      p += sent;
+      remaining -= sent;
+    }
+  }
     return;
   }
 
@@ -204,7 +240,16 @@ void HttpServer::handle_client(int client_fd) {
   std::string response_body = (*handler)(request_body);
 
   auto resp = make_ok_json(std::move(response_body));
-  send(client_fd, resp.data(), resp.size(), MSG_NOSIGNAL);
+  {
+    const char* p = resp.data();
+    size_t remaining = resp.size();
+    while (remaining > 0) {
+      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
+      if (sent <= 0) break;
+      p += sent;
+      remaining -= sent;
+    }
+  }
 }
 
 }  // namespace ai_gateway
