@@ -137,7 +137,10 @@ void HttpServer::run() {
 
           ev.events = EPOLLIN | EPOLLET;
           ev.data.fd = client_fd;
-          epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev);
+          if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
+            close(client_fd);
+            continue;
+          }
         }
       } else {
         // ---- 客户端数据 ----
