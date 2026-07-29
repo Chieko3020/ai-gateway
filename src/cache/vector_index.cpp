@@ -158,6 +158,7 @@ bool VectorIndex::save(const std::string& path) const {
   fclose(f);
   return true;
 }
+
 bool VectorIndex::load(const std::string& path) {
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return false;
@@ -174,15 +175,17 @@ bool VectorIndex::load(const std::string& path) {
     ids_.push_back(id);
 
     int32_t key_len;
-    fread(&key_len, sizeof(key_len), 1, f);
+    if (fread(&key_len, sizeof(key_len), 1, f) != 1) break;
+    if (key_len < 0 || key_len > 65536) break;  // 合理性校验
     std::string key(key_len, '\0');
-    fread(key.data(), 1, key_len, f);
+    if (fread(key.data(), 1, key_len, f) != static_cast<size_t>(key_len)) break;
     keys_.push_back(std::move(key));
 
     int32_t dim;
-    fread(&dim, sizeof(dim), 1, f);
+    if (fread(&dim, sizeof(dim), 1, f) != 1) break;
+    if (dim <= 0 || dim > 10000) break;          // 恶意/损坏 dim 防护
     std::vector<float> vec(dim);
-    fread(vec.data(), sizeof(float), dim, f);
+    if (fread(vec.data(), sizeof(float), dim, f) != static_cast<size_t>(dim)) break;
     vecs_.push_back(std::move(vec));
   }
 
