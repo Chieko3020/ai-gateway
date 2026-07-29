@@ -16,6 +16,7 @@
 #include <functional>
 
 #include "common/config.h"
+#include "embedding.h"
 #include "lru_store.h"
 #include "vector_index.h"
 
@@ -25,8 +26,8 @@ class CacheEngine {
  public:
   // 传入配置和依赖组件
   using EmbedFn = std::function<std::vector<float>(
-      const std::string& url, const std::string& key,
-      const std::string& model, const std::string& text,
+      std::string url, std::string key,
+      std::string model, std::string text,
       int timeout)>;
 
   CacheEngine(const EmbeddingConfig& emb_cfg,

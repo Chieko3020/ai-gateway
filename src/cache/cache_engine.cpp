@@ -12,7 +12,8 @@ namespace ai_gateway {
 CacheEngine::CacheEngine(const EmbeddingConfig& emb_cfg,
                          const CacheConfig& cache_cfg,
                          std::shared_ptr<LruStore> store,
-                         std::shared_ptr<VectorIndex> index)
+                         std::shared_ptr<VectorIndex> index,
+                         EmbedFn embed_fn)
     : emb_cfg_(emb_cfg),
       threshold_(cache_cfg.similarity_threshold),
       store_(std::move(store)),
@@ -23,7 +24,7 @@ std::optional<CacheEngine::HitResult> CacheEngine::try_hit(
     const std::string& user_message) {
   // 1. 向量化用户消息
   auto vec = embed_fn_(emb_cfg_.url, emb_cfg_.api_key,
-                           emb_cfg_.model, user_message);
+                           emb_cfg_.model, user_message, 5);
   if (vec.empty()) {
     // 嵌入失败 → 降级为精确匹配（MD5级）
     LOG_WARN("cache: embedding failed, fallback to exact match");
@@ -60,7 +61,7 @@ void CacheEngine::cache_reply(const std::string& user_message,
                                const std::string& reply) {
   // 存储回复 + 关联 embedding 向量
   auto vec = embed_fn_(emb_cfg_.url, emb_cfg_.api_key,
-                           emb_cfg_.model, user_message);
+                           emb_cfg_.model, user_message, 5);
   if (vec.empty()) {
     // embedding 失败时仍缓存回复（精确缓存可用），但不建向量索引
     store_->put(user_message, reply);
