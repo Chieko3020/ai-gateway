@@ -24,12 +24,12 @@ class CurlClient {
 
   // 设置目标 URL
   void set_url(const std::string& url) {
-    curl_easy_setopt(curl_, CURLOPT_URL, url.c_str());
+    if (curl_easy_setopt(curl_, CURLOPT_URL, url.c_str()) != CURLE_OK) return;
   }
 
   // 设置请求体（POST）
   void set_post_body(const std::string& body) {
-    curl_easy_setopt(curl_, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl_, CURLOPT_POST, 1L);  // near-impossible to fail for valid handle
     curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, body.c_str());
     curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE,
                      static_cast<long>(body.size()));
@@ -37,7 +37,7 @@ class CurlClient {
 
   // 设置超时（秒）
   void set_timeout(int seconds) {
-    curl_easy_setopt(curl_, CURLOPT_TIMEOUT, static_cast<long>(seconds));
+    curl_easy_setopt(curl_, CURLOPT_TIMEOUT, static_cast<long>(seconds));  // near-impossible to fail
   }
 
   // 添加 Authorization Bearer 头
