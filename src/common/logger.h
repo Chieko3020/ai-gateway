@@ -61,7 +61,8 @@ void emit(LogLevel lv, std::string_view fmt_str, Args&&... args) {
 }  // namespace ai_gateway
 
 // 用 do-while(0) 确保宏在任何控制流中行为正确
-// __VA_OPT__(,) 在无额外参数时省略逗号，避免 "emit(fmt,)" 语法错误
+// if constexpr 在编译期丢弃 false 分支，包括所有函数参数求值
+// → LOG_DEBUG(expensive()) 在 Release 下零开销
 #define LOG_DEBUG(fmt, ...)                                       \
   do {                                                            \
     if constexpr (::ai_gateway::kActiveLevel <= ::ai_gateway::LogLevel::DEBUG) \
