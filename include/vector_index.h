@@ -2,7 +2,6 @@
 // 内部实现：暴力搜索（线性扫描 AVX2 SIMD 加速）
 // 余弦相似度 = dot(A,B) / (|A| * |B|)
 // 由于存储时向量已归一化，搜索时直接计算内积即可（等价于余弦相似度）
-
 // 线程安全：读写锁保护 add/search/remove，多线程并发读安全。
 // 当前单线程 epoll 模型下安全，多线程需外部加锁。
 #pragma once
@@ -57,7 +56,7 @@ class VectorIndex {
   std::vector<std::string> keys_;
   std::vector<std::vector<float>> vecs_;
   std::unordered_map<int64_t, size_t> id_to_idx_;
-  mutable std::shared_mutex mutex_;  // O(1) 查重/删除
+  mutable std::shared_mutex mutex_;
 };
 
 }  // namespace ai_gateway

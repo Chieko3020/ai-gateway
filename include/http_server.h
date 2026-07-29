@@ -1,8 +1,5 @@
 // HTTP 服务器核心：epoll ET + 非阻塞 IO + 线程池
-//
-// 架构：
-//   主线程 accept + epoll_wait → 提交到线程池 → worker 处理 + send + close
-//
+// 主线程 accept + epoll_wait 提交到线程池 worker 处理 + send + close
 
 #include <atomic>
 #include <functional>
@@ -17,7 +14,7 @@
 #include "thread_pool.h"
 
 // 注意：pool_ 的声明顺序必须在 conn_handler_ 之后（析构顺序相反）
-// pool_ 先析构 → join 所有任务 → 此时 conn_handler_ 仍有效 → [this] 安全
+// pool_ 先析构 join 所有任务 此时 conn_handler_ 仍有效 线程池执行execute任务传入lambda时使用[this]捕获是安全的
 
 namespace ai_gateway {
 
