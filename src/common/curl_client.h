@@ -69,6 +69,7 @@ class CurlClient {
 
   static size_t write_callback(char* ptr, size_t size, size_t nmemb,
                                void* userdata) {
+    if (!userdata) return 0;
     auto* body = static_cast<std::string*>(userdata);
     body->append(ptr, size * nmemb);
     return size * nmemb;
