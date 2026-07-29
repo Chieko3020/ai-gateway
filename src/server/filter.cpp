@@ -1,5 +1,5 @@
 // 安全过滤器实现
-#include "ai-gateway/server/filter.h"
+#include "filter.h"
 
 #include <algorithm>
 #include <regex>

@@ -2,7 +2,7 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
-#include "ai-gateway/server/request.h"
+#include "request.h"
 using namespace ai_gateway;
 
 int main() {

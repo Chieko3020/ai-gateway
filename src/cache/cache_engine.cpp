@@ -1,11 +1,11 @@
 // 缓存协调器实现
-#include "ai-gateway/cache/cache_engine.h"
+#include "cache_engine.h"
 
 #include <cmath>
 #include <format>
 
-#include "ai-gateway/common/logger.h"
-#include "ai-gateway/cache/embedding.h"
+#include "logger.h"
+#include "embedding.h"
 
 namespace ai_gateway {
 

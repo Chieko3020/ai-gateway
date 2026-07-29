@@ -1,7 +1,7 @@
 // 过滤器单元测试
 #include <cassert>
 #include <iostream>
-#include "ai-gateway/server/filter.h"
+#include "filter.h"
 using namespace ai_gateway;
 
 int main() {

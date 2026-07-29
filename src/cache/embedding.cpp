@@ -1,12 +1,12 @@
 // Embedding API 客户端实现
-#include "ai-gateway/cache/embedding.h"
+#include "embedding.h"
 
 #include <nlohmann/json.hpp>
 
 #include <format>
 
-#include "ai-gateway/common/curl_client.h"
-#include "ai-gateway/common/logger.h"
+#include "curl_client.h"
+#include "logger.h"
 
 using json = nlohmann::json;
 

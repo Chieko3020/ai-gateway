@@ -1,7 +1,7 @@
 // Router 路由分发单元测试
 #include <cassert>
 #include <iostream>
-#include "ai-gateway/server/router.h"
+#include "router.h"
 using namespace ai_gateway;
 
 int main() {

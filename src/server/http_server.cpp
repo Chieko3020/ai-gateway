@@ -1,5 +1,5 @@
 // HTTP 服务器核心实现
-#include "ai-gateway/server/http_server.h"
+#include "http_server.h"
 
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -9,8 +9,8 @@
 
 #include <cstring>
 
-#include "ai-gateway/common/logger.h"
-#include "ai-gateway/server/connection_handler.h"
+#include "logger.h"
+#include "connection_handler.h"
 
 namespace ai_gateway {
 

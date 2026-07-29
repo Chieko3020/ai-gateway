@@ -3,7 +3,7 @@
 #include <chrono>
 #include <iostream>
 #include <thread>
-#include "ai-gateway/cache/lru_store.h"
+#include "lru_store.h"
 using namespace ai_gateway;
 
 int main() {

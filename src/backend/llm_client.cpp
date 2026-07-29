@@ -1,10 +1,10 @@
 // LLM API 客户端：转发请求到 OpenAI 兼容后端
-#include "ai-gateway/backend/llm_client.h"
+#include "llm_client.h"
 
 #include <format>
 
-#include "ai-gateway/common/curl_client.h"
-#include "ai-gateway/common/logger.h"
+#include "curl_client.h"
+#include "logger.h"
 
 namespace ai_gateway {
 

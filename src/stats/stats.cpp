@@ -1,9 +1,9 @@
 // 统计模块实现
-#include "ai-gateway/stats/stats.h"
+#include "stats.h"
 
 #include <algorithm>
 
-#include "ai-gateway/common/logger.h"
+#include "logger.h"
 
 namespace ai_gateway {
 
