@@ -47,7 +47,6 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
     if (root.contains("server")) {
       auto& s = root["server"];
       out.server.port = s.value("port", 9000);
-      out.server.thread_pool_size = s.value("thread_pool_size", 4);
     }
 
     // --- backend ---

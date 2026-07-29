@@ -10,7 +10,6 @@ namespace ai_gateway {
 // 服务端配置
 struct ServerConfig {
   int port = 9000;
-  int thread_pool_size = 4;
 };
 
 // LLM 后端配置（OpenAI 兼容）

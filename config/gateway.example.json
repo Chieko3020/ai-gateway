@@ -1,7 +1,6 @@
 {
   "server": {
-    "port": 9000,
-    "thread_pool_size": 4
+    "port": 9000
   },
   "backend": {
     "url": "https://api.deepseek.com/v1/chat/completions",
