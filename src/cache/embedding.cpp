@@ -38,6 +38,10 @@ std::vector<float> get_embedding(const std::string& url,
   long http_code = 0;
   CURLcode res = curl.perform(&http_code);
 
+  if (res != CURLE_OK) {
+    LOG_WARN("embedding: curl error {}", static_cast<int>(res));
+    return {};
+  }
   if (http_code != 200) {
     LOG_WARN("embedding: HTTP {} {}", http_code,
              response_body.size() > 200
