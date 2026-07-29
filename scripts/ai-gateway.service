@@ -1,0 +1,18 @@
+[Unit]
+Description=AI Gateway - LLM Semantic Cache Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ai-gateway
+EnvironmentFile=/home/ubuntu/ai-gateway/config/gateway.env
+ExecStart=/home/ubuntu/ai-gateway/build/src/ai-gateway /home/ubuntu/ai-gateway/config/gateway.json
+Restart=on-failure
+RestartSec=5
+MemoryMax=150M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
