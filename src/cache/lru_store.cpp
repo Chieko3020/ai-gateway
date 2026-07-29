@@ -1,5 +1,5 @@
 // LRU + TTL 缓存存储实现
-#include "lru_store.h"
+#include "ai-gateway/cache/lru_store.h"
 
 #include <algorithm>
 #include <fstream>

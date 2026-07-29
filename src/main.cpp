@@ -10,16 +10,16 @@
 
 #include <nlohmann/json.hpp>
 
-#include "backend/llm_client.h"
-#include "cache/cache_engine.h"
-#include "cache/lru_store.h"
-#include "cache/vector_index.h"
-#include "common/config.h"
-#include "common/logger.h"
-#include "common/types.h"
-#include "server/filter.h"
-#include "server/http_server.h"
-#include "stats/stats.h"
+#include "ai-gateway/backend/llm_client.h"
+#include "ai-gateway/cache/cache_engine.h"
+#include "ai-gateway/cache/lru_store.h"
+#include "ai-gateway/cache/vector_index.h"
+#include "ai-gateway/common/config.h"
+#include "ai-gateway/common/logger.h"
+#include "ai-gateway/common/types.h"
+#include "ai-gateway/server/filter.h"
+#include "ai-gateway/server/http_server.h"
+#include "ai-gateway/stats/stats.h"
 
 using namespace ai_gateway;
 using json = nlohmann::json;

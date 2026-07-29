@@ -1,7 +1,7 @@
 // HTTP 响应构造单元测试
 #include <cassert>
 #include <iostream>
-#include "server/response.h"
+#include "ai-gateway/server/response.h"
 using namespace ai_gateway;
 
 int main() {

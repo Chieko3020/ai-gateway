@@ -1,12 +1,12 @@
 // 配置加载实现：nlohmann/json 解析 + 环境变量读取
-#include "config.h"
+#include "ai-gateway/common/config.h"
 
 #include <cstdlib>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <string>
 
-#include "logger.h"
+#include "ai-gateway/common/logger.h"
 
 using json = nlohmann::json;
 

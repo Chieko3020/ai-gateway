@@ -1,7 +1,7 @@
 // VectorIndex 单元测试
 #include <cassert>
 #include <iostream>
-#include "cache/vector_index.h"
+#include "ai-gateway/cache/vector_index.h"
 using namespace ai_gateway;
 
 int main() {

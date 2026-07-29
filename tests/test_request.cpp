@@ -2,7 +2,7 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
-#include "server/request.h"
+#include "ai-gateway/server/request.h"
 using namespace ai_gateway;
 
 int main() {
@@ -24,7 +24,7 @@ int main() {
     assert(req.header("Content-Type") == "application/json"); ok++;
 
     // GET request (no body)
-    auto get = parse_request("GET /health HTTP/1.1\r\n\r\n", 23);
+    auto get = parse_request("GET /health HTTP/1.1\r\n\r\n", 24);
     assert(get.valid && get.method == "GET"); ok++;
     assert(get.path == "/health"); ok++;
     assert(get.content_length == 0); ok++;
