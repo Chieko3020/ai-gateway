@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 
 namespace ai_gateway {
@@ -27,10 +28,10 @@ class Stats {
   void report() const;
 
   // 基础计数
-  size_t total_requests() const { return total_; }
-  size_t cache_hits() const { return hits_; }
-  size_t cache_misses() const { return misses_; }
-  double hit_rate() const;
+  size_t total_requests() const { std::shared_lock lock(mutex_); return total_; }
+  size_t cache_hits() const { std::shared_lock lock(mutex_); return hits_; }
+  size_t cache_misses() const { std::shared_lock lock(mutex_); return misses_; }
+  double hit_rate() const;  // ODR-used, defined in .cpp
 
   // Token 统计
   int64_t total_prompt_tokens() const { return total_prompt_tokens_; }
@@ -46,7 +47,7 @@ class Stats {
   int64_t max_latency_ms() const { return max_latency_; }
 
  private:
-  mutable std::mutex mutex_;
+  mutable std::shared_mutex mutex_;
   size_t total_ = 0;
   size_t hits_ = 0;
   size_t misses_ = 0;
