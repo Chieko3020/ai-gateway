@@ -1,4 +1,4 @@
-// 网关入口：加载配置 → 初始化各模块 → 启动 HTTP 服务
+// 网关入口：加载配置 初始化各模块 启动 HTTP 服务
 
 #include <chrono>
 #include <csignal>
@@ -46,7 +46,7 @@ void handle_signal(int /*sig*/) {
   g_shutdown.store(true, std::memory_order_release);
 }
 
-// 请求处理管道：过滤 → 缓存 → LLM → 统计 → 过滤
+// 请求处理管道：过滤 + 缓存 + LLM + 统计 + 过滤
 static std::string handle_request(const std::string& request_body,
                                    const GatewayConfig& cfg,
                                    MessageFilter* filter,
@@ -81,7 +81,7 @@ static std::string handle_request(const std::string& request_body,
     cached_embedding = std::move(hit.embedding);
   }
 
-  // 4c. 缓存未命中 → 转发 LLM
+  // 4c. 缓存未命中 转发 LLM
   auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
                          request_body, cfg.backend.timeout_seconds);
 
@@ -133,7 +133,7 @@ int main(int argc, char* argv[]) {
     return static_cast<int>(ErrorCode::kConfigError);
   }
 
-  // ---- 2. 初始化模块（全部由 config 驱动）----
+  // ---- 2. 初始化模块 ----
   auto lru = std::make_shared<LruStore>(cfg.cache.max_entries,
                                         cfg.cache.ttl_days * 86400);
   auto idx = std::make_shared<VectorIndex>();

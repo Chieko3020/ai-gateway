@@ -34,9 +34,9 @@ class Stats {
   double hit_rate() const;  // ODR-used, defined in .cpp
 
   // Token 统计
-  int64_t total_prompt_tokens() const { return total_prompt_tokens_; }
-  int64_t total_completion_tokens() const { return total_completion_tokens_; }
-  int64_t total_tokens_saved() const { return tokens_saved_; }
+  int64_t total_prompt_tokens() const;
+  int64_t total_completion_tokens() const;
+  int64_t total_tokens_saved() const;
 
   // 费用估算
   double estimated_cost() const;
@@ -44,7 +44,7 @@ class Stats {
 
   // 延迟统计
   int64_t avg_latency_ms() const;
-  int64_t max_latency_ms() const { return max_latency_; }
+  int64_t max_latency_ms() const;
 
  private:
   mutable std::shared_mutex mutex_;

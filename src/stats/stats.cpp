@@ -69,4 +69,24 @@ double Stats::estimated_saved() const {
   return tokens_saved_ * kCostPer1KTokens / 1000.0;
 }
 
+int64_t Stats::total_prompt_tokens() const {
+  std::shared_lock lock(mutex_);
+  return total_prompt_tokens_;
+}
+
+int64_t Stats::total_completion_tokens() const {
+  std::shared_lock lock(mutex_);
+  return total_completion_tokens_;
+}
+
+int64_t Stats::total_tokens_saved() const {
+  std::shared_lock lock(mutex_);
+  return tokens_saved_;
+}
+
+int64_t Stats::max_latency_ms() const {
+  std::shared_lock lock(mutex_);
+  return max_latency_;
+}
+
 }  // namespace ai_gateway
