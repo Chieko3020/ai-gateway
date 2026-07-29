@@ -56,6 +56,7 @@ class CurlClient {
 
   // 执行请求，返回 HTTP 状态码；CURLE_OK 时 http_code 有效
   CURLcode perform(long* http_code) {
+    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers_);
     CURLcode res = curl_easy_perform(curl_);
     if (res == CURLE_OK && http_code) {
       curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, http_code);
