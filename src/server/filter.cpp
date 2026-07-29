@@ -97,12 +97,14 @@ bool MessageFilter::contains_injection(std::string_view text) {
       "DAN mode",
       "jailbreak",
   };
-  // 转小写后匹配
-  std::string lower(text);
-  std::transform(lower.begin(), lower.end(), lower.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
+  // 逐字符大小写不敏感匹配（避免堆分配）
   for (auto& p : patterns) {
-    if (lower.find(p) != std::string::npos) return true;
+    auto it = std::search(
+        text.begin(), text.end(), p.begin(), p.end(),
+        [](unsigned char a, unsigned char b) {
+          return std::tolower(a) == std::tolower(b);
+        });
+    if (it != text.end()) return true;
   }
   return false;
 }
