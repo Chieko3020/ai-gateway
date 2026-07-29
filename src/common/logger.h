@@ -1,6 +1,5 @@
-// 极简日志宏：零依赖，stderr 输出，NDEBUG 切除 DEBUG
-//
-// 设计决策：不使用 std::vlog + make_format_args（右值引用问题在宏中难以处理）
+// stderr 输出，NDEBUG 切除 DEBUG
+// 不使用 std::vlog + make_format_args（右值引用问题在宏中难以处理）
 // 改为 try-catch 包裹 std::format，异常时回退到 raw 输出
 #pragma once
 
@@ -63,7 +62,7 @@ void emit(LogLevel lv, std::string_view fmt_str, Args&&... args) {
 
 // 用 do-while(0) 确保宏在任何控制流中行为正确
 // if constexpr 在编译期丢弃 false 分支，包括所有函数参数求值
-// → LOG_DEBUG(expensive()) 在 Release 下零开销
+// LOG_DEBUG(expensive()) 在 Release 下零开销
 #define LOG_DEBUG(fmt, ...)                                       \
   do {                                                            \
     if constexpr (::ai_gateway::kActiveLevel <= ::ai_gateway::LogLevel::DEBUG) \

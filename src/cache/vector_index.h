@@ -1,6 +1,5 @@
-// 向量索引：存储 embedding 向量 + 支持 Top-K 余弦相似度搜索
-//
-// 内部实现：暴力搜索（线性扫描 + AVX2 SIMD 加速）——零外部依赖
+// 向量索引：存储 embedding 向量 支持 Top-K 余弦相似度搜索
+// 内部实现：暴力搜索（线性扫描 AVX2 SIMD 加速）
 // 余弦相似度 = dot(A,B) / (|A| * |B|)
 // 由于存储时向量已归一化，搜索时直接计算内积即可（等价于余弦相似度）
 #pragma once
@@ -9,13 +8,14 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ai_gateway {
 
 struct SearchResult {
   std::string key;       // 对应的缓存 key
-  float similarity = 0;  // 余弦相似度 [0, 1]
+  float similarity = 0;  // 余弦相似度 闭区间[0, 1]
 };
 
 class VectorIndex {
@@ -52,6 +52,7 @@ class VectorIndex {
   std::vector<int64_t> ids_;
   std::vector<std::string> keys_;
   std::vector<std::vector<float>> vecs_;
+  std::unordered_map<int64_t, size_t> id_to_idx_;  // O(1) 查重/删除
 };
 
 }  // namespace ai_gateway

@@ -1,4 +1,4 @@
-// HTTP 请求解析实现：手工解析 HTTP/1.1 请求行 + 头部 + 正文
+// HTTP 请求解析 HTTP/1.1 请求行 + 头部 + 正文
 #include "request.h"
 
 #include <charconv>
@@ -42,7 +42,7 @@ ParsedRequest parse_request(const char* raw_data, size_t len) {
     std::string_view line = data.substr(pos, eol - pos);
     pos = eol + 2;
 
-    // 空行 → 头部结束
+    // 空行表示头部结束
     if (line.empty()) break;
 
     auto colon = line.find(':');
@@ -68,7 +68,7 @@ ParsedRequest parse_request(const char* raw_data, size_t len) {
 
   if (req.content_length > 0) {
     if (pos + req.content_length > len) {
-      req.valid = false;  // 声明长度与实际不符 → 拒绝
+      req.valid = false;  // 声明长度与实际不符直接拒绝
       return req;
     }
     req.body = data.substr(pos, req.content_length);

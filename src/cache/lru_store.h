@@ -34,8 +34,8 @@ class LruStore {
   std::optional<std::string> get(const std::string& key);
 
   // 存入缓存（不含 embedding）：
-  //   key 已存在 → 移动到头部 + 更新 value
-  //   key 不存在 → 插入头部；若超出 max_entries 则淘汰尾部
+  //   key 已存在 移动到头部 + 更新 value
+  //   key 不存在 插入头部；若超出 max_entries 则淘汰尾部
   void put(const std::string& key, std::string value);
 
   // 存入缓存 + embedding 向量
@@ -70,7 +70,7 @@ class LruStore {
   // 淘汰过期条目（get 未命中时调用）
   void expire_one(const std::string& key);
 
-  using Clock = std::chrono::system_clock;      // 系统时钟：epoch 可跨重启持久化
+  using Clock = std::chrono::system_clock;      // 系统时钟 （epoch 持久化）
 
   using TimePoint = Clock::time_point;
 

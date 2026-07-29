@@ -1,4 +1,4 @@
-// URL 路由：将 HTTP path → handler 映射
+// URL 路由：将 HTTP path 转 handler 映射
 #pragma once
 
 #include <functional>
@@ -8,7 +8,7 @@
 
 namespace ai_gateway {
 
-// 请求头（method, path）→ 是否匹配 + 对应 handler
+// 请求头（method, path） 是否匹配 + 对应 handler
 class Router {
  public:
   using Handler = std::function<std::string(const std::string& body)>;

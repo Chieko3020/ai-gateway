@@ -35,7 +35,7 @@ std::optional<std::string> LruStore::get(const std::string& key) {
     }
   }
 
-  // 命中 → 移动到 LRU 头部
+  // 命中则移动到 LRU 头部
   lru_.splice(lru_.begin(), lru_, it->second);
   ++hit_count_;
   return node.value;
@@ -52,7 +52,7 @@ void LruStore::put_with_embedding(const std::string& key,
 
   auto it = iter_map_.find(key);
   if (it != iter_map_.end()) {
-    // 已存在 → 更新 + 移到头部
+    // 已存在 更新并移到头部
     auto& node = *(it->second);
     node.value = std::move(value);
     node.embedding.data = std::move(embedding);
@@ -61,7 +61,7 @@ void LruStore::put_with_embedding(const std::string& key,
     return;
   }
 
-  // 容量控制：超出限制时淘汰尾部（最久未用）
+  // LRU淘汰 超出限制时淘汰尾部（最久未用）
   if (max_entries_ > 0 && lru_.size() >= max_entries_) {
     auto& back = lru_.back();
     iter_map_.erase(back.key);
@@ -110,7 +110,7 @@ size_t LruStore::size() const {
 }
 
 void LruStore::expire_one(const std::string& key) {
-  // 调用者已持有 mutex
+  // 调用者已持有 mutex 不需要重复上锁
   auto it = iter_map_.find(key);
   if (it == iter_map_.end()) return;
   lru_.erase(it->second);

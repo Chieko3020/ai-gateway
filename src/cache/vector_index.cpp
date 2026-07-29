@@ -22,6 +22,7 @@ float VectorIndex::dot_product(const std::vector<float>& a,
   size_t i = 0;
 
 #ifdef __AVX2__
+  // 一次处理8个floats，使用FMA指令加速内积计算
   // 8 floats per iteration
   __m256 vsum = _mm256_setzero_ps();
   for (; i + 8 <= n; i += 8) {
@@ -37,6 +38,7 @@ float VectorIndex::dot_product(const std::vector<float>& a,
   sum128 = _mm_hadd_ps(sum128, sum128);
   sum += _mm_cvtss_f32(sum128);
 
+// cpu兼容
 #elif defined(__SSE4_1__)
   // 4 floats per iteration
   __m128 vsum = _mm_setzero_ps();
@@ -53,7 +55,7 @@ float VectorIndex::dot_product(const std::vector<float>& a,
   sum += _mm_cvtss_f32(sums);
 #endif
 
-  // Remainder: scalar
+  // 余数scalar标量计算
   for (; i < n; ++i) {
     sum += pa[i] * pb[i];
   }
@@ -62,14 +64,13 @@ float VectorIndex::dot_product(const std::vector<float>& a,
 
 void VectorIndex::add(int64_t id, const std::string& key,
                        const std::vector<float>& vec) {
-  // 覆盖已存在的 id
-  for (size_t i = 0; i < ids_.size(); ++i) {
-    if (ids_[i] == id) {
-      keys_[i] = key;
-      vecs_[i] = vec;
-      return;
-    }
+  auto it = id_to_idx_.find(id);
+  if (it != id_to_idx_.end()) {
+    keys_[it->second] = key;
+    vecs_[it->second] = vec;
+    return;
   }
+  id_to_idx_[id] = ids_.size();
   ids_.push_back(id);
   keys_.push_back(key);
   vecs_.push_back(vec);
@@ -79,7 +80,7 @@ std::vector<SearchResult> VectorIndex::search(
     const std::vector<float>& query, int k) const {
   if (vecs_.empty()) return {};
 
-  // 用最小堆维护 Top-K：堆顶是第 K 大的最小值
+  // 用最小堆维护 Top-K 堆顶是第 K 大的最小值
   using Item = std::pair<float, size_t>;  // (similarity, index)
   auto cmp = [](const Item& a, const Item& b) { return a.first > b.first; };
   std::priority_queue<Item, std::vector<Item>, decltype(cmp)> heap(cmp);
@@ -107,18 +108,21 @@ std::vector<SearchResult> VectorIndex::search(
 }
 
 void VectorIndex::remove(int64_t id) {
-  for (size_t i = 0; i < ids_.size(); ++i) {
-    if (ids_[i] == id) {
-      // 与末尾交换后 pop（O(1) 删除）
-      ids_[i] = ids_.back();
-      keys_[i] = keys_.back();
-      vecs_[i] = vecs_.back();
-      ids_.pop_back();
-      keys_.pop_back();
-      vecs_.pop_back();
-      return;
-    }
+  auto it = id_to_idx_.find(id);
+  if (it == id_to_idx_.end()) return;
+  size_t idx = it->second;
+  // 与末尾交换后 pop（O(1) 删除），更新被交换元素的映射
+  size_t last = ids_.size() - 1;
+  if (idx != last) {
+    ids_[idx] = ids_[last];
+    keys_[idx] = std::move(keys_[last]);
+    vecs_[idx] = std::move(vecs_[last]);
+    id_to_idx_[ids_[idx]] = idx;
   }
+  ids_.pop_back();
+  keys_.pop_back();
+  vecs_.pop_back();
+  id_to_idx_.erase(it);
 }
 
 void VectorIndex::for_each(
@@ -166,7 +170,7 @@ bool VectorIndex::load(const std::string& path) {
   int64_t count = 0;
   if (fread(&count, sizeof(count), 1, f) != 1) { fclose(f); return false; }
 
-  ids_.clear(); keys_.clear(); vecs_.clear();
+  ids_.clear(); keys_.clear(); vecs_.clear(); id_to_idx_.clear();
   ids_.reserve(count); keys_.reserve(count); vecs_.reserve(count);
 
   for (int64_t i = 0; i < count; ++i) {
@@ -180,6 +184,7 @@ bool VectorIndex::load(const std::string& path) {
     std::string key(key_len, '\0');
     if (fread(key.data(), 1, key_len, f) != static_cast<size_t>(key_len)) break;
     keys_.push_back(std::move(key));
+    id_to_idx_[id] = ids_.size() - 1;
 
     int32_t dim;
     if (fread(&dim, sizeof(dim), 1, f) != 1) break;

@@ -7,7 +7,7 @@
 
 namespace ai_gateway {
 
-// 解析结果——轻量级，不拥有数据（数据在原始缓冲区中）
+// 解析结果 不拥有数据（数据在原始缓冲区中）
 struct ParsedRequest {
   std::string_view method;
   std::string_view path;
