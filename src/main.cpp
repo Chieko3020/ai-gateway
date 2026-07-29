@@ -146,8 +146,11 @@ int main(int argc, char* argv[]) {
     LOG_INFO("cache restored: {} entries, {} vectors", lru->size(), idx->size());
   }
 
-  signal(SIGINT, handle_signal);
-  signal(SIGTERM, handle_signal);
+  struct sigaction sa{};
+  sa.sa_handler = handle_signal;
+  sa.sa_flags = SA_RESTART;
+  sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
 
   // ---- 3. 启动定期统计线程 ----
   std::thread stats_thread([stats] {
