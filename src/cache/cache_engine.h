@@ -42,12 +42,14 @@ class CacheEngine {
   struct HitResult {
     std::string reply;
     float similarity = 0.0f;
+    std::vector<float> embedding;  // 未命中时带回 embedding，避免 cache_reply 重复计算
   };
   std::optional<HitResult> try_hit(const std::string& user_message);
 
-  // 将 LLM 回复存入缓存（供未命中后使用）
+  // 将 LLM 回复存入缓存，传入已计算的 embedding 向量（避免重复 API 调用）
   void cache_reply(const std::string& user_message,
-                   const std::string& reply);
+                   const std::string& reply,
+                   const std::vector<float>& cached_embedding);
 
   // 从 LruStore 重建向量索引（缓存恢复后调用）
   void rebuild_index();

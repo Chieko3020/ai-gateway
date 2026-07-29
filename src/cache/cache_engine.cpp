@@ -54,30 +54,27 @@ std::optional<CacheEngine::HitResult> CacheEngine::try_hit(
   LOG_INFO("cache: MISS top_sim={:.3f} threshold={:.3f}",
            results.empty() ? 0.0f : results[0].similarity,
            threshold_);
-  return std::nullopt;
+  HitResult miss;
+  miss.embedding = std::move(vec);  // 带回 embedding，避免 cache_reply 重复计算
+  return miss;
 }
 
 void CacheEngine::cache_reply(const std::string& user_message,
-                               const std::string& reply) {
-  // 存储回复 + 关联 embedding 向量
-  auto vec = embed_fn_(emb_cfg_.url, emb_cfg_.api_key,
-                           emb_cfg_.model, user_message, 5);
-  if (vec.empty()) {
-    // embedding 失败时仍缓存回复（精确缓存可用），但不建向量索引
+                               const std::string& reply,
+                               const std::vector<float>& cached_embedding) {
+  if (cached_embedding.empty()) {
+    // 无 embedding 时仍缓存回复（精确缓存可用）
     store_->put(user_message, reply);
-    LOG_WARN("cache: embedding failed, cached without vector for: {}...",
-             user_message.substr(0, 30));
     return;
   }
 
-  // 生成唯一 key（用 message hash 避免 key 碰撞）
   auto key = std::format("msg:{}", next_id_);
   ++next_id_;
 
-  store_->put_with_embedding(key, reply, vec);
-  index_->add(next_id_ - 1, key, vec);
+  store_->put_with_embedding(key, reply, cached_embedding);
+  index_->add(next_id_ - 1, key, cached_embedding);
 
-  LOG_DEBUG("cache: stored key={} dims={}", key, vec.size());
+  LOG_DEBUG("cache: stored key={} dims={}", key, cached_embedding.size());
 }
 
 void CacheEngine::rebuild_index() {

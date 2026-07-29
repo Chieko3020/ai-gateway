@@ -54,6 +54,9 @@ static std::string handle_request(const std::string& request_body,
                                    Stats* stats) {
   auto t0 = std::chrono::steady_clock::now();
 
+  // 缓存命中检查时带回的 embedding（避免 cache_reply 重复计算）
+  std::vector<float> cached_embedding;
+
   // 4a. 输入过滤
   std::string user_msg = extract_user_message(request_body);
   if (!user_msg.empty()) {
@@ -66,15 +69,18 @@ static std::string handle_request(const std::string& request_body,
       user_msg = f_result.sanitized;
   }
 
-  // 4b. 语义缓存（embedding 失败时自动降级为精确匹配）
+  // 4b. 语义缓存
   if (cfg.cache.enabled && !user_msg.empty()) {
     auto hit = engine->try_hit(user_msg);
-    if (hit.has_value()) {
+    if (hit.has_value() && !hit->reply.empty()) {
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - t0);
       stats->record_cache_hit(elapsed.count());
       return hit->reply;
     }
+    // 未命中 → 记录 embedding 供后续 cache_reply 使用
+    cached_embedding = hit.has_value() ? std::move(hit->embedding)
+                                        : std::vector<float>{};
   }
 
   // 4c. 缓存未命中 → 转发 LLM
@@ -99,7 +105,7 @@ static std::string handle_request(const std::string& request_body,
   // 4e. 写入缓存
   bool ok = (result.status_code >= 200 && result.status_code < 300);
   if (ok && cfg.cache.enabled && !user_msg.empty())
-    engine->cache_reply(user_msg, result.body);
+    engine->cache_reply(user_msg, result.body, cached_embedding);
 
   // 4f. 统计
   stats->record_api_call(elapsed.count(), prompt_tokens, completion_tokens);

@@ -23,7 +23,7 @@ std::vector<float> get_embedding(const std::string& url,
     LOG_ERROR("embedding: curl_easy_init failed");
     return {};
   }
-
+  // 构造请求 JSON
   json req_body;
   req_body["model"] = model;
   req_body["input"] = text;
@@ -49,7 +49,7 @@ std::vector<float> get_embedding(const std::string& url,
                  : response_body);
     return {};
   }
-
+  // 解析 JSON 响应 提取 embedding 向量
   try {
     auto resp = json::parse(response_body);
     auto& data = resp.at("data");
