@@ -16,6 +16,9 @@
 #include "router.h"
 #include "thread_pool.h"
 
+// 注意：pool_ 的声明顺序必须在 conn_handler_ 之后（析构顺序相反）
+// pool_ 先析构 → join 所有任务 → 此时 conn_handler_ 仍有效 → [this] 安全
+
 namespace ai_gateway {
 
 // 请求处理器签名：接收请求体 JSON，返回响应体 JSON

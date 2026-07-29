@@ -150,10 +150,12 @@ void HttpServer::stop() {
 void HttpServer::handle_client(int client_fd) {
   char buf[kBufSize];
   ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
-  if (n <= 0) return;
+  if (n <= 0) {
+    close(client_fd);  // recv 失败/连接关闭，释放 fd
+    return;
+  }
   buf[n] = '\0';
 
-  // 拷贝数据，提交到线程池处理（lambda 中捕获 shared_ptr<ConnectionHandler> 延长生命周期）
   std::string request(buf, n);
   pool_.execute([this, client_fd, req = std::move(request), n] {
     auto result = conn_handler_.process(req.data(), n);
