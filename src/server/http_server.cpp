@@ -32,7 +32,11 @@ constexpr size_t kBufSize = 65536;  // 64KB 缓冲区，足够大多数 HTTP 请
 HttpServer::HttpServer(const ServerConfig& config)
     : config_(config) {}
 
-HttpServer::~HttpServer() { stop(); }
+HttpServer::~HttpServer() {
+  stop();
+  if (listen_fd_ >= 0) close(listen_fd_);
+  if (epoll_fd_ >= 0) close(epoll_fd_);
+}
 
 void HttpServer::set_handler(RequestHandler handler) {
   handler_ = std::move(handler);
