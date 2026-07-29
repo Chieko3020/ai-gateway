@@ -72,15 +72,13 @@ static std::string handle_request(const std::string& request_body,
   // 4b. 语义缓存
   if (cfg.cache.enabled && !user_msg.empty()) {
     auto hit = engine->try_hit(user_msg);
-    if (hit.has_value() && !hit->reply.empty()) {
+    if (hit.hit) {
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - t0);
       stats->record_cache_hit(elapsed.count());
-      return hit->reply;
+      return hit.reply;
     }
-    // 未命中 → 记录 embedding 供后续 cache_reply 使用
-    cached_embedding = hit.has_value() ? std::move(hit->embedding)
-                                        : std::vector<float>{};
+    cached_embedding = std::move(hit.embedding);
   }
 
   // 4c. 缓存未命中 → 转发 LLM

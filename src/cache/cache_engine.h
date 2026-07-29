@@ -38,13 +38,15 @@ class CacheEngine {
 
   // 尝试从缓存中获取回复
   // user_message: 用户最新一条消息文本
-  // 返回 (缓存的 LLM 回复, 相似度)；未命中返回 nullopt
+  // 返回命中结果：hit=true 表示找到缓存，hit=false 表示未命中
+  // 未命中时 embedding 字段带回已计算的向量（避免 cache_reply 重复调用 API）
   struct HitResult {
+    bool hit = false;
     std::string reply;
     float similarity = 0.0f;
-    std::vector<float> embedding;  // 未命中时带回 embedding，避免 cache_reply 重复计算
+    std::vector<float> embedding;
   };
-  std::optional<HitResult> try_hit(const std::string& user_message);
+  HitResult try_hit(const std::string& user_message);
 
   // 将 LLM 回复存入缓存，传入已计算的 embedding 向量（避免重复 API 调用）
   void cache_reply(const std::string& user_message,
