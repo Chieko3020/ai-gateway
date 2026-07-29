@@ -65,7 +65,11 @@ ParsedRequest parse_request(const char* raw_data, size_t len) {
                     req.content_length);
   }
 
-  if (req.content_length > 0 && pos + req.content_length <= len) {
+  if (req.content_length > 0) {
+    if (pos + req.content_length > len) {
+      req.valid = false;  // 声明长度与实际不符 → 拒绝
+      return req;
+    }
     req.body = data.substr(pos, req.content_length);
   }
 
