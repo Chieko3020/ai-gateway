@@ -39,10 +39,84 @@ static std::string extract_user_message(const std::string& request_body) {
   return "";
 }
 
+// Thread-safe shutdown flag
 static std::atomic<bool> g_shutdown{false};
 
 void handle_signal(int /*sig*/) {
   g_shutdown.store(true, std::memory_order_release);
+}
+
+// 请求处理管道：过滤 → 缓存 → LLM → 统计 → 过滤
+static std::string handle_request(const std::string& request_body,
+                                   const GatewayConfig& cfg,
+                                   MessageFilter* filter,
+                                   CacheEngine* engine,
+                                   Stats* stats) {
+  auto t0 = std::chrono::steady_clock::now();
+
+  // 4a. 输入过滤
+  std::string user_msg = extract_user_message(request_body);
+  if (!user_msg.empty()) {
+    auto f_result = filter->check_input(user_msg);
+    if (f_result.action == FilterAction::kReject) {
+      LOG_WARN("filter: rejected input: {}", f_result.reject_msg);
+      return R"({"error":"Request rejected"})";
+    }
+    if (f_result.action == FilterAction::kTruncate)
+      user_msg = f_result.sanitized;
+  }
+
+  // 4b. 语义缓存（embedding 失败时自动降级为精确匹配）
+  if (cfg.cache.enabled && !user_msg.empty()) {
+    auto hit = engine->try_hit(user_msg);
+    if (hit.has_value()) {
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - t0);
+      stats->record_cache_hit(elapsed.count());
+      return hit->reply;
+    }
+  }
+
+  // 4c. 缓存未命中 → 转发 LLM
+  auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
+                         cfg.backend.model, request_body,
+                         cfg.backend.timeout_seconds);
+
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0);
+
+  // 4d. 解析 token 用量
+  int prompt_tokens = 0, completion_tokens = 0;
+  if (result.status_code >= 200 && result.status_code < 300) {
+    try {
+      auto resp = json::parse(result.body);
+      auto& usage = resp.at("usage");
+      prompt_tokens = usage.value("prompt_tokens", 0);
+      completion_tokens = usage.value("completion_tokens", 0);
+    } catch (...) {}
+  }
+
+  // 4e. 写入缓存
+  bool ok = (result.status_code >= 200 && result.status_code < 300);
+  if (ok && cfg.cache.enabled && !user_msg.empty())
+    engine->cache_reply(user_msg, result.body);
+
+  // 4f. 统计
+  stats->record_api_call(elapsed.count(), prompt_tokens, completion_tokens);
+
+  if (ok)
+    LOG_INFO("{} {} {}ms", result.status_code, result.body.size(), elapsed.count());
+  else
+    LOG_WARN("{} {} {}ms", result.status_code,
+             result.body.size() > 0 ? result.body : "(empty)", elapsed.count());
+
+  // 输出过滤
+  auto out_result = filter->check_output(result.body);
+  if (out_result.action == FilterAction::kReject) {
+    LOG_WARN("filter: rejected output containing URL");
+    return R"({"error":"Response filtered"})";
+  }
+  return out_result.sanitized;
 }
 
 int main(int argc, char* argv[]) {
@@ -68,7 +142,7 @@ int main(int argc, char* argv[]) {
   if (cfg.cache.enabled) {
     lru->load("cache/lru_store.json");
     idx->load("cache/vector_index.bin");
-    engine->rebuild_index();  // 从 lru_store 重建向量索引
+    engine->rebuild_index();
     LOG_INFO("cache restored: {} entries, {} vectors", lru->size(), idx->size());
   }
 
@@ -87,72 +161,8 @@ int main(int argc, char* argv[]) {
   HttpServer server(cfg.server);
   g_shutdown.store(false, std::memory_order_release);
 
-  server.set_handler([&](const std::string& request_body) -> std::string {
-    auto t0 = std::chrono::steady_clock::now();
-
-    // 4a. 输入过滤
-    std::string user_msg = extract_user_message(request_body);
-    if (!user_msg.empty()) {
-      auto f_result = filter->check_input(user_msg);
-      if (f_result.action == FilterAction::kReject) {
-        LOG_WARN("filter: rejected input: {}", f_result.reject_msg);
-        return R"({"error":"Request rejected"})";
-      }
-      if (f_result.action == FilterAction::kTruncate)
-        user_msg = f_result.sanitized;
-    }
-
-    // 4b. 语义缓存（embedding 失败时自动降级为精确匹配）
-    if (cfg.cache.enabled && !user_msg.empty()) {
-      auto hit = engine->try_hit(user_msg);
-      if (hit.has_value()) {
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t0);
-        stats->record_cache_hit(elapsed.count());
-        return hit->reply;
-      }
-    }
-
-    // 4c. 缓存未命中 → 转发 LLM
-    auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
-                           cfg.backend.model, request_body,
-                           cfg.backend.timeout_seconds);
-
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - t0);
-
-    // 4d. 解析 token 用量
-    int prompt_tokens = 0, completion_tokens = 0;
-    if (result.status_code >= 200 && result.status_code < 300) {
-      try {
-        auto resp = json::parse(result.body);
-        auto& usage = resp.at("usage");
-        prompt_tokens = usage.value("prompt_tokens", 0);
-        completion_tokens = usage.value("completion_tokens", 0);
-      } catch (...) {}
-    }
-
-    // 4e. 写入缓存
-    bool ok = (result.status_code >= 200 && result.status_code < 300);
-    if (ok && cfg.cache.enabled && !user_msg.empty())
-      engine->cache_reply(user_msg, result.body);
-
-    // 4f. 统计
-    stats->record_api_call(elapsed.count(), prompt_tokens, completion_tokens);
-
-    if (ok)
-      LOG_INFO("{} {} {}ms", result.status_code, result.body.size(), elapsed.count());
-    else
-      LOG_WARN("{} {} {}ms", result.status_code,
-               result.body.size() > 0 ? result.body : "(empty)", elapsed.count());
-
-    // 输出过滤
-    auto out_result = filter->check_output(result.body);
-    if (out_result.action == FilterAction::kReject) {
-      LOG_WARN("filter: rejected output containing URL");
-      return R"({"error":"Response filtered"})";
-    }
-    return out_result.sanitized;
+  server.set_handler([&](const std::string& body) {
+    return handle_request(body, cfg, filter.get(), engine.get(), stats.get());
   });
 
   // ---- 5. 启动 ----
@@ -169,7 +179,8 @@ int main(int argc, char* argv[]) {
     LOG_INFO("cache persisted: {} entries, {} vectors", lru->size(), idx->size());
   }
   LOG_INFO("cache hits={} misses={} hit_rate={:.1f}%",
-           engine->hit_count(), engine->miss_count(), engine->hit_rate() * 100);
+           stats->cache_hits(), stats->cache_misses(),
+           stats->hit_rate() * 100);
   LOG_INFO("ai-gateway stopped");
   return 0;
 }
