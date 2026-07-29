@@ -70,7 +70,8 @@ class LruStore {
   // 淘汰过期条目（get 未命中时调用）
   void expire_one(const std::string& key);
 
-  using Clock = std::chrono::steady_clock;
+  using Clock = std::chrono::system_clock;      // 系统时钟：epoch 可跨重启持久化
+
   using TimePoint = Clock::time_point;
 
   struct Node {

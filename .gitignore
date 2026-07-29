@@ -42,3 +42,4 @@ __pycache__/
 core
 *.core
 docs/interview-qa.md
+docs/ARCHITECTURE_REVIEW.md
