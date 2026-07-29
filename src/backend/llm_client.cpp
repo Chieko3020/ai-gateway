@@ -10,7 +10,6 @@ namespace ai_gateway {
 
 LlmResponse call_llm(const std::string& url,
                      const std::string& api_key,
-                     const std::string& model,
                      const std::string& request_body,
                      int timeout_seconds) {
   LlmResponse result;

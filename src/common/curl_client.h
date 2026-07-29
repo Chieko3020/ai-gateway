@@ -1,4 +1,5 @@
-// Curl HTTP 客户端基类：消除 llm_client 和 embedding 的重复代码
+// Curl HTTP 客户端基类
+// 把 libcurl 的 C API 包装成 RAII + 链式调用
 #pragma once
 
 #include <curl/curl.h>

@@ -83,8 +83,7 @@ static std::string handle_request(const std::string& request_body,
 
   // 4c. 缓存未命中 → 转发 LLM
   auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
-                         cfg.backend.model, request_body,
-                         cfg.backend.timeout_seconds);
+                         request_body, cfg.backend.timeout_seconds);
 
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t0);
