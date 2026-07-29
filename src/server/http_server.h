@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "common/config.h"
+#include "connection_handler.h"
 #include "router.h"
 
 namespace ai_gateway {
@@ -59,8 +60,8 @@ class HttpServer {
   int listen_fd_ = -1;
   int epoll_fd_ = -1;
   std::atomic<bool> running_{false};
-  RequestHandler handler_;
   Router router_;
+  ConnectionHandler conn_handler_{router_};
 };
 
 }  // namespace ai_gateway

@@ -14,6 +14,7 @@ add_library(ai_gateway_server STATIC
     server/response.cpp
     server/filter.cpp
     server/router.cpp
+    server/connection_handler.cpp
 )
 target_include_directories(ai_gateway_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ai_gateway_server PUBLIC ai_gateway_common)

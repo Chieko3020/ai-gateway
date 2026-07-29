@@ -17,6 +17,7 @@
 
 #include "common/logger.h"
 #include "common/types.h"
+#include "connection_handler.h"
 #include "request.h"
 #include "response.h"
 #include "router.h"
@@ -39,8 +40,7 @@ HttpServer::~HttpServer() {
 }
 
 void HttpServer::set_handler(RequestHandler handler) {
-  handler_ = std::move(handler);
-  router_.add("/v1/chat/completions", handler_);
+  router_.add("/v1/chat/completions", std::move(handler));
 }
 
 void HttpServer::add_route(std::string_view path, RequestHandler handler) {
@@ -160,95 +160,20 @@ void HttpServer::stop() {
 }
 
 void HttpServer::handle_client(int client_fd) {
-  // Phase 1 简化实现：一次读 + 一次写
-  // 假设请求足够小，一次 recv 能读完
-  // TODO(Phase2): 改为循环读取直到 EAGAIN，处理大请求和分片到达
-
   char buf[kBufSize];
   ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
   if (n <= 0) return;
   buf[n] = '\0';
 
-  auto req = parse_request(buf, static_cast<size_t>(n));
-  if (!req.valid) {
-    auto resp = make_bad_request(R"({"error":"Invalid request"})");
-    {
-    const char* p = resp.data();
-    size_t remaining = resp.size();
-    while (remaining > 0) {
-      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
-      if (sent <= 0) break;
-      p += sent;
-      remaining -= sent;
-    }
-  }
-    return;
-  }
+  auto result = conn_handler_.process(buf, static_cast<size_t>(n));
 
-  // 仅允许 POST 方法（OpenAI 兼容 API）
-  if (req.method != "POST") {
-    auto resp = make_response(405, "application/json",
-                              R"({"error":"Method not allowed"})");
-    {
-    const char* p = resp.data();
-    size_t remaining = resp.size();
-    while (remaining > 0) {
-      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
-      if (sent <= 0) break;
-      p += sent;
-      remaining -= sent;
-    }
-  }
-    return;
-  }
-
-  // 使用 Router 查找处理器
-  auto* handler = router_.find("POST", req.path);
-  if (!handler) {
-    auto resp = make_response(404, "application/json",
-                              R"({"error":"Not found"})");
-    {
-    const char* p = resp.data();
-    size_t remaining = resp.size();
-    while (remaining > 0) {
-      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
-      if (sent <= 0) break;
-      p += sent;
-      remaining -= sent;
-    }
-  }
-    return;
-  }
-
-  // 调用注册的 handler（由 main.cpp 注入转发逻辑）
-  if (!handler_) {
-    auto resp = make_service_unavailable(R"({"error":"No handler registered"})");
-    {
-    const char* p = resp.data();
-    size_t remaining = resp.size();
-    while (remaining > 0) {
-      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
-      if (sent <= 0) break;
-      p += sent;
-      remaining -= sent;
-    }
-  }
-    return;
-  }
-
-  std::string request_body(req.body);
-  std::string response_body = (*handler)(request_body);
-
-  auto resp = make_ok_json(std::move(response_body));
-  {
-    const char* p = resp.data();
-    size_t remaining = resp.size();
-    while (remaining > 0) {
-      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
-      if (sent <= 0) break;
-      p += sent;
-      remaining -= sent;
-    }
+  const char* p = result.response.data();
+  size_t remaining = result.response.size();
+  while (remaining > 0) {
+    ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
+    if (sent <= 0) break;
+    p += sent;
+    remaining -= sent;
   }
 }
 
