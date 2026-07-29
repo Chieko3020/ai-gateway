@@ -30,7 +30,8 @@ inline std::string timestamp() {
   const auto now = std::chrono::system_clock::now();
   const auto t = std::chrono::system_clock::to_time_t(now);
   char buf[20]{};
-  std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&t));
+  struct tm tm_buf{};
+  std::strftime(buf, sizeof(buf), "%H:%M:%S", localtime_r(&t, &tm_buf));
   return buf;
 }
 
