@@ -49,6 +49,7 @@ void HttpServer::add_route(std::string_view path, RequestHandler handler) {
 
 void HttpServer::set_nonblocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return;
   fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 

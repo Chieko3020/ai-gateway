@@ -43,3 +43,4 @@ core
 *.core
 docs/interview-qa.md
 docs/ARCHITECTURE_REVIEW.md
+docs/code-review-findings.md
