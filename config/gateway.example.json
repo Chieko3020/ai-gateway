@@ -1,0 +1,18 @@
+{
+  "server": {
+    "port": 9000,
+    "thread_pool_size": 4
+  },
+  "backend": {
+    "url": "https://api.deepseek.com/v1/chat/completions",
+    "api_key_env": "LLM_API_KEY",
+    "model": "deepseek-v4-flash",
+    "timeout_seconds": 60
+  },
+  "embedding": {
+    "url": "https://api.siliconflow.cn/v1/embeddings",
+    "api_key_env": "LLM_API_KEY",
+    "model": "BAAI/bge-large-zh-v1.5",
+    "_note": "DeepSeek 无公开 Embedding API；推荐硅基流动(免费额度)或 OpenAI text-embedding-3-small"
+  }
+}
