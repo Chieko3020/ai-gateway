@@ -50,7 +50,7 @@ int HttpServer::create_listen_socket() {
     return -1;
   }
 
-  // SO_REUSEADDR 允许快速重启（避免 TIME_WAIT 阻塞 bind）
+  // SO_REUSEADDR
   int opt = 1;
   if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
     LOG_WARN("setsockopt SO_REUSEADDR failed: {}", std::strerror(errno));
