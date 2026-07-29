@@ -1,12 +1,12 @@
-// HTTP 服务器核心：epoll ET + 非阻塞 IO + 线程池
+// HTTP 服务器核心：epoll ET + 非阻塞 IO，主线程同步处理
 //
 // 架构：
-//   主线程 accept + epoll_wait 收事件 → 线程池处理业务逻辑
+//   主线程 accept + epoll_wait → 委托 ConnectionHandler 处理 → send 响应
 //
 // 设计决策：
-//   - 使用 ET 模式减少 epoll 事件通知次数
-//   - 线程池和 epoll 在同一线程模型下配合（主线程负责 IO，工作线程负责处理）
-//   - 不使用 Boost/Muduo：复用 HttpFramework 已验证的架构，保持零重依赖
+//   - ET 模式减少事件通知次数
+//   - 低并发场景主线程同步处理，零线程开销
+//   - 不使用 Boost/Muduo：保持零重依赖
 #pragma once
 
 #include <atomic>

@@ -1,4 +1,4 @@
-// 连接处理器：解析 → 路由 → 处理 → 响应（从 HttpServer 分离）
+// 连接处理器：解析 路由 处理 响应
 #pragma once
 
 #include <string>
