@@ -19,6 +19,7 @@
 #include "common/types.h"
 #include "request.h"
 #include "response.h"
+#include "router.h"
 
 namespace ai_gateway {
 
@@ -35,6 +36,11 @@ HttpServer::~HttpServer() { stop(); }
 
 void HttpServer::set_handler(RequestHandler handler) {
   handler_ = std::move(handler);
+  router_.add("/v1/chat/completions", handler_);
+}
+
+void HttpServer::add_route(std::string_view path, RequestHandler handler) {
+  router_.add(path, std::move(handler));
 }
 
 void HttpServer::set_nonblocking(int fd) {
@@ -92,16 +98,7 @@ void HttpServer::run() {
   ev.data.fd = listen_fd_;
   epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev);
 
-  // 启动工作线程
-  running_ = true;
-  for (int i = 0; i < config_.thread_pool_size; ++i) {
-    workers_.emplace_back([this] {
-      // Phase 1 中工作线程暂不参与请求处理
-      // 所有请求在主线程中同步处理（低并发场景足够）
-      // Phase 2+ 可改为线程池异步处理
-    });
-  }
-
+  running_ = true;  // 工作线程已移除，但标志位仍需设置
   epoll_event events[kMaxEvents];
 
   while (running_) {
@@ -150,10 +147,6 @@ void HttpServer::run() {
 
 void HttpServer::stop() {
   running_ = false;
-  for (auto& t : workers_) {
-    if (t.joinable()) t.join();
-  }
-  workers_.clear();
 }
 
 void HttpServer::handle_client(int client_fd) {
@@ -181,8 +174,9 @@ void HttpServer::handle_client(int client_fd) {
     return;
   }
 
-  // 仅接受 /v1/chat/completions
-  if (req.path != "/v1/chat/completions") {
+  // 使用 Router 查找处理器
+  auto* handler = router_.find("POST", req.path);
+  if (!handler) {
     auto resp = make_response(404, "application/json",
                               R"({"error":"Not found"})");
     send(client_fd, resp.data(), resp.size(), MSG_NOSIGNAL);
@@ -197,7 +191,7 @@ void HttpServer::handle_client(int client_fd) {
   }
 
   std::string request_body(req.body);
-  std::string response_body = handler_(request_body);
+  std::string response_body = (*handler)(request_body);
 
   auto resp = make_ok_json(std::move(response_body));
   send(client_fd, resp.data(), resp.size(), MSG_NOSIGNAL);

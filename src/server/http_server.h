@@ -9,13 +9,15 @@
 //   - 不使用 Boost/Muduo：复用 HttpFramework 已验证的架构，保持零重依赖
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
-#include <thread>
+#include <string_view>
 #include <vector>
 
 #include "common/config.h"
+#include "router.h"
 
 namespace ai_gateway {
 
@@ -31,8 +33,11 @@ class HttpServer {
   HttpServer(const HttpServer&) = delete;
   HttpServer& operator=(const HttpServer&) = delete;
 
-  // 注册请求处理函数
+  // 注册路由处理器（默认注册到 POST /v1/chat/completions）
   void set_handler(RequestHandler handler);
+
+  // 注册自定义路由
+  void add_route(std::string_view path, RequestHandler handler);
 
   // 启动服务（阻塞当前线程直到 stop() 被调用）
   void run();
@@ -53,9 +58,9 @@ class HttpServer {
   ServerConfig config_;
   int listen_fd_ = -1;
   int epoll_fd_ = -1;
+  std::atomic<bool> running_{false};
   RequestHandler handler_;
-  std::vector<std::thread> workers_;
-  bool running_ = false;
+  Router router_;
 };
 
 }  // namespace ai_gateway
