@@ -1,7 +1,7 @@
-// HTTP 服务器核心：epoll ET + 非阻塞 IO，主线程同步处理
+// HTTP 服务器核心：epoll ET + 非阻塞 IO + 线程池
 //
 // 架构：
-//   主线程 accept + epoll_wait + ConnectionHandler 处理数据 + send 响应
+//   主线程 accept + epoll_wait → 提交到线程池 → worker 处理 + send + close
 //
 
 #include <atomic>

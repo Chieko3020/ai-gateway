@@ -133,7 +133,7 @@ void HttpServer::run() {
           }
         }
       } else {
-        // ---- 客户端数据 → 提交到线程池处理 ----
+        // ---- 客户端数据提交到线程池处理 ----
         handle_client(fd);
       }
     }

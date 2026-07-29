@@ -16,6 +16,7 @@ class ThreadPool {
  public:
   explicit ThreadPool(size_t num_threads = 0) {
     if (num_threads == 0) {
+      // 线程数为硬件cpu并发数，如果无法获取则默认为 2
       num_threads = std::thread::hardware_concurrency();
       if (num_threads == 0) num_threads = 2;
     }
