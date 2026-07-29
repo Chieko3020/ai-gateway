@@ -1,10 +1,11 @@
 // 缓存协调器：语义缓存的核心编排引擎
 //
 // 判断流程：
-//   1. 接收 user message → 调用 embedding API → 得到向量
-//   2. vector_index.search → Top-K 相似条目
-//   3. max(similarity) ≥ threshold？→ 命中：返回 lru_store 中的缓存回复
-//   4. 未命中 → 返回 nullopt，由上层转发 LLM 后将结果 + 向量存入缓存
+//   1. 接收 user message 调用 embedding API 得到向量
+//   2. vector_index.search 得到 Top-K 相似条目
+//   3. max(similarity) ≥ threshold？
+//      命中返回 lru_store 中的缓存回复
+//      未命中返回 nullopt，由上层转发 LLM 后将结果 + 向量存入缓存
 #pragma once
 
 #include <cstdint>

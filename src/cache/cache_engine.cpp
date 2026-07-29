@@ -26,7 +26,7 @@ CacheEngine::HitResult CacheEngine::try_hit(
   auto vec = embed_fn_(emb_cfg_.url, emb_cfg_.api_key,
                            emb_cfg_.model, user_message, 5);
   if (vec.empty()) {
-    // 嵌入失败 → 降级为精确匹配
+    // 嵌入失败 降级为精确匹配
     LOG_WARN("cache: embedding failed, fallback to exact match");
     auto exact = store_->get(user_message);
     if (exact.has_value()) {
@@ -50,7 +50,7 @@ CacheEngine::HitResult CacheEngine::try_hit(
     }
   }
 
-  // 4. 未命中 — 带回 embedding 避免 cache_reply 重复计算
+  // 4. 未命中 带回 embedding 避免 cache_reply 重复计算
   LOG_INFO("cache: MISS top_sim={:.3f} threshold={:.3f}",
            results.empty() ? 0.0f : results[0].similarity,
            threshold_);
