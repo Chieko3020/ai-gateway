@@ -40,13 +40,8 @@ class CacheEngine {
   void cache_reply(const std::string& user_message,
                    const std::string& reply);
 
-  // 从 lru_store 重建 vector_index（启动恢复 / 缓存逐出后同步）
+  // 从 LruStore 重建向量索引（缓存恢复后调用）
   void rebuild_index();
-
-  // 统计
-  size_t hit_count() const { return hit_count_; }
-  size_t miss_count() const { return miss_count_; }
-  double hit_rate() const;
 
   // 配置访问
   float threshold() const { return threshold_; }
@@ -59,11 +54,7 @@ class CacheEngine {
 
   float threshold_ = 0.0f;  // 由 CacheConfig 注入
   int top_k_ = 3;
-
-  int64_t next_id_ = 1;  // 自增 ID，用于 vector_index 映射
-
-  size_t hit_count_ = 0;
-  size_t miss_count_ = 0;
+  int64_t next_id_ = 1;
 };
 
 }  // namespace ai_gateway

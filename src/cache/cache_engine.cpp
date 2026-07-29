@@ -29,10 +29,8 @@ std::optional<CacheEngine::HitResult> CacheEngine::try_hit(
     auto exact = store_->get(user_message);
     if (exact.has_value()) {
       LOG_INFO("cache: HIT (exact)");
-      ++hit_count_;
       return HitResult{std::move(exact.value()), 1.0f};
     }
-    ++miss_count_;
     return std::nullopt;
   }
 
@@ -45,8 +43,6 @@ std::optional<CacheEngine::HitResult> CacheEngine::try_hit(
       auto cached = store_->get(r.key);
       if (cached.has_value()) {
         LOG_INFO("cache: HIT key={} sim={:.3f}", r.key, r.similarity);
-        ++hit_count_;
-        // get() 已将条目移至 LRU 头部
         return HitResult{std::move(cached.value()), r.similarity};
       }
     }
@@ -56,7 +52,6 @@ std::optional<CacheEngine::HitResult> CacheEngine::try_hit(
   LOG_INFO("cache: MISS top_sim={:.3f} threshold={:.3f}",
            results.empty() ? 0.0f : results[0].similarity,
            threshold_);
-  ++miss_count_;
   return std::nullopt;
 }
 
@@ -105,11 +100,6 @@ void CacheEngine::rebuild_index() {
   next_id_ = new_id;
 
   LOG_INFO("cache: index rebuilt, {} vectors", index_->size());
-}
-
-double CacheEngine::hit_rate() const {
-  auto total = hit_count_ + miss_count_;
-  return total > 0 ? static_cast<double>(hit_count_) / total : 0.0;
 }
 
 }  // namespace ai_gateway
