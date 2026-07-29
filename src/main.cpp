@@ -39,11 +39,10 @@ static std::string extract_user_message(const std::string& request_body) {
   return "";
 }
 
-HttpServer* g_server = nullptr;
+static std::atomic<bool> g_shutdown{false};
 
-void handle_signal(int sig) {
-  LOG_INFO("received signal {}, shutting down...", sig);
-  if (g_server) g_server->stop();
+void handle_signal(int /*sig*/) {
+  g_shutdown.store(true, std::memory_order_release);
 }
 
 int main(int argc, char* argv[]) {
@@ -78,7 +77,7 @@ int main(int argc, char* argv[]) {
 
   // ---- 3. 启动定期统计线程 ----
   std::thread stats_thread([stats] {
-    while (g_server) {  // g_server 为 nullptr 时退出
+    while (!g_shutdown.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(60s);
       stats->report();
     }
@@ -86,7 +85,7 @@ int main(int argc, char* argv[]) {
 
   // ---- 4. 构建 HTTP 服务 + 注册处理器 ----
   HttpServer server(cfg.server);
-  g_server = &server;
+  g_shutdown.store(false, std::memory_order_release);
 
   server.set_handler([&](const std::string& request_body) -> std::string {
     auto t0 = std::chrono::steady_clock::now();
@@ -161,7 +160,7 @@ int main(int argc, char* argv[]) {
   server.run();
 
   // ---- 6. 清理：保存缓存 + 统计 ----
-  g_server = nullptr;
+  g_shutdown.store(true, std::memory_order_release);
   if (stats_thread.joinable()) stats_thread.join();
   stats->report();
   if (cfg.cache.enabled) {
