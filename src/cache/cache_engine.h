@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include <functional>
+
 #include "common/config.h"
 #include "lru_store.h"
 #include "vector_index.h"
@@ -22,10 +24,16 @@ namespace ai_gateway {
 class CacheEngine {
  public:
   // 传入配置和依赖组件
+  using EmbedFn = std::function<std::vector<float>(
+      const std::string& url, const std::string& key,
+      const std::string& model, const std::string& text,
+      int timeout)>;
+
   CacheEngine(const EmbeddingConfig& emb_cfg,
               const CacheConfig& cache_cfg,
               std::shared_ptr<LruStore> store,
-              std::shared_ptr<VectorIndex> index);
+              std::shared_ptr<VectorIndex> index,
+              EmbedFn embed_fn = get_embedding);
 
   // 尝试从缓存中获取回复
   // user_message: 用户最新一条消息文本
@@ -52,6 +60,7 @@ class CacheEngine {
   std::shared_ptr<LruStore> store_;
   std::shared_ptr<VectorIndex> index_;
 
+  EmbedFn embed_fn_;
   float threshold_ = 0.0f;  // 由 CacheConfig 注入
   int top_k_ = 3;
   int64_t next_id_ = 1;

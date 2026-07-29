@@ -16,12 +16,13 @@ CacheEngine::CacheEngine(const EmbeddingConfig& emb_cfg,
     : emb_cfg_(emb_cfg),
       threshold_(cache_cfg.similarity_threshold),
       store_(std::move(store)),
-      index_(std::move(index)) {}
+      index_(std::move(index)),
+      embed_fn_(std::move(embed_fn)) {}
 
 std::optional<CacheEngine::HitResult> CacheEngine::try_hit(
     const std::string& user_message) {
   // 1. 向量化用户消息
-  auto vec = get_embedding(emb_cfg_.url, emb_cfg_.api_key,
+  auto vec = embed_fn_(emb_cfg_.url, emb_cfg_.api_key,
                            emb_cfg_.model, user_message);
   if (vec.empty()) {
     // 嵌入失败 → 降级为精确匹配（MD5级）
@@ -58,7 +59,7 @@ std::optional<CacheEngine::HitResult> CacheEngine::try_hit(
 void CacheEngine::cache_reply(const std::string& user_message,
                                const std::string& reply) {
   // 存储回复 + 关联 embedding 向量
-  auto vec = get_embedding(emb_cfg_.url, emb_cfg_.api_key,
+  auto vec = embed_fn_(emb_cfg_.url, emb_cfg_.api_key,
                            emb_cfg_.model, user_message);
   if (vec.empty()) {
     // embedding 失败时仍缓存回复（精确缓存可用），但不建向量索引
