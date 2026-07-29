@@ -61,8 +61,9 @@ ParsedRequest parse_request(const char* raw_data, size_t len) {
   // 读取 Content-Length 决定正文大小
   auto cl_str = req.header("Content-Length");
   if (!cl_str.empty()) {
-    std::from_chars(cl_str.data(), cl_str.data() + cl_str.size(),
-                    req.content_length);
+    auto [ptr, ec] = std::from_chars(cl_str.data(), cl_str.data() + cl_str.size(),
+                                   req.content_length);
+    if (ec != std::errc()) req.content_length = 0;
   }
 
   if (req.content_length > 0) {
