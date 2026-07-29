@@ -14,6 +14,7 @@
 #include "config.h"
 #include "connection_handler.h"
 #include "router.h"
+#include "thread_pool.h"
 
 namespace ai_gateway {
 
@@ -57,6 +58,7 @@ class HttpServer {
   std::atomic<bool> running_{false};
   Router router_;
   ConnectionHandler conn_handler_{router_};
+  ThreadPool pool_{4};  // 单 reactor + 线程池架构
 };
 
 }  // namespace ai_gateway

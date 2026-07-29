@@ -3,13 +3,14 @@
 // 余弦相似度 = dot(A,B) / (|A| * |B|)
 // 由于存储时向量已归一化，搜索时直接计算内积即可（等价于余弦相似度）
 
-// 线程安全：无线程同步，依赖调用方（CacheEngine）保证串行访问。
+// 线程安全：读写锁保护 add/search/remove，多线程并发读安全。
 // 当前单线程 epoll 模型下安全，多线程需外部加锁。
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -55,7 +56,8 @@ class VectorIndex {
   std::vector<int64_t> ids_;
   std::vector<std::string> keys_;
   std::vector<std::vector<float>> vecs_;
-  std::unordered_map<int64_t, size_t> id_to_idx_;  // O(1) 查重/删除
+  std::unordered_map<int64_t, size_t> id_to_idx_;
+  mutable std::shared_mutex mutex_;  // O(1) 查重/删除
 };
 
 }  // namespace ai_gateway

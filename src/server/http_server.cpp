@@ -133,10 +133,8 @@ void HttpServer::run() {
           }
         }
       } else {
-        // ---- 客户端数据 ----
+        // ---- 客户端数据 → 提交到线程池处理 ----
         handle_client(fd);
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-        close(fd);
       }
     }
   }
@@ -155,16 +153,20 @@ void HttpServer::handle_client(int client_fd) {
   if (n <= 0) return;
   buf[n] = '\0';
 
-  auto result = conn_handler_.process(buf, static_cast<size_t>(n));
-
-  const char* p = result.response.data();
-  size_t remaining = result.response.size();
-  while (remaining > 0) {
-    ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
-    if (sent <= 0) break;
-    p += sent;
-    remaining -= sent;
-  }
+  // 拷贝数据，提交到线程池处理（lambda 中捕获 shared_ptr<ConnectionHandler> 延长生命周期）
+  std::string request(buf, n);
+  pool_.execute([this, client_fd, req = std::move(request), n] {
+    auto result = conn_handler_.process(req.data(), n);
+    const char* p = result.response.data();
+    size_t remaining = result.response.size();
+    while (remaining > 0) {
+      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
+      if (sent <= 0) break;
+      p += sent;
+      remaining -= sent;
+    }
+    close(client_fd);
+  });
 }
 
 }  // namespace ai_gateway
