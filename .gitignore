@@ -19,8 +19,24 @@ ai-gateway
 # Config (contains API keys)
 config/gateway.json
 
+# Model files (downloaded separately — too large for git)
+bge-small-zh-v1.5/
+bge-small-zh-v1.5-onnx/
+hfd.sh
+
+# Cache persistence files
+cache/lru_store.json
+cache/vector_index.bin
+
 # Dependencies
-third_party/nlohmann/
+third_party/
+
+# Python
+__pycache__/
+*.pyc
+
+# Specstory
+.specstory/
 
 # Core dumps
 core
