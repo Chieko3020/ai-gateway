@@ -136,25 +136,28 @@ bool VectorIndex::save(const std::string& path) const {
   if (!f) return false;
 
   int64_t count = static_cast<int64_t>(ids_.size());
-  fwrite(&count, sizeof(count), 1, f);
+  if (fwrite(&count, sizeof(count), 1, f) != 1) { fclose(f); return false; }
 
   for (size_t i = 0; i < ids_.size(); ++i) {
     int64_t id = ids_[i];
-    fwrite(&id, sizeof(id), 1, f);
+    if (fwrite(&id, sizeof(id), 1, f) != 1) { fclose(f); return false; }
 
     int32_t key_len = static_cast<int32_t>(keys_[i].size());
-    fwrite(&key_len, sizeof(key_len), 1, f);
-    fwrite(keys_[i].data(), 1, key_len, f);
+    if (fwrite(&key_len, sizeof(key_len), 1, f) != 1) { fclose(f); return false; }
+    if (fwrite(keys_[i].data(), 1, key_len, f) != static_cast<size_t>(key_len)) {
+      fclose(f); return false;
+    }
 
     int32_t dim = static_cast<int32_t>(vecs_[i].size());
-    fwrite(&dim, sizeof(dim), 1, f);
-    fwrite(vecs_[i].data(), sizeof(float), dim, f);
+    if (fwrite(&dim, sizeof(dim), 1, f) != 1) { fclose(f); return false; }
+    if (fwrite(vecs_[i].data(), sizeof(float), dim, f) != static_cast<size_t>(dim)) {
+      fclose(f); return false;
+    }
   }
 
   fclose(f);
   return true;
 }
-
 bool VectorIndex::load(const std::string& path) {
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return false;
