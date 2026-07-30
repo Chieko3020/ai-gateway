@@ -18,6 +18,7 @@ ai-gateway
 
 # Config (contains API keys)
 config/gateway.json
+config/gateway.env
 
 # Model files (downloaded separately — too large for git)
 bge-small-zh-v1.5/
@@ -41,6 +42,4 @@ __pycache__/
 # Core dumps
 core
 *.core
-docs/interview-qa.md
-docs/ARCHITECTURE_REVIEW.md
-docs/code-review-findings.md
+docs/
