@@ -152,14 +152,20 @@ void HttpServer::handle_client(int client_fd) {
   ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
   buf[n] = '\0';
 
-  // Non-blocking socket may require multiple recv() calls to assemble
-  // a complete HTTP request (TCP segmentation). Do one more recv with
-  // a short timeout to collect trailing data.
+  // Non-blocking socket may deliver TCP segments out of order.
+  // Temporarily set blocking with timeout to collect trailing packets.
   {
-    struct timeval tv = {0, 100000};  // 100ms
+    int flags = fcntl(client_fd, F_GETFL, 0);
+    fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);  // switch to blocking
+    struct timeval tv = {0, 200000};  // 200ms
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ssize_t n2 = recv(client_fd, buf + n, sizeof(buf) - 1 - n, 0);
-    if (n2 > 0) { n += n2; buf[n] = '\0'; }
+    for (int retry = 0; retry < 3; ++retry) {
+      ssize_t n2 = recv(client_fd, buf + n, sizeof(buf) - 1 - n, 0);
+      if (n2 <= 0) break;
+      n += n2;
+      buf[n] = '\0';
+    }
+    fcntl(client_fd, F_SETFL, flags);  // restore non-blocking
   }
   std::string request(buf, n);
   pool_.execute([this, client_fd, req = std::move(request), n] {
