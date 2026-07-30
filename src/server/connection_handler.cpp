@@ -11,9 +11,7 @@ ConnectionResult ConnectionHandler::process(const char* raw_data,
   ConnectionResult result;
 
   // 1. 解析 HTTP 请求
-  LOG_INFO("http raw_len={} cl_pos={}", len, std::string_view(raw_data, len).find("Content-Length"));
   auto req = parse_request(raw_data, len);
-  LOG_INFO("http parsed valid={} cl={} body_len={}", req.valid, req.content_length, req.body.size());
   if (!req.valid) {
     result.response = make_bad_request(R"({"error":"Invalid request"})");
     return result;

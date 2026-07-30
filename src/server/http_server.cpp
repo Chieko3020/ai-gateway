@@ -150,12 +150,17 @@ void HttpServer::stop() {
 void HttpServer::handle_client(int client_fd) {
   char buf[kBufSize];
   ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
-  if (n <= 0) {
-    close(client_fd);  // recv 失败/连接关闭，释放 fd
-    return;
-  }
   buf[n] = '\0';
 
+  // Non-blocking socket may require multiple recv() calls to assemble
+  // a complete HTTP request (TCP segmentation). Do one more recv with
+  // a short timeout to collect trailing data.
+  {
+    struct timeval tv = {0, 100000};  // 100ms
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ssize_t n2 = recv(client_fd, buf + n, sizeof(buf) - 1 - n, 0);
+    if (n2 > 0) { n += n2; buf[n] = '\0'; }
+  }
   std::string request(buf, n);
   pool_.execute([this, client_fd, req = std::move(request), n] {
     auto result = conn_handler_.process(req.data(), n);
