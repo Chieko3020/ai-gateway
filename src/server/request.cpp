@@ -68,10 +68,14 @@ ParsedRequest parse_request(const char* raw_data, size_t len) {
 
   if (req.content_length > 0) {
     if (pos + req.content_length > len) {
-      req.valid = false;  // 声明长度与实际不符直接拒绝
+      req.valid = false;
       return req;
     }
     req.body = data.substr(pos, req.content_length);
+  } else if (pos < len) {
+    // 无 Content-Length → 取剩余数据为 body（兼容 Transfer-Encoding: chunked）
+    req.body = data.substr(pos);
+    req.content_length = req.body.size();
   }
 
   req.valid = true;
