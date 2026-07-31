@@ -1,9 +1,10 @@
 # Module libraries — include/ai-gateway/ 方案
 set(INCLUDE_ROOT ${CMAKE_SOURCE_DIR}/include)
 
-# Common (logger, config, types, curl_client)
+# Common (logger, config, types, curl_client, log_file)
 add_library(ai_gateway_common STATIC
     common/config.cpp
+    common/log_file.cpp
 )
 target_include_directories(ai_gateway_common PUBLIC ${INCLUDE_ROOT})
 target_link_libraries(ai_gateway_common PUBLIC nlohmann_json::nlohmann_json)
@@ -27,15 +28,17 @@ add_library(ai_gateway_backend STATIC
 target_include_directories(ai_gateway_backend PUBLIC ${INCLUDE_ROOT})
 target_link_libraries(ai_gateway_backend PUBLIC ai_gateway_common CURL::libcurl)
 
-# Cache (lru_store, embedding, vector_index, cache_engine)
+# Cache (lru_store, embedding, vector_index, cache_engine, onnx_embedding)
 add_library(ai_gateway_cache STATIC
     cache/lru_store.cpp
     cache/embedding.cpp
     cache/vector_index.cpp
     cache/cache_engine.cpp
+    cache/onnx_embedding.cpp
 )
 target_include_directories(ai_gateway_cache PUBLIC ${INCLUDE_ROOT})
-target_link_libraries(ai_gateway_cache PUBLIC ai_gateway_common CURL::libcurl nlohmann_json::nlohmann_json)
+target_link_libraries(ai_gateway_cache PUBLIC ai_gateway_common CURL::libcurl nlohmann_json::nlohmann_json
+    onnxruntime)
 
 # Stats
 add_library(ai_gateway_stats STATIC
