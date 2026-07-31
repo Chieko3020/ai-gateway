@@ -21,8 +21,6 @@ config/gateway.json
 config/gateway.env
 
 # Model files (downloaded separately — too large for git)
-bge-small-zh-v1.5/
-bge-small-zh-v1.5-onnx/
 hfd.sh
 
 # Cache persistence files
@@ -43,3 +41,6 @@ __pycache__/
 core
 *.core
 docs/
+gateway.log
+bge-small-zh-v1.5/
+bge-small-zh-v1.5-onnx/
