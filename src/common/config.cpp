@@ -1,12 +1,12 @@
 // 配置加载实现：nlohmann/json 解析 + 环境变量读取
-#include "config.h"
+#include "common/config.h"
 
 #include <cstdlib>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <string>
 
-#include "logger.h"
+#include "common/logger.h"
 
 using json = nlohmann::json;
 
@@ -82,6 +82,7 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       out.filter.max_output_chars = f.value("max_output_chars", 600);
       out.filter.block_urls = f.value("block_urls", true);
       if (f.contains("blocked_keywords") && f["blocked_keywords"].is_array()) {
+        out.filter.blocked_keywords.clear();  // 防止重复 load 累加
         for (auto& kw : f["blocked_keywords"]) {
           out.filter.blocked_keywords.push_back(kw.get<std::string>());
         }
