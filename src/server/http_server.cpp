@@ -173,17 +173,17 @@ void HttpServer::handle_client(int client_fd) {
   char buf[kBufSize];
   ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
   if (n <= 0) {
-    // recv error or client disconnected — nothing to process
+    // recv 错误或客户端断开 无需处理
     close(client_fd);
     return;
   }
   buf[n] = '\0';
 
-  // Non-blocking socket may deliver TCP segments out of order.
-  // Temporarily set blocking with timeout to collect trailing packets.
+  // 非阻塞 socket 可能收到乱序 TCP 分段
+  // 临时切换阻塞模式并设置超时以收集后续数据包
   {
     int flags = fcntl(client_fd, F_GETFL, 0);
-    fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);  // switch to blocking
+    fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);  // 切换为阻塞模式
     struct timeval tv = {0, 200000};  // 200ms
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     for (int retry = 0; retry < 3; ++retry) {
@@ -192,7 +192,7 @@ void HttpServer::handle_client(int client_fd) {
       n += n2;
       buf[n] = '\0';
     }
-    fcntl(client_fd, F_SETFL, flags);  // restore non-blocking
+    fcntl(client_fd, F_SETFL, flags);  // 恢复非阻塞
   }
   std::string request(buf, n);
   pool_.execute([this, client_fd, req = std::move(request), n] {

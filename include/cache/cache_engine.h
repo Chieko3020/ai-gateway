@@ -18,7 +18,6 @@
 #include <functional>
 
 #include "common/config.h"
-#include "cache/embedding.h"
 #include "cache/lru_store.h"
 #include "cache/hnsw_index.h"
 
@@ -36,7 +35,7 @@ class CacheEngine {
               const CacheConfig& cache_cfg,
               std::shared_ptr<LruStore> store,
               std::shared_ptr<HnswIndex> index,
-              EmbedFn embed_fn = get_embedding);
+              EmbedFn embed_fn);
 
   // 尝试从缓存中获取回复
   // user_message: 用户最新一条消息文本

@@ -2,7 +2,7 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
-#include "request.h"
+#include "server/request.h"
 using namespace ai_gateway;
 
 int main() {
@@ -29,7 +29,7 @@ int main() {
     assert(get.path == "/health"); ok++;
     assert(get.content_length == 0); ok++;
 
-    // Garbage → invalid
+    // Garbage means invalid
     assert(!parse_request("garbage\r\n", 9).valid); ok++;
 
     std::cout << "test_request: " << ok << "/9 passed\n";

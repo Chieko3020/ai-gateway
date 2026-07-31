@@ -135,7 +135,7 @@ std::vector<float> OnnxEmbedding::encode(std::string_view text) {
   int64_t seq_len = static_cast<int64_t>(input_ids.size());
   if (seq_len < 2) return {};
 
-  // attention_mask + token_type_ids
+  // 注意力掩码 + token 类型 ID
   std::vector<int64_t> mask(seq_len, 1);
   std::vector<int64_t> seg(seq_len, 0);
 
@@ -201,7 +201,7 @@ std::vector<float> OnnxEmbedding::encode(std::string_view text) {
     return {};
   }
 
-  // Mean pooling across seq_len
+  // 沿序列长度做均值池化
   std::vector<float> result(dims_, 0.0f);
   for (int64_t t = 0; t < seq_len; ++t) {
     for (int d = 0; d < dims_ && d < out_dim; ++d) {

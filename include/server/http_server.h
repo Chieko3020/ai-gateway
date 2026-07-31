@@ -1,12 +1,12 @@
 // HTTP 服务器核心：epoll ET + 非阻塞 IO + 线程池
 // 主线程 accept + epoll_wait 提交到线程池 worker 处理 + send + close
 //     epoll_wait (主线程)
-//       ├─ listen_fd EPOLLIN → accept → EPOLL_CTL_ADD 新 client_fd
-//       └─ client_fd EPOLLIN → EPOLL_CTL_DEL → handle_client → pool_.execute
+//       ├─ listen_fd EPOLLIN accept 后 EPOLL_CTL_ADD 新 client_fd
+//       └─ client_fd EPOLLIN 然后 EPOLL_CTL_DEL 然后 handle_client p//ool_.execute
 //                                                      ↓
-//           handle_client:  recv (非阻塞) → fcntl 切阻塞 → 200ms × 3 重试 → 装包
+//           handle_client:  recv (非阻塞) 然后 fcntl 切阻塞 然后 200ms × 3 重试 然后 装包
 //                           pool_.execute(lambda):
-//                             conn_handler_.process → send → close(fd)
+//                             conn_handler_.process 然后 send 然后 close(fd)
 #include <atomic>
 #include <functional>
 #include <memory>

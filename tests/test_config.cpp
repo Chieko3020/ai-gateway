@@ -1,7 +1,7 @@
 // Config 单元测试
 #include <cassert>
 #include <iostream>
-#include "config.h"
+#include "common/config.h"
 using namespace ai_gateway;
 
 int main() {

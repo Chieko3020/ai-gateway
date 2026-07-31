@@ -29,7 +29,7 @@ class CurlClient {
     curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
   }
 
-  // 设置请求体（POST）— 内部持有副本，确保 c_str() 在 perform 前有效
+  // 设置请求体（POST），内部持有副本，确保 c_str() 在 perform 前有效
   void set_post_body(const std::string& body) {
     body_ = body;
     curl_easy_setopt(curl_, CURLOPT_POST, 1L);

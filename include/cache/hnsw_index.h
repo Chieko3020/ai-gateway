@@ -1,7 +1,7 @@
 // HNSW (Hierarchical Navigable Small World) 近似最近邻搜索
 // 简化实现，直接取最近 M 个 0.5 概率 x16 层
-// 参考: Malkov & Yashunin (2018)
-// 参数: M=16, ef_construction=100, ef_search=50
+// 参考论文: Malkov // 参考: Malkov & Yashunin (2018) Yashunin (2018)
+// 构建参数: M=16, ef_construction=100, ef_search=50
 // 复杂度: 搜索 O(log N), 构建 O(N log N)
 // 精度: 10K 512d ≈ 99% recall vs 暴力搜索
 
@@ -22,7 +22,7 @@ namespace ai_gateway {
     // add(vec):   随机层级 逐层找到最近邻 建双向边
     // search(q):  顶层贪心下钻 0 层束搜索 top-K 余弦相似
     
-    //   entry_point
+    //   入口点（最高层节点）
     //   Layer 2:  节点少，边长距，粗导航
     //   Layer 1:  较密
     //   Layer 0:  全节点，最密，精细搜索
@@ -88,7 +88,7 @@ class HnswIndex {
     for (int lc = std::min(level, max_level_); lc >= 0; --lc) {
       auto candidates = search_layer(embedding, ep, cfg_.ef_construction, lc);
       int max_conn = (lc == 0) ? M_max0 : M_max;
-      // Take nearest max_conn neighbors and add bidirectional links
+      // 取最近 max_conn 个邻居并添加双向链接
       std::vector<HnswDistNode> sorted;
       while (!candidates.empty()) { sorted.push_back(candidates.top()); candidates.pop(); }
       int taken = std::min(max_conn, static_cast<int>(sorted.size()));
@@ -97,7 +97,7 @@ class HnswIndex {
         int nei = sorted[i].id;
         if (nei == cur) continue;
         nodes_[cur].neighbors[lc].push_back(nei);
-        // Add reverse edge if within limit
+        // 若未超过限制则添加反向边
         int rev_max = (lc == 0) ? M_max0 : M_max;
         if (static_cast<int>(nodes_[nei].neighbors[lc].size()) < rev_max)
           nodes_[nei].neighbors[lc].push_back(cur);
@@ -120,7 +120,7 @@ class HnswIndex {
 
     auto candidates = search_layer(query, ep, cfg_.ef_search, 0);
 
-    // Convert to results sorted by cosine similarity
+    // 转换为按余弦相似度排序的结果
     std::vector<HnswResult> results;
     while (!candidates.empty() && static_cast<int>(results.size()) < k) {
       auto& top = candidates.top();

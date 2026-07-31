@@ -36,7 +36,7 @@ static std::string extract_namespace(const std::string& request_body) {
     if (!msgs.empty() && msgs[0].value("role", "") == "system") {
       auto content = msgs[0].value("content", "");
       if (!content.empty()) {
-        // hash
+        // 计算哈希
         size_t h = std::hash<std::string>{}(content);
         return std::format("{:08x}", static_cast<uint32_t>(h));
       }
@@ -59,7 +59,7 @@ static std::string extract_user_message(const std::string& request_body) {
   return "";
 }
 
-// Thread-safe shutdown flag
+// 线程安全的关闭标志
 static std::atomic<bool> g_shutdown{false};
 
 void handle_signal(int /*sig*/) {
@@ -182,7 +182,7 @@ int main(int argc, char* argv[]) {
   // 从磁盘恢复缓存
   if (cfg.cache.enabled) {
     lru->load("cache/lru_store.json");
-    idx->load("cache/vector_index.bin");
+    // 索引由 LruStore 重建，无需独立加载;
     engine->rebuild_index();
     LOG_INFO("cache restored: {} entries, {} vectors", lru->size(), idx->size());
   }
@@ -201,7 +201,7 @@ int main(int argc, char* argv[]) {
       // 定期持久化缓存，避免宕机丢了cache
       if (cfg.cache.enabled && lru->size() > 0) {
         lru->save("cache/lru_store.json");
-        idx->save("cache/vector_index.bin");
+        // 持久化空桩（HNSW 索引通过 LruStore 重建）;
       }
     }
   });
@@ -224,7 +224,7 @@ int main(int argc, char* argv[]) {
   stats->report();
   if (cfg.cache.enabled) {
     lru->save("cache/lru_store.json");
-    idx->save("cache/vector_index.bin");
+    // 持久化空桩（HNSW 索引通过 LruStore 重建）;
     LOG_INFO("cache persisted: {} entries, {} vectors", lru->size(), idx->size());
   }
   LOG_INFO("cache hits={} misses={} hit_rate={:.1f}%",

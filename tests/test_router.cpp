@@ -1,7 +1,7 @@
 // Router 路由分发单元测试
 #include <cassert>
 #include <iostream>
-#include "router.h"
+#include "server/router.h"
 using namespace ai_gateway;
 
 int main() {
@@ -9,8 +9,8 @@ int main() {
     Router r;
 
     int called_a = 0, called_b = 0;
-    r.add("/v1/chat/completions", [&](auto) { called_a++; return std::string("a"); });
-    r.add("/v1/embeddings", [&](auto) { called_b++; return std::string("b"); });
+    r.add("POST", "/v1/chat/completions", [&](auto) { called_a++; return std::string("a"); });
+    r.add("POST", "/v1/embeddings", [&](auto) { called_b++; return std::string("b"); });
 
     auto* h1 = r.find("POST", "/v1/chat/completions");
     assert(h1 != nullptr); (*h1)("x"); assert(called_a == 1); ok++;

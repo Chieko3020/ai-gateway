@@ -1,8 +1,8 @@
 // LRU + TTL 内存缓存存储：O(1) 查找 + 有序淘汰 + 线程安全
 //
 // 内部结构：
-//   std::list<Node> — 双向链表，头部=最近使用，尾部=最久未用
-//   std::unordered_map<key, iterator> — O(1) 定位链表节点
+//   std::list<Node> ，双向链表 头部是最近使用 尾部最久未用
+//   std::unordered_map<key, iterator> ，O(1) 定位链表节点
 //
 // 线程安全：所有 public 方法持有 mutex，适合低并发场景
 #pragma once

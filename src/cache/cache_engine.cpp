@@ -5,7 +5,6 @@
 #include <format>
 
 #include "common/logger.h"
-#include "cache/embedding.h"
 
 namespace ai_gateway {
 
@@ -37,7 +36,7 @@ CacheEngine::HitResult CacheEngine::try_hit(
       LOG_INFO("cache: HIT (exact) ns={}", ns.empty() ? "default" : ns);
       return HitResult{true, std::move(exact.value()), 1.0f};
     }
-    return HitResult{};  // hit=false
+    return HitResult{};  // 未命中
   }
 
   // 2. 向量检索 Top-K（持锁保护 HNSW search）

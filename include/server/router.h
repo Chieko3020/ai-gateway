@@ -20,7 +20,7 @@ class Router {
   const Handler* find(std::string_view method, std::string_view path) const;
 
  private:
-  // key = "METHOD /path"
+  // 路由 key 为 "METHOD /path" 格式
   std::unordered_map<std::string, Handler> routes_;
 };
 

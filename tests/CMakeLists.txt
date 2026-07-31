@@ -21,8 +21,6 @@ target_link_libraries(test_router ai_gateway_server ai_gateway_common)
 add_executable(test_lru_store test_lru_store.cpp)
 target_link_libraries(test_lru_store ai_gateway_cache ai_gateway_common)
 
-add_executable(test_vector_index test_vector_index.cpp)
-target_link_libraries(test_vector_index ai_gateway_cache ai_gateway_common)
 
 # Module 4: stats
 add_executable(test_stats test_stats.cpp)
@@ -38,6 +36,5 @@ add_test(NAME request COMMAND test_request)
 add_test(NAME response COMMAND test_response)
 add_test(NAME router COMMAND test_router)
 add_test(NAME lru_store COMMAND test_lru_store)
-add_test(NAME vector_index COMMAND test_vector_index)
 add_test(NAME stats COMMAND test_stats)
 add_test(NAME config COMMAND test_config)

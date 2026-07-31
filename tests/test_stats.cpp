@@ -1,7 +1,7 @@
 // Stats 单元测试
 #include <cassert>
 #include <iostream>
-#include "stats.h"
+#include "stats/stats.h"
 using namespace ai_gateway;
 
 int main() {
