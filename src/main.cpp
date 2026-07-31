@@ -10,20 +10,40 @@
 
 #include <nlohmann/json.hpp>
 
-#include "llm_client.h"
-#include "cache_engine.h"
-#include "lru_store.h"
-#include "vector_index.h"
-#include "config.h"
-#include "logger.h"
-#include "types.h"
-#include "filter.h"
-#include "http_server.h"
-#include "stats.h"
+#include "backend/llm_client.h"
+#include "cache/cache_engine.h"
+#include "cache/lru_store.h"
+#include "cache/hnsw_index.h"
+#include "common/log_file.h"
+#include "cache/onnx_embedding.h"
+#include "common/config.h"
+#include "common/logger.h"
+#include "common/types.h"
+#include "server/filter.h"
+#include "server/http_server.h"
+#include "stats/stats.h"
 
 using namespace ai_gateway;
 using json = nlohmann::json;
 using namespace std::chrono_literals;
+
+// 从 OpenAI 格式请求体中提取第一条 system message 内容，用于缓存隔离
+// 返回 system prompt 的 SHA256 前 8 位 hex
+static std::string extract_namespace(const std::string& request_body) {
+  try {
+    auto req = json::parse(request_body);
+    auto& msgs = req.at("messages");
+    if (!msgs.empty() && msgs[0].value("role", "") == "system") {
+      auto content = msgs[0].value("content", "");
+      if (!content.empty()) {
+        // hash
+        size_t h = std::hash<std::string>{}(content);
+        return std::format("{:08x}", static_cast<uint32_t>(h));
+      }
+    }
+  } catch (...) {}
+  return "";  // 客户端没有 system message 或解析失败，返回空字符串表示不做隔离
+}
 
 // 从 OpenAI 格式请求体中提取最后一条 user message
 static std::string extract_user_message(const std::string& request_body) {
@@ -71,7 +91,8 @@ static std::string handle_request(const std::string& request_body,
 
   // 4b. 语义缓存
   if (cfg.cache.enabled && !user_msg.empty()) {
-    auto hit = engine->try_hit(user_msg);
+    auto ns = extract_namespace(request_body);
+    auto hit = engine->try_hit(user_msg, ns);
     if (hit.hit) {
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - t0);
@@ -102,7 +123,8 @@ static std::string handle_request(const std::string& request_body,
   // 4e. 写入缓存
   bool ok = (result.status_code >= 200 && result.status_code < 300);
   if (ok && cfg.cache.enabled && !user_msg.empty())
-    engine->cache_reply(user_msg, result.body, cached_embedding);
+    engine->cache_reply(user_msg, result.body, cached_embedding,
+                        extract_namespace(request_body));
 
   // 4f. 统计
   stats->record_api_call(elapsed.count(), prompt_tokens, completion_tokens);
