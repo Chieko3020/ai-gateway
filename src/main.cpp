@@ -145,6 +145,9 @@ static std::string handle_request(const std::string& request_body,
 }
 
 int main(int argc, char* argv[]) {
+  // ---- 0. 初始化日志文件（与 systemd journal 双写） ----
+  ai_gateway::detail::set_log_file("gateway.log");
+
   // ---- 1. 加载配置 ----
   const char* config_path = (argc > 1) ? argv[1] : "config/gateway.json";
   GatewayConfig cfg;
@@ -158,8 +161,21 @@ int main(int argc, char* argv[]) {
   // ---- 2. 初始化模块 ----
   auto lru = std::make_shared<LruStore>(cfg.cache.max_entries,
                                         cfg.cache.ttl_days * 86400);
-  auto idx = std::make_shared<VectorIndex>();
-  auto engine = std::make_shared<CacheEngine>(cfg.embedding, cfg.cache, lru, idx);
+  auto idx = std::make_shared<HnswIndex>(HnswConfig{512, 16, 100, 50});
+
+  // 本地 ONNX 嵌入推理
+  auto onnx_embed = std::make_shared<OnnxEmbedding>(
+      "model/model_int8.onnx",
+      "model/vocab.txt", 512);
+
+  auto embed_fn = [onnx_embed](const std::string&, const std::string&,
+                                const std::string&, const std::string& text,
+                                int) -> std::vector<float> {
+    return onnx_embed->ready() ? onnx_embed->encode(text)
+                                : std::vector<float>{};
+  };
+
+  auto engine = std::make_shared<CacheEngine>(cfg.embedding, cfg.cache, lru, idx, embed_fn);
   auto stats = std::make_shared<Stats>();
   auto filter = std::make_shared<MessageFilter>(cfg.filter);
 
@@ -177,11 +193,16 @@ int main(int argc, char* argv[]) {
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
 
-  // ---- 3. 启动定期统计线程 ----
-  std::thread stats_thread([stats] {
+  // ---- 3. 启动定期统计 + 定时持久化线程 ----
+  std::thread bg_thread([stats, lru, idx, &cfg] {
     while (!g_shutdown.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(60s);
       stats->report();
+      // 定期持久化缓存，避免宕机丢了cache
+      if (cfg.cache.enabled && lru->size() > 0) {
+        lru->save("cache/lru_store.json");
+        idx->save("cache/vector_index.bin");
+      }
     }
   });
 
@@ -199,7 +220,7 @@ int main(int argc, char* argv[]) {
 
   // ---- 6. 清理：保存缓存 + 统计 ----
   g_shutdown.store(true, std::memory_order_release);
-  if (stats_thread.joinable()) stats_thread.join();
+  if (bg_thread.joinable()) bg_thread.join();
   stats->report();
   if (cfg.cache.enabled) {
     lru->save("cache/lru_store.json");
