@@ -1,5 +1,5 @@
 // LRU + TTL 缓存存储实现
-#include "lru_store.h"
+#include "cache/lru_store.h"
 
 #include <algorithm>
 #include <fstream>
@@ -41,11 +41,11 @@ std::optional<std::string> LruStore::get(const std::string& key) {
   return node.value;
 }
 
-void LruStore::put(const std::string& key, std::string value) {
-  put_with_embedding(key, std::move(value), {});
+void LruStore::put(std::string key, std::string value) {
+  put_with_embedding(std::move(key), std::move(value), {});
 }
 
-void LruStore::put_with_embedding(const std::string& key,
+void LruStore::put_with_embedding(std::string key,
                                    std::string value,
                                    std::vector<float> embedding) {
   std::lock_guard lock(mutex_);
@@ -71,19 +71,26 @@ void LruStore::put_with_embedding(const std::string& key,
 
   // 插入头部
   Node node;
-  node.key = key;
+  node.key = std::move(key);
   node.value = std::move(value);
   node.embedding.data = std::move(embedding);
   node.ctime = Clock::now();
   lru_.push_front(std::move(node));
-  iter_map_[key] = lru_.begin();
+  iter_map_[lru_.front().key] = lru_.begin();
 }
 
 std::vector<float> LruStore::get_embedding(const std::string& key) {
   std::lock_guard lock(mutex_);
   auto it = iter_map_.find(key);
   if (it == iter_map_.end()) return {};
-  return it->second->embedding.data;
+
+  auto& node = *(it->second);
+  if (ttl_seconds_ > 0) {
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+        Clock::now() - node.ctime).count();
+    if (age >= ttl_seconds_) return {};
+  }
+  return node.embedding.data;
 }
 
 void LruStore::for_each_embedding(
@@ -153,6 +160,10 @@ bool LruStore::load(const std::string& path) {
 
     lru_.clear();
     iter_map_.clear();
+    hit_count_ = 0;
+    miss_count_ = 0;
+    evict_count_ = 0;
+    expired_count_ = 0;
 
     for (auto& entry : arr) {
       Node node;
