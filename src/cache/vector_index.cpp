@@ -1,5 +1,5 @@
 // 向量索引实现：线性扫描 + SIMD 加速内积计算，shared_mutex 保护并发
-#include "vector_index.h"
+#include "cache/vector_index.h"
 
 #include <algorithm>
 #include <cmath>
