@@ -16,7 +16,7 @@
   },
   "cache": {
     "enabled": true,
-    "similarity_threshold": 0.85,
+    "similarity_threshold": 0.8,
     "max_entries": 10000,
     "ttl_days": 7
   },
