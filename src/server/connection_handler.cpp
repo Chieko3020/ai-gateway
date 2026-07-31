@@ -1,8 +1,8 @@
 // 连接处理器实现
-#include "connection_handler.h"
+#include "server/connection_handler.h"
 
-#include "logger.h"
-#include "response.h"
+#include "common/logger.h"
+#include "server/response.h"
 
 namespace ai_gateway {
 

@@ -1,12 +1,13 @@
 // URL 路由实现
-#include "router.h"
+#include "server/router.h"
 
 #include <format>
 
 namespace ai_gateway {
 
-void Router::add(std::string_view path, Handler handler) {
-  routes_[std::format("POST {}", path)] = std::move(handler);
+void Router::add(std::string_view method, std::string_view path,
+                Handler handler) {
+  routes_[std::format("{} {}", method, path)] = std::move(handler);
 }
 
 const Router::Handler* Router::find(std::string_view method,
