@@ -9,8 +9,8 @@
 
 #include <cstring>
 
-#include "logger.h"
-#include "connection_handler.h"
+#include "common/logger.h"
+#include "server/connection_handler.h"
 
 namespace ai_gateway {
 
@@ -25,16 +25,22 @@ HttpServer::HttpServer(const ServerConfig& config)
 
 HttpServer::~HttpServer() {
   stop();
-  if (listen_fd_ >= 0) close(listen_fd_);
-  if (epoll_fd_ >= 0) close(epoll_fd_);
+  if (listen_fd_ >= 0) {
+    close(listen_fd_);
+    listen_fd_ = -1;
+  }
+  if (epoll_fd_ >= 0) {
+    close(epoll_fd_);
+    epoll_fd_ = -1;
+  }
 }
 
 void HttpServer::set_handler(RequestHandler handler) {
-  router_.add("/v1/chat/completions", std::move(handler));
+  router_.add("POST", "/v1/chat/completions", std::move(handler));
 }
 
 void HttpServer::add_route(std::string_view path, RequestHandler handler) {
-  router_.add(path, std::move(handler));
+  router_.add("POST", path, std::move(handler));
 }
 
 void HttpServer::set_nonblocking(int fd) {
@@ -79,7 +85,7 @@ int HttpServer::create_listen_socket() {
   return fd;
 }
 
-void HttpServer::run() {
+void HttpServer::run(std::atomic<bool>* external_shutdown) {
   listen_fd_ = create_listen_socket();
   if (listen_fd_ < 0) return;
 
@@ -87,6 +93,7 @@ void HttpServer::run() {
   if (epoll_fd_ < 0) {
     LOG_ERROR("epoll_create1 failed: {}", std::strerror(errno));
     close(listen_fd_);
+    listen_fd_ = -1;
     return;
   }
 
@@ -95,11 +102,17 @@ void HttpServer::run() {
   ev.data.fd = listen_fd_;
   epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev);
 
-  running_ = true;  // 工作线程已移除，但标志位仍需设置
+  running_ = true;
   epoll_event events[kMaxEvents];
 
   while (running_) {
-    // 短暂超时以便检查 running_ 标志
+    // 检查外部关闭信号（例如来自信号处理器）
+    if (external_shutdown &&
+        external_shutdown->load(std::memory_order_acquire)) {
+      break;
+    }
+
+    // 短暂超时以便检查 running_ 和 external_shutdown
     int nfds = epoll_wait(epoll_fd_, events, kMaxEvents, 100);
     if (nfds < 0) {
       if (errno == EINTR) continue;
@@ -112,8 +125,8 @@ void HttpServer::run() {
 
       if (fd == listen_fd_) {
         // ---- 新连接 ----
-        // ET 模式下需要循环 accept 直到 EAGAIN
-        while (true) {
+        // ET 模式下循环 accept，限流最多 16 个防主线程饥饿
+        for (int accepted = 0; accepted < 16; ++accepted) {
           sockaddr_in client_addr{};
           socklen_t addr_len = sizeof(client_addr);
           int client_fd = accept4(listen_fd_,
@@ -134,13 +147,22 @@ void HttpServer::run() {
         }
       } else {
         // ---- 客户端数据提交到线程池处理 ----
+        // 先从 epoll 移除，避免边缘触发重复通知
+        // 线程池 lambda 里 send + close 处理后关闭
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         handle_client(fd);
       }
     }
   }
 
-  close(epoll_fd_);
-  close(listen_fd_);
+  if (epoll_fd_ >= 0) {
+    close(epoll_fd_);
+    epoll_fd_ = -1;
+  }
+  if (listen_fd_ >= 0) {
+    close(listen_fd_);
+    listen_fd_ = -1;
+  }
 }
 
 void HttpServer::stop() {
@@ -150,6 +172,11 @@ void HttpServer::stop() {
 void HttpServer::handle_client(int client_fd) {
   char buf[kBufSize];
   ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    // recv error or client disconnected — nothing to process
+    close(client_fd);
+    return;
+  }
   buf[n] = '\0';
 
   // Non-blocking socket may deliver TCP segments out of order.
