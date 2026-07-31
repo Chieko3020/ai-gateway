@@ -1,9 +1,9 @@
 // HTTP 响应构造实现
-#include "response.h"
+#include "server/response.h"
 
 #include <format>
 
-#include "types.h"
+#include "common/types.h"
 
 namespace ai_gateway {
 
