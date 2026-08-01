@@ -21,6 +21,18 @@ def call(msg, max_tokens=30):
     return int((time.time() - t0) * 1000)
 
 
+def call_with_result(msg, max_tokens=30):
+    """返回 (latency_ms, is_hit)"""
+    body = json.dumps({"model": MODEL, "messages": [{"role": "user", "content": msg}], "max_tokens": max_tokens})
+    t0 = time.time()
+    r = subprocess.run(["curl", "-s", "-X", "POST", URL, "-H", "Content-Type: application/json", "-d", body],
+                       capture_output=True, text=True, timeout=60)
+    lat = int((time.time() - t0) * 1000)
+    # 命中延迟 < 800ms (ONNX ~200ms + overhead)，未命中需等待 LLM (>800ms)
+    is_hit = lat < 800
+    return lat, is_hit
+
+
 def level1(num=30):
     """函数级: N 条消息 × 2 轮"""
     msgs = [
@@ -82,18 +94,40 @@ def level2(num=200):
     ][:num]
 
     print(f"\n{'='*60}")
-    print(f"Level 2: 回放 ({len(msgs)} msgs × 2 rounds, 10 语义簇)")
+    print(f"Level 2: 回放 ({len(msgs)} msgs x 2 rounds, 10 语义簇)")
     print(f"{'='*60}")
+
+    all_hit_lats, all_miss_lats = [], []
 
     for rd, label in [(1, "R1-populate"), (2, "R2-replay")]:
         hits = misses = 0
+        hit_lats, miss_lats = [], []
         for i, msg in enumerate(msgs):
-            lat = call(msg)
-            if lat < 500: hits += 1
-            else: misses += 1
+            lat, is_hit = call_with_result(msg)
+            if is_hit:
+                hits += 1
+                hit_lats.append(lat)
+            else:
+                misses += 1
+                miss_lats.append(lat)
             if (i + 1) % 50 == 0:
                 print(f"  {label}: {i+1}/{len(msgs)} done, HIT={hits} MISS={misses}")
         print(f"  {label}: HIT={hits}/{len(msgs)} ({hits/len(msgs)*100:.0f}%)")
+        all_hit_lats.extend(hit_lats)
+        all_miss_lats.extend(miss_lats)
+
+    # 汇总延迟统计
+    print(f"\n{'─'*40}")
+    if all_hit_lats:
+        s = sorted(all_hit_lats)
+        print(f"命中延迟: avg={sum(s)//len(s)}ms p50={s[len(s)//2]}ms "
+              f"p99={s[min(int(len(s)*0.99), len(s)-1)]}ms "
+              f"min={s[0]}ms max={s[-1]}ms (共{len(s)}次)")
+    if all_miss_lats:
+        s = sorted(all_miss_lats)
+        print(f"未命中延迟: avg={sum(s)//len(s)}ms p50={s[len(s)//2]}ms "
+              f"p99={s[min(int(len(s)*0.99), len(s)-1)]}ms "
+              f"min={s[0]}ms max={s[-1]}ms (共{len(s)}次)")
 
 
 def level3(threads_num=4, requests=10):
