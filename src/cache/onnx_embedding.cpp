@@ -1,4 +1,4 @@
-// ONNX Runtime 嵌入推理 & BPE 分词器实现
+// ONNX Runtime 嵌入推理 & 贪心最长子串匹配分词器实现
 #include "cache/onnx_embedding.h"
 
 #include <algorithm>
@@ -12,9 +12,9 @@
 
 namespace ai_gateway {
 
-// ── BpeTokenizer ──────────────────────────────────────────
+// ── GreedyTokenizer ──────────────────────────────────────────
 
-bool BpeTokenizer::load(const std::string& vocab_path) {
+bool GreedyTokenizer::load(const std::string& vocab_path) {
   std::ifstream f(vocab_path);
   if (!f) return false;
   vocab_.clear();
@@ -27,7 +27,7 @@ bool BpeTokenizer::load(const std::string& vocab_path) {
   return vocab_.size() > kMinVocabSize;  // 至少要有基本词条并且数量足够
 }
 
-std::vector<int64_t> BpeTokenizer::encode(std::string_view text, int max_len) {
+std::vector<int64_t> GreedyTokenizer::encode(std::string_view text, int max_len) {
   std::vector<int64_t> ids;
   ids.reserve(max_len);
   ids.push_back(101);  // [CLS]

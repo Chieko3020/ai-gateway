@@ -14,18 +14,13 @@ cmake-build-*/
 
 # Binary output
 bin/
-ai-gateway
 
 # Config (contains API keys)
 config/gateway.json
 config/gateway.env
 
-# Model files (downloaded separately — too large for git)
-hfd.sh
-
-# Cache persistence files
+# Cache persistence (runtime generated)
 cache/lru_store.json
-cache/vector_index.bin
 
 # Dependencies
 third_party/
@@ -34,13 +29,25 @@ third_party/
 __pycache__/
 *.pyc
 
+# Logs + runtime
+gateway.log
+*.pid
+*.backup-*
+
 # Specstory
 .specstory/
 
 # Core dumps
 core
 *.core
-docs/
-gateway.log
+
+# Hermes plans
+.hermes/
+
+# Model download leftovers
 bge-small-zh-v1.5/
 bge-small-zh-v1.5-onnx/
+hfd.sh
+
+# document
+docs/

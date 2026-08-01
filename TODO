@@ -1,0 +1,59 @@
+## TODO
+
+### SSE 流式响应
+
+当前网关只支持非流式（完整响应后一次性返回）。SSE 流式响应可以让客户端在 LLM 生成 token 的过程中逐步接收，提升交互体验。
+
+**方案设计**
+
+```
+客户端                            AI Gateway                       LLM
+   │  POST (stream: true)            │                               │
+   │ ──────────────────────────────► │                               │
+   │                                 │  POST (stream: true)          │
+   │                                 │ ────────────────────────────► │
+   │                                 │                               │
+   │                                 │  data: {"choices":[{"delta":  │
+   │                                 │  {"content":"你好"}}]}        │
+   │                                 │ ◄──────────────────────────── │
+   │  data: {"choices":[{"delta":    │                               │
+   │  {"content":"你好"}}]}          │                               │
+   │ ◄────────────────────────────── │                               │
+   │                                 │  data: [DONE]                 │
+   │                                 │ ◄──────────────────────────── │
+   │  data: [DONE]                   │                               │
+   │ ◄────────────────────────────── │                               │
+```
+
+**技术要点**
+
+- curl `CURLOPT_WRITEFUNCTION` 回调逐 chunk 处理，当前 `set_response_target` 需要改为流式回调接口
+- SSE 协议: `Content-Type: text/event-stream`，每行 `data: <json>\n\n`，结束发 `data: [DONE]\n\n`
+- **流式下缓存策略**: 两种选择
+  - **方案 A**: 流式透传，但后端收集完整响应后补写缓存。命中时回退为非流式（直接返回缓存文本）。
+    需要后端线程 fork 一份 body buffer 等 LLM 完成。
+  - **方案 B**: 放弃流式请求的缓存，只缓存非流式请求。简单但命中率低。
+- `http_server` 的 `handle_client` 目前是一次性 `recv → send → close`，需要改为保持连接持续写入 SSE 帧
+- 线程池 `pool_.execute` 的 lambda 需要持有 fd 并分多帧 `send`，直到收到终止信号
+
+**文件改动预估**
+
+| 文件 | 改动 |
+|------|------|
+| `include/common/curl_client.h` | 新增流式回调接口 `on_chunk` |
+| `src/backend/llm_client.cpp` | 流式模式 `call_llm_stream`，chunk 回调 |
+| `src/server/http_server.cpp` | `handle_client` 支持 SSE 长连接保持 |
+| `src/main.cpp` | `handle_request` 分支: 流式走透传，非流式走缓存 |
+| `include/cache/cache_engine.h` | 补写缓存接口: 流式响应完成后异步写入 |
+
+**风险与决策点**
+
+- 内存: 流式补写缓存意味着需要 fork 一份 LLM 响应 body 缓冲区，额外 ~4KB-64KB/请求
+- 时序: 如果 LLM 正在流式输出，缓存补写是异步的 —— 在 `[DONE]` 后调用 `cache_reply`
+- 线程安全: 补写需要访问 `CacheEngine`/`HnswIndex`，已有 mutex 保护
+
+**待验证**
+
+- 当前 QQ Bot（webhook 模式）是否支持流式响应？webhook 是一次性 HTTP POST callback，可能不需要流式
+- 博客聊天（chat-api）同样是一次性请求，不需要流式
+- **结论**: 如果所有客户端都是 webhook/一次性请求，SSE 优先级可降级，标记为"未来扩展"

@@ -4,8 +4,8 @@
 // 比 Flask HTTP 服务省 ~20ms（无 HTTP/JSON 序列化开销）
 //
 // 依赖：libonnxruntime.so（系统动态库，pip 安装）
-// 模型：bge-small-zh-v1.5-onnx/model_int8.onnx (需要INT8 量化, ~23MB)
-// 词表：bge-small-zh-v1.5/vocab.txt
+// 模型：bge-small-zh-v1.5-onnx/model_int8.onnx (INT8 量化, ~23MB)
+// 词表：bge-small-zh-v1.5/vocab.txt (WordPiece 词表, 21128 词条)
 
 #pragma once
 
@@ -19,8 +19,11 @@
 
 namespace ai_gateway {
 // 先分词后推理
-// 最小 BPE 分词器：加载 vocab.txt，UTF-8 逐字匹配
-class BpeTokenizer {
+// 贪心最长子串匹配分词器
+// 基于 BERT WordPiece 词表，逐位置向后扫描取最长匹配 token
+// 与标准 WordPiece 的区别：标准 WordPiece 从开头逐 token 贪心匹配并跳过未登录字，
+// 本实现从每个位置尝试最长子串，未匹配则标记为 [UNK]
+class GreedyTokenizer {
  public:
   static constexpr size_t kMinVocabSize = 1000;
   bool load(const std::string& vocab_path);
@@ -51,7 +54,7 @@ class OnnxEmbedding {
   OrtSession* session_ = nullptr;
   OrtEnv* env_ = nullptr;
   OrtMemoryInfo* mem_info_ = nullptr;
-  BpeTokenizer tokenizer_;
+  GreedyTokenizer tokenizer_;
   int dims_ = 512;
 };
 
