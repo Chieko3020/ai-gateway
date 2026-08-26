@@ -27,8 +27,19 @@ using namespace ai_gateway;
 using json = nlohmann::json;
 using namespace std::chrono_literals;
 
+// FNV-1a 32-bit 确定性哈希：保证跨进程一致，避免 std::hash 因随机种子导致
+// 重启后同一 system prompt 算出不同 namespace 使缓存隔离失效
+static uint32_t fnv1a_32(const std::string& s) {
+  uint32_t h = 0x811c9dc5u;
+  for (char c : s) {
+    h ^= static_cast<uint8_t>(c);
+    h *= 0x01000193u;
+  }
+  return h;
+}
+
 // 从 OpenAI 格式请求体中提取第一条 system message 内容，用于缓存隔离
-// 返回 system prompt 的 SHA256 前 8 位 hex
+// 返回 system prompt 的 FNV-1a 32-bit hex
 static std::string extract_namespace(const std::string& request_body) {
   try {
     auto req = json::parse(request_body);
@@ -36,9 +47,7 @@ static std::string extract_namespace(const std::string& request_body) {
     if (!msgs.empty() && msgs[0].value("role", "") == "system") {
       auto content = msgs[0].value("content", "");
       if (!content.empty()) {
-        // 计算哈希
-        size_t h = std::hash<std::string>{}(content);
-        return std::format("{:08x}", static_cast<uint32_t>(h));
+        return std::format("{:08x}", fnv1a_32(content));
       }
     }
   } catch (...) {}
