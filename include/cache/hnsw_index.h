@@ -14,6 +14,7 @@
 #include <memory>
 #include <queue>
 #include <random>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,7 @@ class HnswIndex {
   explicit HnswIndex(const HnswConfig& cfg = {}) : cfg_(cfg), gen_(42), gen_dis_(0.0, 1.0) {}
 
   void add(int id, const std::string& key, const std::vector<float>& embedding) {
+    std::lock_guard lock(mutex_);
     if (static_cast<int>(embedding.size()) != cfg_.dim) return;
 
     int level = 0;
@@ -111,6 +113,7 @@ class HnswIndex {
   }
 
   std::vector<HnswResult> search(const std::vector<float>& query, int k = 10) {
+    std::shared_lock lock(mutex_);
     if (entry_point_ == -1 || nodes_.empty()) return {};
     if (static_cast<int>(query.size()) != cfg_.dim) return {};
 
@@ -132,7 +135,10 @@ class HnswIndex {
     return results;
   }
 
-  size_t size() const { return nodes_.size(); }
+  size_t size() const {
+    std::shared_lock lock(mutex_);
+    return nodes_.size();
+  }
 
   // 持久化：索引由 LruStore 管理（for_each_embedding 重建），不需要独立 save/load
   void save(const std::string&) const {}
@@ -210,6 +216,7 @@ class HnswIndex {
   int max_level_ = 0;
   std::mt19937 gen_;
   std::uniform_real_distribution<float> gen_dis_;
+  mutable std::shared_mutex mutex_;
 };
 
 }  // namespace ai_gateway
