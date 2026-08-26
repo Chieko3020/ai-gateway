@@ -142,6 +142,7 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
           ev.events = EPOLLIN | EPOLLET;
           ev.data.fd = client_fd;
           if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
+            LOG_WARN("epoll_ctl ADD failed: {}", std::strerror(errno));
             close(client_fd);
             continue;
           }
