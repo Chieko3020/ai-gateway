@@ -6,9 +6,10 @@ using namespace ai_gateway;
 
 int main() {
     GatewayConfig cfg;
-    assert(GatewayConfig::load("config/gateway.json", cfg) == 0);
+    assert(GatewayConfig::load("config/gateway.example.json", cfg) == 0);
 
     assert(cfg.server.port >= 0);
+    assert(cfg.server.max_body_bytes > 0);
     assert(!cfg.backend.url.empty());
     assert(cfg.cache.similarity_threshold > 0);
 
