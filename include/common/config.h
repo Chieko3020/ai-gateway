@@ -10,6 +10,7 @@ namespace ai_gateway {
 // 服务端配置
 struct ServerConfig {
   int port = 9000;
+  uint64_t max_body_bytes = 20 * 1024 * 1024;  // 请求体最大字节数，默认 20MB
 };
 
 // LLM 后端配置（OpenAI 兼容）

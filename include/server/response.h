@@ -23,4 +23,8 @@ inline std::string make_service_unavailable(std::string body) {
   return make_response(503, "application/json", std::move(body));
 }
 
+inline std::string make_payload_too_large(std::string body) {
+  return make_response(413, "application/json", std::move(body));
+}
+
 }  // namespace ai_gateway

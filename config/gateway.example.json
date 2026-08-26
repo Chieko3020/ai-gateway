@@ -1,6 +1,7 @@
 {
   "server": {
-    "port": 9000
+    "port": 9000,
+    "max_body_bytes": 20971520
   },
   "backend": {
     "url": "https://api.deepseek.com/v1/chat/completions",

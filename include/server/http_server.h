@@ -2,16 +2,18 @@
 // 主线程 accept + epoll_wait 提交到线程池 worker 处理 + send + close
 //     epoll_wait (主线程)
 //       ├─ listen_fd EPOLLIN accept 后 EPOLL_CTL_ADD 新 client_fd
-//       └─ client_fd EPOLLIN 然后 EPOLL_CTL_DEL 然后 handle_client p//ool_.execute
+//       └─ client_fd EPOLLIN 然后 EPOLL_CTL_DEL 然后 handle_client
 //                                                      ↓
-//           handle_client:  recv (非阻塞) 然后 fcntl 切阻塞 然后 200ms × 3 重试 然后 装包
-//                           pool_.execute(lambda):
-//                             conn_handler_.process 然后 send 然后 close(fd)
+//           handle_client: 非阻塞循环 recv 追加到累积缓冲区 conn_buffers_[fd]
+//                          解析 Content-Length 判断 body 是否完整
+//                          完整 → pool_.execute: process + send + close
+//                          不完整 → EPOLL_CTL_ADD 重新注册等待更多数据
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "common/config.h"
@@ -56,6 +58,9 @@ class HttpServer {
   // 处理单个客户端连接
   void handle_client(int client_fd);
 
+  // 读取可读数据追加到累积缓冲区，返回是否成功读取
+  bool read_into_buffer(int client_fd, std::string& buf);
+
   // 设置 fd 为非阻塞
   static void set_nonblocking(int fd);
 
@@ -66,6 +71,9 @@ class HttpServer {
   Router router_;
   ConnectionHandler conn_handler_{router_};
   ThreadPool pool_{4};  // 单 reactor + 线程池架构
+
+  // 每个连接的累积接收缓冲区（主线程 epoll 循环独占访问，无需锁）
+  std::unordered_map<int, std::string> conn_buffers_;
 };
 
 }  // namespace ai_gateway

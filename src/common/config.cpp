@@ -47,6 +47,7 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
     if (root.contains("server")) {
       auto& s = root["server"];
       out.server.port = s.value("port", 9000);
+      out.server.max_body_bytes = s.value("max_body_bytes", 20 * 1024 * 1024ull);
     }
 
     // --- backend ---
