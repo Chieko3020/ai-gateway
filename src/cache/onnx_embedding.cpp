@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 
 #include "common/logger.h"
@@ -79,13 +80,14 @@ OnnxEmbedding::OnnxEmbedding(const std::string& model_path,
   }
   LOG_INFO("onnx: tokenizer loaded, vocab={}", tokenizer_.size());
 
-  // 初始化 ORT API（进程级单例模式）
-  if (!g_api_) {
+  // 初始化 ORT API（进程级单例模式，call_once 防竞态）
+  static std::once_flag api_init;
+  std::call_once(api_init, [] {
     g_api_ = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-    if (!g_api_) {
-      LOG_ERROR("onnx: OrtGetApiBase failed");
-      return;
-    }
+  });
+  if (!g_api_) {
+    LOG_ERROR("onnx: OrtGetApiBase failed");
+    return;
   }
 
   // 创建环境
