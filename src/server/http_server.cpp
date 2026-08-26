@@ -134,6 +134,7 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
                                    &addr_len, SOCK_NONBLOCK);
           if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EINTR) continue;  // 信号中断，继续尝试 accept
             LOG_WARN("accept failed: {}", std::strerror(errno));
             break;
           }
