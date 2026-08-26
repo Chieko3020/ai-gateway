@@ -229,14 +229,15 @@ std::vector<float> OnnxEmbedding::encode(std::string_view text) {
     return {};
   }
 
-  // 沿序列长度做均值池化
-  std::vector<float> result(dims_, 0.0f);
+  // 沿序列长度做均值池化，维度取 min(dims_, out_dim) 对齐实际模型输出
+  int effective_dim = std::min(dims_, out_dim);
+  std::vector<float> result(effective_dim, 0.0f);
   for (int64_t t = 0; t < seq_len; ++t) {
-    for (int d = 0; d < dims_ && d < out_dim; ++d) {
+    for (int d = 0; d < effective_dim; ++d) {
       result[d] += out_data[t * out_dim + d];
     }
   }
-  for (int d = 0; d < dims_; ++d) result[d] /= static_cast<float>(seq_len);
+  for (int d = 0; d < effective_dim; ++d) result[d] /= static_cast<float>(seq_len);
 
   // L2 normalize（bge 需要归一化向量用于余弦相似度）
   float norm = 0.0f;
