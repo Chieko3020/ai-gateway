@@ -1,10 +1,12 @@
 // 网关入口：加载配置 初始化各模块 启动 HTTP 服务
 
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdlib>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -68,8 +70,10 @@ static std::string extract_user_message(const std::string& request_body) {
   return "";
 }
 
-// 线程安全的关闭标志
+// 线程安全的关闭标志与后台线程唤醒机制
 static std::atomic<bool> g_shutdown{false};
+static std::mutex g_bg_mutex;
+static std::condition_variable g_bg_cv;
 
 void handle_signal(int /*sig*/) {
   g_shutdown.store(true, std::memory_order_release);
@@ -205,7 +209,12 @@ int main(int argc, char* argv[]) {
   // ---- 3. 启动定期统计 + 定时持久化线程 ----
   std::thread bg_thread([stats, lru, idx, &cfg] {
     while (!g_shutdown.load(std::memory_order_acquire)) {
-      std::this_thread::sleep_for(60s);
+      {
+        std::unique_lock lk(g_bg_mutex);
+        g_bg_cv.wait_for(lk, 60s,
+                         [] { return g_shutdown.load(std::memory_order_acquire); });
+      }
+      if (g_shutdown.load(std::memory_order_acquire)) break;
       stats->report();
       // 定期持久化缓存，避免宕机丢了cache
       if (cfg.cache.enabled && lru->size() > 0) {
@@ -229,6 +238,7 @@ int main(int argc, char* argv[]) {
 
   // ---- 6. 清理：保存缓存 + 统计 ----
   g_shutdown.store(true, std::memory_order_release);
+  g_bg_cv.notify_one();  // 唤醒 bg_thread 避免等待 60s 超时
   if (bg_thread.joinable()) bg_thread.join();
   stats->report();
   if (cfg.cache.enabled) {
