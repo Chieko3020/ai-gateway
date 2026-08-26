@@ -144,15 +144,41 @@ std::vector<float> OnnxEmbedding::encode(std::string_view text) {
   size_t byte_size = seq_len * sizeof(int64_t);
 
   OrtValue* inputs[3] = {};
-  g_api_->CreateTensorWithDataAsOrtValue(
+  OrtStatus* st = nullptr;
+
+  auto release_inputs = [&](int count) {
+    for (int i = 0; i < count; ++i)
+      if (inputs[i]) g_api_->ReleaseValue(inputs[i]);
+  };
+
+  st = g_api_->CreateTensorWithDataAsOrtValue(
       mem_info_, input_ids.data(), byte_size, shape, 2,
       ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &inputs[0]);
-  g_api_->CreateTensorWithDataAsOrtValue(
+  if (st) {
+    LOG_WARN("onnx: CreateTensor input_ids failed: {}", g_api_->GetErrorMessage(st));
+    g_api_->ReleaseStatus(st);
+    return {};
+  }
+
+  st = g_api_->CreateTensorWithDataAsOrtValue(
       mem_info_, mask.data(), byte_size, shape, 2,
       ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &inputs[1]);
-  g_api_->CreateTensorWithDataAsOrtValue(
+  if (st) {
+    LOG_WARN("onnx: CreateTensor attention_mask failed: {}", g_api_->GetErrorMessage(st));
+    g_api_->ReleaseStatus(st);
+    release_inputs(1);
+    return {};
+  }
+
+  st = g_api_->CreateTensorWithDataAsOrtValue(
       mem_info_, seg.data(), byte_size, shape, 2,
       ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &inputs[2]);
+  if (st) {
+    LOG_WARN("onnx: CreateTensor token_type_ids failed: {}", g_api_->GetErrorMessage(st));
+    g_api_->ReleaseStatus(st);
+    release_inputs(2);
+    return {};
+  }
 
   // 推理
   const char* in_names[] = {"input_ids", "attention_mask", "token_type_ids"};
@@ -161,7 +187,7 @@ std::vector<float> OnnxEmbedding::encode(std::string_view text) {
   auto status = g_api_->Run(session_, nullptr, in_names, inputs, 3,
                             out_names, 1, &output);
 
-  for (int i = 0; i < 3; ++i) g_api_->ReleaseValue(inputs[i]);
+  release_inputs(3);
 
   if (status) {
     LOG_WARN("onnx: Run error: {}", g_api_->GetErrorMessage(status));
