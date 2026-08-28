@@ -20,6 +20,7 @@
 #include "cache/onnx_embedding.h"
 #include "common/config.h"
 #include "common/logger.h"
+#include "common/singleflight.h"
 #include "common/types.h"
 #include "server/filter.h"
 #include "server/http_server.h"
@@ -79,11 +80,12 @@ void handle_signal(int /*sig*/) {
   g_shutdown.store(true, std::memory_order_release);
 }
 
-// 请求处理管道：过滤 + 缓存 + LLM + 统计 + 过滤
+// 请求处理管道：过滤 + 缓存 + singleflight + LLM + 统计 + 过滤
 static std::string handle_request(const std::string& request_body,
                                    const GatewayConfig& cfg,
                                    MessageFilter* filter,
                                    CacheEngine* engine,
+                                   Singleflight* sf,
                                    Stats* stats) {
   auto t0 = std::chrono::steady_clock::now();
 
@@ -103,8 +105,11 @@ static std::string handle_request(const std::string& request_body,
   }
 
   // 4b. 语义缓存
+  std::string ns;
+  std::string ns_key;
   if (cfg.cache.enabled && !user_msg.empty()) {
-    auto ns = extract_namespace(request_body);
+    ns = extract_namespace(request_body);
+    ns_key = ns.empty() ? user_msg : ns + ":" + user_msg;
     auto hit = engine->try_hit(user_msg, ns);
     if (hit.hit) {
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -115,14 +120,39 @@ static std::string handle_request(const std::string& request_body,
     cached_embedding = std::move(hit.embedding);
   }
 
-  // 4c. 缓存未命中 转发 LLM
+  // 4c. 请求合并（singleflight）
+  if (!user_msg.empty() && !cached_embedding.empty()) {
+    auto fut = sf->try_merge(ns_key, cached_embedding);
+    if (fut.has_value()) {
+      auto status = fut->wait_for(
+          std::chrono::seconds(cfg.backend.timeout_seconds));
+      if (status == std::future_status::ready) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+        stats->record_cache_hit(elapsed.count());
+        LOG_INFO("singleflight: merged key={}", ns_key);
+        return fut->get();
+      }
+      LOG_DEBUG("singleflight: wait timeout for key={}", ns_key);
+    }
+    sf->insert(ns_key, cached_embedding);
+  }
+
+  // 4d. 缓存未命中 转发 LLM
   auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
                          request_body, cfg.backend.timeout_seconds);
+
+  // 4e. singleflight 完成/取消
+  bool ok = (result.status_code >= 200 && result.status_code < 300);
+  if (!ns_key.empty()) {
+    if (ok) sf->complete(ns_key, result.body);
+    else sf->cancel(ns_key);
+  }
 
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t0);
 
-  // 4d. 解析 token 用量
+  // 4f. 解析 token 用量
   int prompt_tokens = 0, completion_tokens = 0;
   if (result.status_code >= 200 && result.status_code < 300) {
     try {
@@ -133,13 +163,12 @@ static std::string handle_request(const std::string& request_body,
     } catch (...) {}
   }
 
-  // 4e. 写入缓存
-  bool ok = (result.status_code >= 200 && result.status_code < 300);
+  // 4g. 写入缓存
   if (ok && cfg.cache.enabled && !user_msg.empty())
     engine->cache_reply(user_msg, result.body, cached_embedding,
                         extract_namespace(request_body));
 
-  // 4f. 统计
+  // 4h. 统计
   stats->record_api_call(elapsed.count(), prompt_tokens, completion_tokens);
 
   if (ok)
@@ -229,8 +258,10 @@ int main(int argc, char* argv[]) {
   HttpServer server(cfg.server);
   g_shutdown.store(false, std::memory_order_release);
 
+  Singleflight flight_merge;
   server.set_handler([&](const std::string& body) {
-    return handle_request(body, cfg, filter.get(), engine.get(), stats.get());
+    return handle_request(body, cfg, filter.get(), engine.get(),
+                          &flight_merge, stats.get());
   });
 
   // ---- 5. 启动 ----
