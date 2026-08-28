@@ -284,7 +284,10 @@ void HttpServer::handle_client(int client_fd) {
     size_t remaining = resp.size();
     while (remaining > 0) {
       ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
-      if (sent <= 0) break;
+      if (sent <= 0) {
+        if (sent < 0) LOG_DEBUG("send error: {}", std::strerror(errno));
+        break;
+      }
       p += sent;
       remaining -= sent;
     }
@@ -312,7 +315,10 @@ void HttpServer::handle_client(int client_fd) {
     size_t remaining = result.response.size();
     while (remaining > 0) {
       ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
-      if (sent <= 0) break;
+      if (sent <= 0) {
+        if (sent < 0) LOG_DEBUG("send error: {}", std::strerror(errno));
+        break;
+      }
       p += sent;
       remaining -= sent;
     }
