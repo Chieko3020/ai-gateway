@@ -26,6 +26,7 @@
 - **向量检索**: 简化实现的 HNSW 图索引（未实现启发剪枝），10K 向量内召回率 95%
 - **存储引擎**: LRU + TTL 缓存管理，JSON 持久化
 - **嵌入推理**: C++ ONNX Runtime 进程内 INT8 量化推理，零外部依赖
+- **模型量化**: `scripts/quantize.py` — HuggingFace → FP32 ONNX → 动态量化 INT8 (~90MB→~23MB)
 - **连接池**: libcurl Keep-Alive 复用 TCP 连接
 
 ## 技术栈
