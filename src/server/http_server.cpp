@@ -112,6 +112,12 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
   ev.events = EPOLLIN | EPOLLET;  // 边缘触发
   ev.data.fd = listen_fd_;
   epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev);
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev) < 0) {
+    LOG_ERROR("epoll_ctl ADD listen_fd failed: {}", std::strerror(errno));
+    close(listen_fd_);
+    listen_fd_ = -1;
+    return;
+  }
 
   running_ = true;
   epoll_event events[kMaxEvents];
