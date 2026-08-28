@@ -62,6 +62,12 @@ class CacheEngine {
   float threshold() const { return threshold_; }
   int top_k() const { return top_k_; }
 
+  // 幽灵向量观测：返回"搜到但取不到"的比例，用于判断是否需要 rebuild_index
+  std::pair<int, size_t> ghost_stats() const;
+
+  // 如果幽灵率超过阈值，自动重建索引（在 60s 定时器中调用）
+  void try_rebuild_if_ghosty();
+
  private:
   EmbeddingConfig emb_cfg_;
   std::shared_ptr<LruStore> store_;
@@ -74,6 +80,10 @@ class CacheEngine {
 
   // 保护 next_id_ + HNSW add/search 并发（LruStore 自有锁）
   mutable std::mutex mutex_;
+
+  // 幽灵向量观测计数器
+  size_t ghost_count_ = 0;
+  size_t total_search_ = 0;
 };
 
 }  // namespace ai_gateway

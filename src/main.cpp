@@ -207,7 +207,7 @@ int main(int argc, char* argv[]) {
   sigaction(SIGTERM, &sa, nullptr);
 
   // ---- 3. 启动定期统计 + 定时持久化线程 ----
-  std::thread bg_thread([stats, lru, idx, &cfg] {
+  std::thread bg_thread([stats, lru, idx, engine, &cfg] {
     while (!g_shutdown.load(std::memory_order_acquire)) {
       {
         std::unique_lock lk(g_bg_mutex);
@@ -216,6 +216,7 @@ int main(int argc, char* argv[]) {
       }
       if (g_shutdown.load(std::memory_order_acquire)) break;
       stats->report();
+      if (cfg.cache.enabled) engine->try_rebuild_if_ghosty();
       // 定期持久化缓存，避免宕机丢了cache
       if (cfg.cache.enabled && lru->size() > 0) {
         lru->save("cache/lru_store.json");

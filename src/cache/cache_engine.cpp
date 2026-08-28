@@ -48,9 +48,9 @@ CacheEngine::HitResult CacheEngine::try_hit(
 
   // 3. 遍历结果，检查是否命中（相似度 ≥ 阈值，且命名空间匹配）
   std::string ns_prefix = ns.empty() ? "" : ns + ":";
+  ++total_search_;
   for (auto& r : results) {
     if (r.similarity >= threshold_) {
-      // 跨命名空间保护：跳过不属于当前 namespace 的缓存条目
       if (!ns.empty() && !r.key.starts_with(ns_prefix)) continue;
       auto cached = store_->get(r.key);
       if (cached.has_value()) {
@@ -58,6 +58,7 @@ CacheEngine::HitResult CacheEngine::try_hit(
                  ns.empty() ? "default" : ns);
         return HitResult{true, std::move(cached.value()), r.similarity};
       }
+      ++ghost_count_;
     }
   }
 
@@ -111,6 +112,26 @@ void CacheEngine::rebuild_index() {
   next_id_ = new_id;
 
   LOG_INFO("cache: index rebuilt, {} vectors", index_->size());
+}
+
+std::pair<int, size_t> CacheEngine::ghost_stats() const {
+  std::lock_guard lock(mutex_);
+  if (total_search_ == 0) return {0, 0};
+  int rate = static_cast<int>(ghost_count_ * 100 / total_search_);
+  return {rate, total_search_};
+}
+
+void CacheEngine::try_rebuild_if_ghosty() {
+  auto [rate, total] = ghost_stats();
+  if (total < 10) return;
+  if (rate > 5) {
+    LOG_INFO("cache: ghost rate {}% ({} / {}), auto-rebuilding index",
+             rate, ghost_count_, total_search_);
+    std::lock_guard lock(mutex_);
+    rebuild_index();
+    ghost_count_ = 0;
+    total_search_ = 0;
+  }
 }
 
 }  // namespace ai_gateway
