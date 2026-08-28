@@ -56,7 +56,8 @@ void HttpServer::add_route(std::string_view path, RequestHandler handler) {
 void HttpServer::set_nonblocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0) return;
-  fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+    LOG_WARN("fcntl F_SETFL failed: {}", std::strerror(errno));
 }
 
 int HttpServer::create_listen_socket() {
