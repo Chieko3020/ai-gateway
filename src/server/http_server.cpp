@@ -301,7 +301,8 @@ void HttpServer::handle_client(int client_fd) {
   }
 
   // 4. 请求完整：从 epoll 移除，提交线程池处理
-  epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr) < 0)
+    LOG_DEBUG("epoll_ctl DEL failed: {}", std::strerror(errno));
   std::string request = buf.substr(0, body_start + content_length);
   conn_buffers_.erase(client_fd);
 
