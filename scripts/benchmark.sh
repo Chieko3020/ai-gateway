@@ -5,7 +5,7 @@ set -e
 
 CONCURRENCY=${1:-5}
 REQUESTS=${2:-20}
-URL="http://localhost:9000/v1/chat/completions"
+URL="${GATEWAY_URL:-http://localhost:4000/v1/chat/completions}"
 BODY='{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}]}'
 
 echo "=== AI Gateway Benchmark ==="

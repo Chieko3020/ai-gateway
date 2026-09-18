@@ -88,6 +88,20 @@ static bool is_uncacheable_request(const std::string& request_body) {
   return false;
 }
 
+// 在 OpenAI 响应体中注入缓存状态字段，供压测脚本精确判定是否命中；
+// 额外字段不影响下游对标准字段的解析。
+static std::string annotate_cache_status(const std::string& body,
+                                         const char* status) {
+  try {
+    auto resp = json::parse(body);
+    if (!resp.is_object()) return body;
+    resp["_cache"] = status;
+    return resp.dump();
+  } catch (...) {
+    return body;  // 非 JSON（如错误页）原样返回
+  }
+}
+
 // 线程安全的关闭标志与后台线程唤醒机制
 static std::atomic<bool> g_shutdown{false};
 static std::mutex g_bg_mutex;
@@ -130,7 +144,7 @@ static std::string handle_request(const std::string& request_body,
       LOG_WARN("filter: rejected output containing URL");
       return R"({"error":"Response filtered"})";
     }
-    return out_result.sanitized;
+    return annotate_cache_status(out_result.sanitized, "bypass");
   }
 
   // 缓存命中检查时带回的 embedding（避免 cache_reply 重复计算）
@@ -159,7 +173,7 @@ static std::string handle_request(const std::string& request_body,
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - t0);
       stats->record_cache_hit(elapsed.count());
-      return hit.reply;
+      return annotate_cache_status(hit.reply, "hit");
     }
     cached_embedding = std::move(hit.embedding);
   }
@@ -175,7 +189,7 @@ static std::string handle_request(const std::string& request_body,
             std::chrono::steady_clock::now() - t0);
         stats->record_cache_hit(elapsed.count());
         LOG_INFO("singleflight: merged key={}", ns_key);
-        return fut->get();
+        return annotate_cache_status(fut->get(), "hit");
       }
       LOG_DEBUG("singleflight: wait timeout for key={}", ns_key);
     }
@@ -227,7 +241,7 @@ static std::string handle_request(const std::string& request_body,
     LOG_WARN("filter: rejected output containing URL");
     return R"({"error":"Response filtered"})";
   }
-  return out_result.sanitized;
+  return annotate_cache_status(out_result.sanitized, "miss");
 }
 
 int main(int argc, char* argv[]) {

@@ -1,0 +1,320 @@
+{"q": "你好", "cluster": "greeting"}
+{"q": "您好", "cluster": "greeting"}
+{"q": "嗨", "cluster": "greeting"}
+{"q": "hi", "cluster": "greeting"}
+{"q": "hello", "cluster": "greeting"}
+{"q": "嘿", "cluster": "greeting"}
+{"q": "在吗", "cluster": "greeting"}
+{"q": "有人吗", "cluster": "greeting"}
+{"q": "你好呀", "cluster": "greeting"}
+{"q": "早上好", "cluster": "greeting"}
+{"q": "早安", "cluster": "greeting"}
+{"q": "晚上好", "cluster": "greeting"}
+{"q": "下午好", "cluster": "greeting"}
+{"q": "好久不见", "cluster": "greeting"}
+{"q": "最近怎么样", "cluster": "greeting"}
+{"q": "嗨喽", "cluster": "greeting"}
+{"q": "哈喽", "cluster": "greeting"}
+{"q": "您好呀", "cluster": "greeting"}
+{"q": "喂", "cluster": "greeting"}
+{"q": "在不在", "cluster": "greeting"}
+{"q": "今天天气怎么样", "cluster": "weather"}
+{"q": "外面冷不冷", "cluster": "weather"}
+{"q": "明天会下雨吗", "cluster": "weather"}
+{"q": "天气如何", "cluster": "weather"}
+{"q": "今天温度多少", "cluster": "weather"}
+{"q": "需要带伞吗", "cluster": "weather"}
+{"q": "这几天会降温吗", "cluster": "weather"}
+{"q": "今天有太阳吗", "cluster": "weather"}
+{"q": "会不会刮风", "cluster": "weather"}
+{"q": "空气质量如何", "cluster": "weather"}
+{"q": "适合出门吗", "cluster": "weather"}
+{"q": "天气预报", "cluster": "weather"}
+{"q": "今天热不热", "cluster": "weather"}
+{"q": "外面在下雨吗", "cluster": "weather"}
+{"q": "明天天气好吗", "cluster": "weather"}
+{"q": "湿度大吗", "cluster": "weather"}
+{"q": "要穿外套吗", "cluster": "weather"}
+{"q": "今天多少度", "cluster": "weather"}
+{"q": "晚上冷不冷", "cluster": "weather"}
+{"q": "周末天气怎么样", "cluster": "weather"}
+{"q": "现在几点了", "cluster": "time"}
+{"q": "现在什么时间", "cluster": "time"}
+{"q": "今天几号", "cluster": "time"}
+{"q": "今天是周几", "cluster": "time"}
+{"q": "当前时间是多少", "cluster": "time"}
+{"q": "现在时刻", "cluster": "time"}
+{"q": "今天日期", "cluster": "time"}
+{"q": "这个月几号", "cluster": "time"}
+{"q": "现在几点钟", "cluster": "time"}
+{"q": "距离今天结束还有多久", "cluster": "time"}
+{"q": "现在是上午还是下午", "cluster": "time"}
+{"q": "今天星期几", "cluster": "time"}
+{"q": "当前日期是", "cluster": "time"}
+{"q": "告诉我现在的时间", "cluster": "time"}
+{"q": "现在时间戳", "cluster": "time"}
+{"q": "今天是什么日子", "cluster": "time"}
+{"q": "几点了现在", "cluster": "time"}
+{"q": "今天几月几号", "cluster": "time"}
+{"q": "本周第几天", "cluster": "time"}
+{"q": "现在时刻是几点", "cluster": "time"}
+{"q": "你是谁", "cluster": "identity"}
+{"q": "你叫什么名字", "cluster": "identity"}
+{"q": "你是什么", "cluster": "identity"}
+{"q": "介绍一下你自己", "cluster": "identity"}
+{"q": "你的名字是什么", "cluster": "identity"}
+{"q": "你是什么模型", "cluster": "identity"}
+{"q": "你是AI吗", "cluster": "identity"}
+{"q": "你能做什么", "cluster": "identity"}
+{"q": "你的能力范围", "cluster": "identity"}
+{"q": "你由谁开发", "cluster": "identity"}
+{"q": "你的身份", "cluster": "identity"}
+{"q": "自我介绍一下", "cluster": "identity"}
+{"q": "你叫什么", "cluster": "identity"}
+{"q": "你是什么产品", "cluster": "identity"}
+{"q": "你有哪些功能", "cluster": "identity"}
+{"q": "你是聊天机器人吗", "cluster": "identity"}
+{"q": "你的定位是什么", "cluster": "identity"}
+{"q": "你擅长什么", "cluster": "identity"}
+{"q": "你可以帮我做什么", "cluster": "identity"}
+{"q": "你是什么助手", "cluster": "identity"}
+{"q": "Python怎么读取文件", "cluster": "py_file"}
+{"q": "Python读文件", "cluster": "py_file"}
+{"q": "用python打开文件", "cluster": "py_file"}
+{"q": "python 文件读取方式", "cluster": "py_file"}
+{"q": "Python如何写入文件", "cluster": "py_file"}
+{"q": "python读取txt文件", "cluster": "py_file"}
+{"q": "python open 用法", "cluster": "py_file"}
+{"q": "Python 文件读写示例", "cluster": "py_file"}
+{"q": "python怎么打开一个文件", "cluster": "py_file"}
+{"q": "用 Python 读文本文件", "cluster": "py_file"}
+{"q": "python读取csv", "cluster": "py_file"}
+{"q": "Python 写文件", "cluster": "py_file"}
+{"q": "python 按行读取文件", "cluster": "py_file"}
+{"q": "python with open 语法", "cluster": "py_file"}
+{"q": "Python 读取 json 文件", "cluster": "py_file"}
+{"q": "python怎么保存文件", "cluster": "py_file"}
+{"q": "python 文件操作", "cluster": "py_file"}
+{"q": "Python 逐行读文件", "cluster": "py_file"}
+{"q": "python 读文件内容", "cluster": "py_file"}
+{"q": "Python 文件处理", "cluster": "py_file"}
+{"q": "什么是C++", "cluster": "cpp_basic"}
+{"q": "C++是什么语言", "cluster": "cpp_basic"}
+{"q": "介绍一下C++", "cluster": "cpp_basic"}
+{"q": "C++ 的特点", "cluster": "cpp_basic"}
+{"q": "C++和C的区别", "cluster": "cpp_basic"}
+{"q": "C++ 是面向对象的吗", "cluster": "cpp_basic"}
+{"q": "C++ 有什么用", "cluster": "cpp_basic"}
+{"q": "C++ 能做什么", "cluster": "cpp_basic"}
+{"q": "C++ 应用场景", "cluster": "cpp_basic"}
+{"q": "为什么要学C++", "cluster": "cpp_basic"}
+{"q": "C++ 语言简介", "cluster": "cpp_basic"}
+{"q": "C++ 支持哪些范式", "cluster": "cpp_basic"}
+{"q": "C++ 版本有哪些", "cluster": "cpp_basic"}
+{"q": "C++ 的优缺点", "cluster": "cpp_basic"}
+{"q": "C++ 适合做什么", "cluster": "cpp_basic"}
+{"q": "C++ 是什么级别的语言", "cluster": "cpp_basic"}
+{"q": "C++ 和 Java 区别", "cluster": "cpp_basic"}
+{"q": "C++ 主要特性", "cluster": "cpp_basic"}
+{"q": "C++ 由谁设计", "cluster": "cpp_basic"}
+{"q": "C++ 发展历史", "cluster": "cpp_basic"}
+{"q": "Linux怎么查看进程", "cluster": "linux_cmd"}
+{"q": "linux 查看进程命令", "cluster": "linux_cmd"}
+{"q": "如何列出系统进程", "cluster": "linux_cmd"}
+{"q": "ps 命令怎么用", "cluster": "linux_cmd"}
+{"q": "Linux 查看磁盘占用", "cluster": "linux_cmd"}
+{"q": "linux 查看端口占用", "cluster": "linux_cmd"}
+{"q": "top 命令怎么看", "cluster": "linux_cmd"}
+{"q": "Linux 查找文件", "cluster": "linux_cmd"}
+{"q": "linux 查看内存使用", "cluster": "linux_cmd"}
+{"q": "grep 命令用法", "cluster": "linux_cmd"}
+{"q": "Linux 查看日志", "cluster": "linux_cmd"}
+{"q": "linux 解压文件", "cluster": "linux_cmd"}
+{"q": "如何查看 CPU 使用率", "cluster": "linux_cmd"}
+{"q": "Linux 杀进程", "cluster": "linux_cmd"}
+{"q": "linux 查看目录大小", "cluster": "linux_cmd"}
+{"q": "awk 命令用法", "cluster": "linux_cmd"}
+{"q": "Linux 设置环境变量", "cluster": "linux_cmd"}
+{"q": "linux 后台运行程序", "cluster": "linux_cmd"}
+{"q": "查看网络连接的命令", "cluster": "linux_cmd"}
+{"q": "Linux 权限修改", "cluster": "linux_cmd"}
+{"q": "git怎么回退", "cluster": "git_op"}
+{"q": "git 回退版本", "cluster": "git_op"}
+{"q": "如何撤销 git 提交", "cluster": "git_op"}
+{"q": "git reset 用法", "cluster": "git_op"}
+{"q": "git 回滚代码", "cluster": "git_op"}
+{"q": "git 怎么切换分支", "cluster": "git_op"}
+{"q": "git 合并分支", "cluster": "git_op"}
+{"q": "git 提交规范", "cluster": "git_op"}
+{"q": "git 撤销修改", "cluster": "git_op"}
+{"q": "git rebase 怎么用", "cluster": "git_op"}
+{"q": "git 查看提交历史", "cluster": "git_op"}
+{"q": "git 冲突怎么解决", "cluster": "git_op"}
+{"q": "git 删除分支", "cluster": "git_op"}
+{"q": "git 拉取远程代码", "cluster": "git_op"}
+{"q": "git 推送失败怎么办", "cluster": "git_op"}
+{"q": "git stash 用法", "cluster": "git_op"}
+{"q": "git 打标签", "cluster": "git_op"}
+{"q": "git 忽略文件配置", "cluster": "git_op"}
+{"q": "git 查看差异", "cluster": "git_op"}
+{"q": "git 恢复删除的文件", "cluster": "git_op"}
+{"q": "HTTP和HTTPS区别", "cluster": "network"}
+{"q": "什么是TCP协议", "cluster": "network"}
+{"q": "TCP 三次握手", "cluster": "network"}
+{"q": "HTTP 状态码有哪些", "cluster": "network"}
+{"q": "HTTPS 加密原理", "cluster": "network"}
+{"q": "什么是DNS", "cluster": "network"}
+{"q": "TCP 和 UDP 区别", "cluster": "network"}
+{"q": "HTTP 请求方法", "cluster": "network"}
+{"q": "什么是长连接", "cluster": "network"}
+{"q": "Cookie 和 Session 区别", "cluster": "network"}
+{"q": "什么是 CDN", "cluster": "network"}
+{"q": "HTTP2 有什么改进", "cluster": "network"}
+{"q": "什么是负载均衡", "cluster": "network"}
+{"q": "OSI 七层模型", "cluster": "network"}
+{"q": "什么是反向代理", "cluster": "network"}
+{"q": "WebSocket 是什么", "cluster": "network"}
+{"q": "TCP 粘包怎么解决", "cluster": "network"}
+{"q": "什么是跨域", "cluster": "network"}
+{"q": "HTTP 缓存机制", "cluster": "network"}
+{"q": "什么是 RESTful", "cluster": "network"}
+{"q": "什么是虚拟内存", "cluster": "os_mem"}
+{"q": "进程和线程的区别", "cluster": "os_mem"}
+{"q": "什么是死锁", "cluster": "os_mem"}
+{"q": "内存泄漏怎么排查", "cluster": "os_mem"}
+{"q": "什么是僵尸进程", "cluster": "os_mem"}
+{"q": "用户态和内核态区别", "cluster": "os_mem"}
+{"q": "什么是协程", "cluster": "os_mem"}
+{"q": "CPU 调度算法有哪些", "cluster": "os_mem"}
+{"q": "什么是页面置换", "cluster": "os_mem"}
+{"q": "进程间通信方式", "cluster": "os_mem"}
+{"q": "什么是内存对齐", "cluster": "os_mem"}
+{"q": "什么是写时复制", "cluster": "os_mem"}
+{"q": "文件描述符是什么", "cluster": "os_mem"}
+{"q": "什么是上下文切换", "cluster": "os_mem"}
+{"q": "堆和栈的区别", "cluster": "os_mem"}
+{"q": "什么是信号量", "cluster": "os_mem"}
+{"q": "什么是线程池", "cluster": "os_mem"}
+{"q": "什么是零拷贝", "cluster": "os_mem"}
+{"q": "什么是 DMA", "cluster": "os_mem"}
+{"q": "中断和轮询区别", "cluster": "os_mem"}
+{"q": "MySQL 索引原理", "cluster": "sql"}
+{"q": "什么是数据库事务", "cluster": "sql"}
+{"q": "SQL 查询优化", "cluster": "sql"}
+{"q": "MVCC 是什么", "cluster": "sql"}
+{"q": "什么是慢查询", "cluster": "sql"}
+{"q": "MySQL 主从复制", "cluster": "sql"}
+{"q": "SQL 注入怎么防", "cluster": "sql"}
+{"q": "什么是间隙锁", "cluster": "sql"}
+{"q": "数据库隔离级别", "cluster": "sql"}
+{"q": "什么是范式", "cluster": "sql"}
+{"q": "MySQL 存储引擎区别", "cluster": "sql"}
+{"q": "什么是回表", "cluster": "sql"}
+{"q": "如何设计索引", "cluster": "sql"}
+{"q": "什么是分库分表", "cluster": "sql"}
+{"q": "Redis 和 MySQL 区别", "cluster": "sql"}
+{"q": "什么是乐观锁", "cluster": "sql"}
+{"q": "SQL 执行计划怎么看", "cluster": "sql"}
+{"q": "什么是死锁检测", "cluster": "sql"}
+{"q": "数据库连接池作用", "cluster": "sql"}
+{"q": "什么是读写分离", "cluster": "sql"}
+{"q": "推荐一本书", "cluster": "recommend"}
+{"q": "有什么好书推荐", "cluster": "recommend"}
+{"q": "推荐一本小说", "cluster": "recommend"}
+{"q": "好看的书有哪些", "cluster": "recommend"}
+{"q": "值得读的书", "cluster": "recommend"}
+{"q": "推荐一本技术书", "cluster": "recommend"}
+{"q": "有哪些经典书籍", "cluster": "recommend"}
+{"q": "推荐点书给我", "cluster": "recommend"}
+{"q": "好书推荐一下", "cluster": "recommend"}
+{"q": "适合入门看的书", "cluster": "recommend"}
+{"q": "推荐一本书看看", "cluster": "recommend"}
+{"q": "有什么值得看的书", "cluster": "recommend"}
+{"q": "书单推荐", "cluster": "recommend"}
+{"q": "推荐几本书", "cluster": "recommend"}
+{"q": "想看书求推荐", "cluster": "recommend"}
+{"q": "有哪些必读书", "cluster": "recommend"}
+{"q": "推荐一本悬疑小说", "cluster": "recommend"}
+{"q": "推荐一本历史书", "cluster": "recommend"}
+{"q": "有哪些好书值得读", "cluster": "recommend"}
+{"q": "给我推荐一本书", "cluster": "recommend"}
+{"q": "1+1等于几", "cluster": "math"}
+{"q": "一加一等于多少", "cluster": "math"}
+{"q": "1加1", "cluster": "math"}
+{"q": "计算 1+1", "cluster": "math"}
+{"q": "1+1=?", "cluster": "math"}
+{"q": "2的10次方是多少", "cluster": "math"}
+{"q": "100除以4等于多少", "cluster": "math"}
+{"q": "求 15 的平方", "cluster": "math"}
+{"q": "3乘以7等于几", "cluster": "math"}
+{"q": "100以内质数有哪些", "cluster": "math"}
+{"q": "圆的面积怎么算", "cluster": "math"}
+{"q": "什么是斐波那契数列", "cluster": "math"}
+{"q": "计算 12*12", "cluster": "math"}
+{"q": "9的平方根是多少", "cluster": "math"}
+{"q": "sin30度等于多少", "cluster": "math"}
+{"q": "一元二次方程求根公式", "cluster": "math"}
+{"q": "什么是质数", "cluster": "math"}
+{"q": "计算 25% 是多少", "cluster": "math"}
+{"q": "三角形面积公式", "cluster": "math"}
+{"q": "排列组合怎么算", "cluster": "math"}
+{"q": "把这句话翻译成英文", "cluster": "translate"}
+{"q": "翻译成英文", "cluster": "translate"}
+{"q": "这句怎么翻译", "cluster": "translate"}
+{"q": "帮我翻译一下", "cluster": "translate"}
+{"q": "中译英", "cluster": "translate"}
+{"q": "英文怎么说", "cluster": "translate"}
+{"q": "翻译这句话", "cluster": "translate"}
+{"q": "请翻译成英语", "cluster": "translate"}
+{"q": "这句话英文是什么", "cluster": "translate"}
+{"q": "帮我翻译成中文", "cluster": "translate"}
+{"q": "翻译一下这段话", "cluster": "translate"}
+{"q": "怎么用英文表达", "cluster": "translate"}
+{"q": "这句话怎么用英语说", "cluster": "translate"}
+{"q": "翻译这个单词", "cluster": "translate"}
+{"q": "英文翻译中文", "cluster": "translate"}
+{"q": "请把下面这句翻译", "cluster": "translate"}
+{"q": "英译中", "cluster": "translate"}
+{"q": "翻译求助", "cluster": "translate"}
+{"q": "这句英文什么意思", "cluster": "translate"}
+{"q": "帮忙翻译一句", "cluster": "translate"}
+{"q": "谢谢", "cluster": "chat"}
+{"q": "多谢", "cluster": "chat"}
+{"q": "感谢", "cluster": "chat"}
+{"q": "辛苦了", "cluster": "chat"}
+{"q": "谢谢你的帮助", "cluster": "chat"}
+{"q": "太感谢了", "cluster": "chat"}
+{"q": "thanks", "cluster": "chat"}
+{"q": "谢了", "cluster": "chat"}
+{"q": "麻烦你了", "cluster": "chat"}
+{"q": "感谢解答", "cluster": "chat"}
+{"q": "好的谢谢", "cluster": "chat"}
+{"q": "明白了谢谢", "cluster": "chat"}
+{"q": "可以了谢谢", "cluster": "chat"}
+{"q": "谢谢啦", "cluster": "chat"}
+{"q": "感谢你", "cluster": "chat"}
+{"q": "非常感谢", "cluster": "chat"}
+{"q": "谢啦", "cluster": "chat"}
+{"q": "多亏了你", "cluster": "chat"}
+{"q": "谢谢解答", "cluster": "chat"}
+{"q": "感谢帮忙", "cluster": "chat"}
+{"q": "怎么学习算法", "cluster": "extra"}
+{"q": "什么是动态规划", "cluster": "extra"}
+{"q": "推荐学习路线", "cluster": "extra"}
+{"q": "如何准备面试", "cluster": "extra"}
+{"q": "简历怎么写", "cluster": "extra"}
+{"q": "什么是微服务", "cluster": "extra"}
+{"q": "什么是容器化", "cluster": "extra"}
+{"q": "Docker 和虚拟机的区别", "cluster": "extra"}
+{"q": "什么是 K8s", "cluster": "extra"}
+{"q": "CI/CD 是什么", "cluster": "extra"}
+{"q": "什么是单元测试", "cluster": "extra"}
+{"q": "代码审查怎么做", "cluster": "extra"}
+{"q": "什么是设计模式", "cluster": "extra"}
+{"q": "什么是重构", "cluster": "extra"}
+{"q": "如何提高代码质量", "cluster": "extra"}
+{"q": "什么是敏捷开发", "cluster": "extra"}
+{"q": "技术债是什么", "cluster": "extra"}
+{"q": "如何做技术选型", "cluster": "extra"}
+{"q": "什么是灰度发布", "cluster": "extra"}
+{"q": "如何排查线上问题", "cluster": "extra"}
