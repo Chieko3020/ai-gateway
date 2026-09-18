@@ -68,6 +68,12 @@ add_executable(test_metrics test_metrics.cpp)
 target_link_libraries(test_metrics ai_gateway_server ai_gateway_stats
     ai_gateway_common ai_gateway_test_check)
 
+# 分词器保真度（报告 8.7 第 5 条）：与 HuggingFace BERT WordPiece 的金标准 id 对照
+add_executable(test_tokenizer test_tokenizer.cpp)
+target_link_libraries(test_tokenizer ai_gateway_cache ai_gateway_common
+    ai_gateway_test_check)
+target_compile_definitions(test_tokenizer PRIVATE GATEWAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 add_test(NAME filter COMMAND test_filter)
 add_test(NAME request COMMAND test_request)
 add_test(NAME response COMMAND test_response)
@@ -80,6 +86,7 @@ add_test(NAME cache_engine COMMAND test_cache_engine)
 add_test(NAME http_server COMMAND test_http_server)
 add_test(NAME log_rotation COMMAND test_log_rotation)
 add_test(NAME metrics COMMAND test_metrics)
+add_test(NAME tokenizer COMMAND test_tokenizer)
 
 # HNSW 自检索召回率断言（合成向量 + 固定种子，确定性）
 add_test(NAME hnsw_recall
@@ -88,4 +95,6 @@ add_test(NAME hnsw_recall
 # test_config 依赖相对路径 config/gateway.example.json：把工作目录钉在源码根目录，
 # 否则从构建目录运行时会加载失败（Debug 下曾直接断言 abort）
 set_tests_properties(config PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# test_tokenizer 需要 model/vocab.txt（相对源码根目录）
+set_tests_properties(tokenizer PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(hnsw_recall PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
