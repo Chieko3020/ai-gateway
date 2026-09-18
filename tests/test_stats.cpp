@@ -1,5 +1,5 @@
 // Stats 单元测试
-#include <cassert>
+#include "test_check.h"
 #include <iostream>
 #include "stats/stats.h"
 using namespace ai_gateway;
@@ -10,11 +10,11 @@ int main() {
   st.record_api_call(200, 50, 30);
   st.record_cache_hit(50);
 
-  assert(st.total_requests() == 3);
-  assert(st.cache_hits() == 2);
-  assert(st.cache_misses() == 1);
-  assert(st.hit_rate() > 0.66 && st.hit_rate() < 0.67);
-  assert(st.max_latency_ms() == 200);
+  CHECK(st.total_requests() == 3);
+  CHECK(st.cache_hits() == 2);
+  CHECK(st.cache_misses() == 1);
+  CHECK(st.hit_rate() > 0.66 && st.hit_rate() < 0.67);
+  CHECK(st.max_latency_ms() == 200);
   int ok = 5;
 
   // 旁路流量（工具调用 / 流式）：计入 token 与独立延迟，但不污染命中率
@@ -25,12 +25,12 @@ int main() {
     double rate_before = b.hit_rate();
     b.record_bypass(300, 200, 80);
 
-    assert(b.bypassed() == 1); ok++;
-    assert(b.total_requests() == 2); ok++;         // 旁路不计入 total
-    assert(b.hit_rate() == rate_before); ok++;     // 命中率不受影响
-    assert(b.total_prompt_tokens() == 300); ok++;  // 100 + 200
-    assert(b.avg_bypass_latency_ms() == 300); ok++;
-    assert(b.avg_latency_ms() == 15); ok++;        // (10+20)/2，旁路不掺入
+    CHECK(b.bypassed() == 1); ok++;
+    CHECK(b.total_requests() == 2); ok++;         // 旁路不计入 total
+    CHECK(b.hit_rate() == rate_before); ok++;     // 命中率不受影响
+    CHECK(b.total_prompt_tokens() == 300); ok++;  // 100 + 200
+    CHECK(b.avg_bypass_latency_ms() == 300); ok++;
+    CHECK(b.avg_latency_ms() == 15); ok++;        // (10+20)/2，旁路不掺入
   }
 
   // 回归：report() 内部会调用 avg_bypass_latency_ms()，那里不可再加锁（否则 EDEADLK 终止进程）
@@ -46,13 +46,12 @@ int main() {
   {
     Stats q;
     for (int i = 1; i <= 100; ++i) q.record_api_call(i, 0, 0);
-    assert(q.latency_samples() == 100); ok++;
-    assert(q.percentile(0) == 1); ok++;
-    assert(q.percentile(50) >= 49 && q.percentile(50) <= 51); ok++;
-    assert(q.percentile(95) >= 94 && q.percentile(95) <= 96); ok++;
-    assert(q.percentile(100) == 100); ok++;
+    CHECK(q.latency_samples() == 100); ok++;
+    CHECK(q.percentile(0) == 1); ok++;
+    CHECK(q.percentile(50) >= 49 && q.percentile(50) <= 51); ok++;
+    CHECK(q.percentile(95) >= 94 && q.percentile(95) <= 96); ok++;
+    CHECK(q.percentile(100) == 100); ok++;
   }
 
-  std::cout << "test_stats: " << ok << "/17 passed\n";
-  return 0;
+    return test_check::finish("test_stats", ok);
 }

@@ -7,6 +7,9 @@
 //      ./tests/recall_bench --synthetic 5000 --dim 512 --queries 200
 //
 // 测量：自检索 top-1 成功率、top-k 召回率（vs 抽样暴力检索）、两种检索延迟与加速比
+//
+// --check：把关键指标变成断言（自检索 top-1 >= 98%、top-k 召回 >= 95%、无空结果），
+//          失败时以非零退出码结束，供 ctest 使用
 
 #include <algorithm>
 #include <chrono>
@@ -22,6 +25,7 @@
 
 #include "cache/hnsw_index.h"
 #include "cache/onnx_embedding.h"
+#include "test_check.h"
 
 using json = nlohmann::json;
 using namespace ai_gateway;
@@ -60,6 +64,7 @@ int main(int argc, char** argv) {
 
   // ---- 解析参数 ----
   bool synthetic = false;
+  bool check_mode = false;  // --check：阈值断言模式（ctest）
   size_t synth_n = 0;
   size_t queries = 200;
   std::vector<std::string> pos;
@@ -74,6 +79,8 @@ int main(int argc, char** argv) {
       queries = std::stoul(argv[++i]);
     } else if (a == "--topk" && i + 1 < argc) {
       top_k = std::stoi(argv[++i]);
+    } else if (a == "--check") {
+      check_mode = true;
     } else {
       pos.push_back(a);
     }
@@ -199,5 +206,15 @@ int main(int argc, char** argv) {
   std::cout << "暴力检索平均: " << (static_cast<double>(brute_us) / n) << "us\n";
   if (hnsw_us > 0)
     std::cout << "加速比: " << (static_cast<double>(brute_us) / hnsw_us) << "x\n";
-  return 0;
+
+  if (!check_mode) return 0;
+
+  // ---- 阈值断言（ctest --check）：把"关键指标"变成可判定的回归线 ----
+  // 阈值留有余量：本机 800 x 512d / 200 查询实测 self-top1 = 100%、top-3 召回 ≈ 99.8%
+  int ok = 0;
+  CHECK(index.size() == total); ok++;
+  CHECK(empty_results == 0); ok++;
+  CHECK(static_cast<double>(self_top1) / n >= 0.98); ok++;
+  CHECK(recall_sum / n >= 0.95); ok++;
+  return test_check::finish("recall_bench(--check)", ok);
 }
