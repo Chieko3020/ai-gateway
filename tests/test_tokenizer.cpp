@@ -7,8 +7,13 @@
 //              --dump-bin <build>/tests/test_tokenizer`
 //
 // 官方 tokenizer_config.json（BAAI/bge-small-zh-v1.5 = google-bert/bert-base-chinese，
-// 与仓库 vocab.txt 逐字节相同）里 `do_lower_case: false`，所以默认**不做**小写化：
-//   默认（cased）列 = 官方默认行为；lower 列 = do_lower_case=true 时的行为
+// 与仓库 vocab.txt 逐字节相同）里写的是 `do_lower_case: false`，但**模型自带的**
+// sentence_bert_config.json 是 `do_lower_case: true` —— sentence-transformers 加载
+// 该模型时以后者为准，这才是"官方用法"的取值。本分词器的默认值因此是 true：
+//   默认（lower）列 = sentence-transformers 实际行为；cased 列 = do_lower_case=false
+//
+// 这不是风格偏好：本词表只有小写英文，do_lower_case=false 会让 `DMA`/`DNS` 都整词
+// 回退成 [UNK]，两条文本的 id 序列完全相同（向量余弦 1.0，任何阈值都拦不住）
 //
 // 判别力说明：把分词器换回修复前的"逐位置最长子串匹配 + 固定 10 字符窗口、无 ## 续接"
 // 实现后，17 条金标准样本只有 2 条 id 对得上（纯汉字那两条），其余 15 条全部失败：
@@ -145,26 +150,13 @@ int main(int argc, char** argv) {
   CHECK(BertWordPieceTokenizer::kClsId == 101 && BertWordPieceTokenizer::kSepId == 102);
   ok++;
 
-  // 默认大小写策略必须与官方 tokenizer_config.json（do_lower_case=false）一致
-  CHECK(!tok.do_lower_case());
-  ok++;
-
-  // ── 1. 金标准样本（官方 transformers 的 id）──────────────────────────
-  size_t mismatched_cased = 0, mismatched_lower = 0;
-  for (const auto& g : gold_samples()) {
-    auto got = tok.encode(g.text);
-    if (got != g.cased) {
-      ++mismatched_cased;
-      std::fprintf(stderr, "cased mismatch: %s\n  got: %s\n  want: %s\n", g.text,
-                   join_ids(got).c_str(), join_ids(g.cased).c_str());
-    }
-  }
-  CHECK(mismatched_cased == 0);
-  ok++;
-
-  tok.set_do_lower_case(true);
+  // 默认大小写策略 = 官方 sentence_bert_config.json（do_lower_case=true）
   CHECK(tok.do_lower_case());
   ok++;
+
+  // ── 1. 金标准样本 ───────────────────────────────────────────────────
+  // 先用默认（lower）列比对；再显式关掉 lowercase，用 cased 列比对
+  size_t mismatched_lower = 0, mismatched_cased = 0;
   for (const auto& g : gold_samples()) {
     auto got = tok.encode(g.text);
     if (got == g.lower) continue;
@@ -184,7 +176,28 @@ int main(int argc, char** argv) {
   ok++;
   CHECK(tok.encode("ab한") == std::vector<int64_t>({101, 100, 102}));
   ok++;
+
   tok.set_do_lower_case(false);
+  CHECK(!tok.do_lower_case());
+  ok++;
+  for (const auto& g : gold_samples()) {
+    auto got = tok.encode(g.text);
+    if (got != g.cased) {
+      ++mismatched_cased;
+      std::fprintf(stderr, "cased mismatch: %s\n  got: %s\n  want: %s\n", g.text,
+                   join_ids(got).c_str(), join_ids(g.cased).c_str());
+    }
+  }
+  CHECK(mismatched_cased == 0);
+  ok++;
+  // 这里正是 DMA/DNS 反例的**分词层**证据：do_lower_case=false 时 `DMA` 与 `DNS`
+  // 都整词回退成 [UNK]，两个句子的 id 序列完全相同 —— 下游余弦必然是 1.0，
+  // 阈值再高也拦不住。打开 lowercase 后 `dma`/`dns` 分别命中子词，序列才有区别
+  CHECK(tok.encode("什么是DMA") == tok.encode("什么是DNS"));
+  ok++;
+  tok.set_do_lower_case(true);
+  CHECK(tok.encode("什么是DMA") != tok.encode("什么是DNS"));
+  ok++;
 
   // ── 2. WordPiece 规则本身 ───────────────────────────────────────────
   // 最长匹配 + ## 续接：连写词必须切成 "hello" + "##world"（旧实现给 "hello"+"world"）

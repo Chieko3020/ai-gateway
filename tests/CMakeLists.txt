@@ -74,6 +74,22 @@ target_link_libraries(test_embedding_fingerprint ai_gateway_cache
 add_executable(test_stats test_stats.cpp)
 target_link_libraries(test_stats ai_gateway_stats ai_gateway_common ai_gateway_test_check)
 
+# 实体一致性否决（本轮新增）：数字/大写缩略语/混合标识符的提取与不对称判定。
+# 依赖实测反例（继续下一题 ↔ 继续12题、什么是DMA ↔ 什么是DNS）
+add_executable(test_entity_tokens test_entity_tokens.cpp)
+target_link_libraries(test_entity_tokens ai_gateway_cache ai_gateway_common
+    ai_gateway_test_check)
+
+# SSE usage 解析（本轮新增）：流式 token 统计，任意 chunk 切分 + 有界性 + 不误判
+add_executable(test_sse_usage test_sse_usage.cpp)
+target_link_libraries(test_sse_usage ai_gateway_server ai_gateway_common
+    ai_gateway_test_check)
+
+# 流式写死线语义（本轮新增）：流式用空闲死线（长流不被切断）、缓冲式保留总死线
+add_executable(test_stream_timeout test_stream_timeout.cpp)
+target_link_libraries(test_stream_timeout ai_gateway_server ai_gateway_common
+    ai_gateway_test_check)
+
 # 日志轮转（报告 8.7 第 4 条）：切分/保留份数/行边界/关闭开关
 add_executable(test_log_rotation test_log_rotation.cpp)
 target_link_libraries(test_log_rotation ai_gateway_common ai_gateway_test_check)
@@ -105,6 +121,9 @@ add_test(NAME tokenizer COMMAND test_tokenizer)
 add_test(NAME sse_stream COMMAND test_sse_stream)
 add_test(NAME keep_alive COMMAND test_keep_alive)
 add_test(NAME embedding_fingerprint COMMAND test_embedding_fingerprint)
+add_test(NAME entity_tokens COMMAND test_entity_tokens)
+add_test(NAME sse_usage COMMAND test_sse_usage)
+add_test(NAME stream_timeout COMMAND test_stream_timeout)
 
 # HNSW 自检索召回率断言（合成向量 + 固定种子，确定性）
 add_test(NAME hnsw_recall

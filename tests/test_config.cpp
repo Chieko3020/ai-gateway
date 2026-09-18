@@ -48,8 +48,19 @@ int main() {
     // 日志轮转参数来自配置（示例配置显式给出 10MB / 5 份）
     CHECK(cfg.log.max_bytes == 10 * 1024 * 1024); ok++;
     CHECK(cfg.log.keep_files == 5); ok++;
-    // 报告 8.7 第 3 条：写超时可配置（大响应 + 慢客户端时 worker 的等待上限）
+    // 报告 8.7 第 3 条 / 本轮第 5 项：写死线分两种口径，都必须在配置里可见
     CHECK(cfg.server.write_timeout_seconds >= 1); ok++;
+    CHECK(cfg.server.stream_idle_timeout_seconds >= 1); ok++;
+    // 示例配置里两者都是 60s（与 backend.timeout_seconds 同量级）；
+    // 旧默认 10s 是"整条响应"的死线，会把超过 10s 的长回答/长流切断
+    CHECK(cfg.server.write_timeout_seconds == 60); ok++;
+    CHECK(cfg.server.stream_idle_timeout_seconds == 60); ok++;
+
+    // 本轮第 1/2 项：示例配置的向量产生方式必须与官方一致
+    CHECK(cfg.embedding.do_lower_case == true); ok++;
+    CHECK(cfg.embedding.pooling == PoolingMode::kCls); ok++;
+    // 本轮第 4 项：实体一致性否决默认开启
+    CHECK(cfg.cache.entity_veto == true); ok++;
 
     // 默认值兜底：空配置（不存在的键）时的默认必须自洽
     {
@@ -65,8 +76,16 @@ int main() {
         // 单价缺省 = 旧的统一口径，保证不配置时报表金额与修复前完全一致
         CHECK(def.cost.input_per_1k == 0.001); ok++;
         CHECK(def.cost.output_per_1k == 0.001); ok++;
-        // 写超时默认 10s（0/负值会被夹到 1）：保证"等到写完"不会无限期
-        CHECK(def.server.write_timeout_seconds == 10); ok++;
+        // 写超时默认 60s（0/负值会被夹到 1）：与 backend.timeout_seconds 同量级。
+        // 旧默认 10s 是整条响应的总死线，会把超过 10s 的长回答直接切断（本轮第 5 项）
+        CHECK(def.server.write_timeout_seconds == 60); ok++;
+        // 流式空闲死线默认 60s（只约束"客户端多久没有进展"，不约束流的长度）
+        CHECK(def.server.stream_idle_timeout_seconds == 60); ok++;
+        // 向量产生方式的默认值 = 官方 sentence-transformers 的行为
+        CHECK(def.embedding.do_lower_case == true); ok++;
+        CHECK(def.embedding.pooling == PoolingMode::kCls); ok++;
+        // 实体否决默认开启（阈值救不了"只差一个实体"的反例）
+        CHECK(def.cache.entity_veto == true); ok++;
     }
 
     return test_check::finish("test_config", ok);

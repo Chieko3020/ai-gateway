@@ -223,5 +223,116 @@ int main() {
     CHECK(!ns_other.hit); ok++;  // 另一个 namespace 不应命中原条目的 source
   }
 
+  // ── 5. 实体一致性否决（本轮第 4 项）：DMA/DNS 从"余弦 1.0 命中"变为"不命中" ──
+  // 为什么用测试替身而不是真模型：这一段的断言对象是**否决规则本身**，需要
+  // "相似度必然 = 1.0"这个可控前提。vec_of_text 把"文本里的数字"映射成单位向量
+  // 下标，不含数字的文本（DMA/DNS 两个反例都属于此类）都落到 v[0]，余弦恰好 1.0
+  // ——这正是旧配置下 `什么是DMA`/`什么是DNS` 的真实表现（do_lower_case=false 时
+  // 两者 token 序列相同）。真实模型上的端到端数值由
+  // scripts/eval_semantic_cache.py 给出（那里会真的跑 ONNX）
+  {
+    const auto same_vec = vec_of_text("什么是DNS");  // 与查询向量完全相同
+    std::vector<float> probe(kDim, 0.0f);
+    probe[0] = 1.0f;  // 无数字文本的向量（= vec_of_text("什么是DMA")）
+
+    // (a) 候选实体与查询不一致 -> 否决，不命中
+    {
+      auto lru = std::make_shared<LruStore>(100, 3600);
+      CacheEngine engine(ec, cc, lru,
+                         std::make_shared<HnswIndex>(HnswConfig{kDim, 16, 100, 50}),
+                         embed_fn);
+      engine.cache_reply("什么是DNS", "DNS是域名系统", same_vec, "");
+      auto vetoed = engine.try_hit("什么是DMA", "");
+      CHECK(!vetoed.hit); ok++;
+      CHECK(engine.entity_veto_count() == 1); ok++;
+    }
+
+    // (b) 关掉否决开关（entity_veto=false）-> 同一份数据必须命中。
+    //     这一条是关键：它证明"不命中"确实来自否决规则，而不是相似度或命名空间
+    {
+      CacheConfig cc_off = cc;
+      cc_off.entity_veto = false;
+      auto lru = std::make_shared<LruStore>(100, 3600);
+      CacheEngine engine(ec, cc_off, lru,
+                         std::make_shared<HnswIndex>(HnswConfig{kDim, 16, 100, 50}),
+                         embed_fn);
+      engine.cache_reply("什么是DNS", "DNS是域名系统", same_vec, "");
+      auto hit = engine.try_hit("什么是DMA", "");
+      CHECK(hit.hit); ok++;
+      CHECK(hit.similarity > 0.999f); ok++;  // 相似度就是 1.0：阈值拦不住
+      CHECK(hit.reply == "DNS是域名系统"); ok++;
+      CHECK(engine.entity_veto_count() == 0); ok++;
+    }
+
+    // (c) 实体一致 -> 正常命中（否决规则不得误伤同实体问法）
+    {
+      auto lru = std::make_shared<LruStore>(100, 3600);
+      CacheEngine engine(ec, cc, lru,
+                         std::make_shared<HnswIndex>(HnswConfig{kDim, 16, 100, 50}),
+                         embed_fn);
+      engine.cache_reply("什么是DNS", "DNS是域名系统", same_vec, "");
+      auto hit_same = engine.try_hit("什么是DNS", "");
+      CHECK(hit_same.hit); ok++;
+      CHECK(hit_same.reply == "DNS是域名系统"); ok++;
+      CHECK(engine.entity_veto_count() == 0); ok++;
+    }
+
+    // (d) 数字类反例：`继续下一题` ↔ `继续0题`
+    //     为什么不用 "12"：测试替身把"文本里的数字"当下标映射成单位向量，
+    //     "继续下一题"（无数字 -> 下标 0）与 "继续12题"（下标 12）是**正交**的，
+    //     余弦 0，构造不出"余弦高但不是同一题"的前提。
+    //     这里改成候选含数字 0（同样映射到下标 0），余弦 = 1.0，
+    //     而实体集合是 {0} vs {} —— 正是"只差一个实体、相似度却拉满"的形状。
+    //     真实语料上该类反例的余弦见简报（`继续下一题`↔`继续12题` 实测 0.885）
+    {
+      auto lru = std::make_shared<LruStore>(100, 3600);
+      CacheEngine engine(ec, cc, lru,
+                         std::make_shared<HnswIndex>(HnswConfig{kDim, 16, 100, 50}),
+                         embed_fn);
+      engine.cache_reply("继续0题", "第零题的答案", probe, "");
+      // 查询 "继续下一题" 无数字 -> vec_of_text 也给 v[0]，与 probe 相同 -> 余弦 1.0
+      auto vetoed_num = engine.try_hit("继续下一题", "");
+      CHECK(!vetoed_num.hit); ok++;
+      CHECK(engine.entity_veto_count() == 1); ok++;
+      // 反方向（查询有实体、候选没有）同样必须否决：两边不对称就是不放心。
+      // 注意这里必须用**唯一候选**验证——此时缓存里已有实体一致的 "继续0题"，
+      // 而正确行为是命中它（与场景 (e) 同理），不是整条查询判未命中。
+      {
+        auto lru2 = std::make_shared<LruStore>(100, 3600);
+        CacheEngine engine2(ec, cc, lru2,
+                            std::make_shared<HnswIndex>(HnswConfig{kDim, 16, 100, 50}),
+                            embed_fn);
+        engine2.cache_reply("继续下一题", "无编号的答案", probe, "");
+        auto vetoed_rev = engine2.try_hit("继续0题", "");
+        CHECK(!vetoed_rev.hit); ok++;
+        CHECK(engine2.entity_veto_count() == 1); ok++;
+      }
+      // 两条候选共存（一条实体一致、一条不一致）：必须命中实体一致的那条，
+      // 而不是被 veto 的那条，也不是整条判未命中
+      {
+        engine.cache_reply("继续下一题", "无编号的答案", probe, "");
+        auto mixed = engine.try_hit("继续0题", "");
+        CHECK(mixed.hit); ok++;
+        CHECK(mixed.reply == "第零题的答案"); ok++;
+      }
+    }
+
+    // (e) 被否决后必须继续看后面的候选，而不是直接判未命中：
+    //     索引里同时存在"实体不一致（余弦 1.0）"与"实体一致（余弦也过阈值）"
+    //     两条时，应当命中后者
+    {
+      auto lru = std::make_shared<LruStore>(100, 3600);
+      CacheEngine engine(ec, cc, lru,
+                         std::make_shared<HnswIndex>(HnswConfig{kDim, 16, 100, 50}),
+                         embed_fn);
+      engine.cache_reply("什么是DNS", "A-dns", probe, "");   // 候选 A：实体不一致
+      engine.cache_reply("什么是DMA", "B-dma", probe, "");   // 候选 B：实体一致
+      auto hit4 = engine.try_hit("什么是DMA", "");
+      CHECK(hit4.hit); ok++;
+      CHECK(hit4.reply == "B-dma"); ok++;  // 命中实体一致的那条，而不是先到的 A
+      CHECK(engine.entity_veto_count() >= 1); ok++;
+    }
+  }
+
   return test_check::finish("test_cache_engine", ok);
 }
