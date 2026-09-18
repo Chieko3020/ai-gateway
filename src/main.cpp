@@ -182,7 +182,14 @@ static std::string handle_request(const std::string& request_body,
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - t0);
       stats->record_cache_hit(elapsed.count());
-      return annotate_cache_status(hit.reply, "hit");
+      // 命中路径与未命中路径统一口径：缓存里存的是上游原文（未过滤），取出来同样
+      // 要过 check_output，否则"先让含 URL 的答案入缓存、再命中"即可绕过输出过滤
+      auto hit_out = filter->check_output(hit.reply);
+      if (hit_out.action == FilterAction::kReject) {
+        LOG_WARN("filter: rejected cached output containing URL");
+        return R"({"error":"Response filtered"})";
+      }
+      return annotate_cache_status(hit_out.sanitized, "hit");
     }
     cached_embedding = std::move(hit.embedding);
   }
