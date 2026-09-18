@@ -63,8 +63,16 @@ class HnswIndex {
     std::lock_guard lock(mutex_);
     if (static_cast<int>(embedding.size()) != cfg_.dim) return;
 
+    // 层数按论文的几何分布：level = floor(-ln(U) * mL)，mL = 1/ln(M)
+    // 使 P(level >= 1) ≈ 1/M（M=16 时约 6.25%），保持高层稀疏、专司粗导航。
+    // 原实现"每层 50% 概率"会让近一半节点进入高层，导航层失去稀疏性。
     int level = 0;
-    while (gen_dis_(gen_) < 0.5f && level < 16) ++level;
+    {
+      const double u = std::max(1e-12, static_cast<double>(gen_dis_(gen_)));
+      const double ml = 1.0 / std::log(static_cast<double>(cfg_.M));
+      level = static_cast<int>(-std::log(u) * ml);
+      if (level > 16) level = 16;
+    }
 
     Node node;
     node.level = level;
@@ -159,6 +167,17 @@ class HnswIndex {
   using MinHeap = std::priority_queue<HnswDistNode, std::vector<HnswDistNode>, std::greater<HnswDistNode>>;
   using MaxHeap = std::priority_queue<HnswDistNode>;
 
+  // 搜索用的 visited 标记：线程本地复用 + epoch 版本号
+  // （每次搜索只递增 epoch，无需清零整个数组；thread_local 保证并发读搜索互不干扰）
+  struct VisitScratch {
+    std::vector<uint32_t> tag;
+    uint32_t epoch = 0;
+  };
+  static VisitScratch& visit_scratch() {
+    thread_local VisitScratch s;
+    return s;
+  }
+
   // 启发式邻居选择（论文 Algorithm 4 SELECT-NEIGHBORS-HEURISTIC）：
   // 候选按到查询点的距离升序尝试加入；若某候选到"已选邻居"的距离比它到查询点更近，
   // 说明它与已选邻居方向重复（冗余），丢弃它——以此让邻居方向分散、维持图连通。
@@ -204,8 +223,18 @@ class HnswIndex {
   }
 
   MinHeap search_layer(const std::vector<float>& query, int ep, int ef, int lc) {
-    std::vector<bool> visited(nodes_.size(), false);
-    visited[ep] = true;
+    // visited 标记复用：线程本地缓冲 + epoch 版本号，避免每次调用分配并清零 O(N)
+    auto& sc = visit_scratch();
+    if (sc.tag.size() != nodes_.size()) {
+      sc.tag.assign(nodes_.size(), 0);
+      sc.epoch = 0;
+    }
+    if (++sc.epoch == 0) {  // epoch 回绕：清零后重新开始，保证标记有效
+      std::fill(sc.tag.begin(), sc.tag.end(), 0);
+      sc.epoch = 1;
+    }
+    const uint32_t cur_epoch = sc.epoch;
+    sc.tag[ep] = cur_epoch;
     MaxHeap result;
     MinHeap candidates;
 
@@ -218,8 +247,8 @@ class HnswIndex {
       if (static_cast<int>(result.size()) >= ef && cur.dist > result.top().dist) break;
 
       for (int nei_id : nodes_[cur.id].neighbors[lc]) {
-        if (visited[nei_id]) continue;
-        visited[nei_id] = true;
+        if (sc.tag[nei_id] == cur_epoch) continue;
+        sc.tag[nei_id] = cur_epoch;
 
         float nd = l2(query, nodes_[nei_id].vec);
         if (static_cast<int>(result.size()) < ef || nd < result.top().dist) {
