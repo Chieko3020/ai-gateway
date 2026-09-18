@@ -54,3 +54,9 @@ hfd.sh
 # document
 docs/
 TODO
+
+# 评测数据集：由 scripts/fetch_eval_datasets.sh 下载，不入库（体积+许可）
+scripts/datasets/*.parquet
+
+# SQLite 会话临时文件（由工具生成，不入库）
+:memory:.ses

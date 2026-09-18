@@ -4,7 +4,9 @@
     "max_body_bytes": 20971520,
     "max_connections": 256,
     "idle_timeout_seconds": 30,
-    "write_timeout_seconds": 10
+    "write_timeout_seconds": 60,
+    "stream_idle_timeout_seconds": 60,
+    "_note": "write_timeout_seconds 是**非流式**响应的总写死线（默认 60s，与 backend.timeout_seconds 同量级）；stream_idle_timeout_seconds 是流式响应两次写入之间的空闲死线（默认 60s，每写出一段 SSE 就续期）。流式**没有**总死线，因此生成几分钟的长回答不会被切断；客户端不读超过空闲值则中停上游"
   },
   "backend": {
     "url": "https://api.deepseek.com/v1/chat/completions",
@@ -16,13 +18,17 @@
     "model_path": "model/model_int8.onnx",
     "vocab_path": "model/vocab.txt",
     "dim": 512,
-    "_note": "本地 ONNX 推理；路径相对进程工作目录（systemd 单元设置了 WorkingDirectory）。dim 必须与模型实际输出一致，否则启动即失败"
+    "do_lower_case": true,
+    "pooling": "cls",
+    "_note": "本地 ONNX 推理；路径相对进程工作目录（systemd 单元设置了 WorkingDirectory）。dim 必须与模型实际输出一致，否则启动即失败。do_lower_case/pooling 对齐官方（模型目录 sentence_bert_config.json 的 do_lower_case=true、1_Pooling/config.json 的 pooling_mode_cls_token=true）：do_lower_case=false 时 DMA/DNS 会都变成 [UNK]、两条文本向量完全相同；这两项与分词器实现一起参与 embedding 指纹，改动会让落盘旧向量失效（加载时丢弃向量、保留文本并重建索引）"
   },
   "cache": {
     "enabled": true,
     "similarity_threshold": 0.85,
+    "entity_veto": true,
     "max_entries": 10000,
-    "ttl_days": 7
+    "ttl_days": 7,
+    "_note": "similarity_threshold 默认 0.85：LCQMC 验证集阈值扫描下 0.85 是 F1 最高点（召回 88.6%/误命中 30.4%/F1 80.5%；0.80 时误命中率约 49%，0.90 时召回掉到 72.1%）。entity_veto 开启时，命中候选与查询在数字/大写缩略语/混合标识符上不一致即否决（`继续下一题`↔`继续12题` 余弦 0.885、`什么是DMA`↔`什么是DNS` 旧配置下 1.0，阈值拦不住）"
   },
   "filter": {
     "max_input_chars": 500,
