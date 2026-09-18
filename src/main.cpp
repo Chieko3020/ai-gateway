@@ -309,7 +309,6 @@ int main(int argc, char* argv[]) {
   // ---- 2. 初始化模块 ----
   auto lru = std::make_shared<LruStore>(cfg.cache.max_entries,
                                         cfg.cache.ttl_days * 86400);
-  auto idx = std::make_shared<HnswIndex>(HnswConfig{512, 16, 100, 50});
 
   // 本地 ONNX 嵌入推理
   auto onnx_embed = std::make_shared<OnnxEmbedding>(
@@ -323,7 +322,11 @@ int main(int argc, char* argv[]) {
                                 : std::vector<float>{};
   };
 
-  auto engine = std::make_shared<CacheEngine>(cfg.embedding, cfg.cache, lru, idx, embed_fn);
+  // 索引由缓存引擎独占持有：rebuild_index() 会替换 index_，main 不再保留副本，
+  // 否则会长期持有一个已失效的旧索引对象（日志里的向量数也会取自旧对象）
+  auto engine = std::make_shared<CacheEngine>(
+      cfg.embedding, cfg.cache, lru,
+      std::make_shared<HnswIndex>(HnswConfig{512, 16, 100, 50}), embed_fn);
   auto stats = std::make_shared<Stats>();
   auto filter = std::make_shared<MessageFilter>(cfg.filter);
 
@@ -338,7 +341,8 @@ int main(int argc, char* argv[]) {
       LOG_INFO("cache restored: 0 entries (缓存为空或条目均已超过 ttl_days={})",
                cfg.cache.ttl_days);
     } else {
-      LOG_INFO("cache restored: {} entries, {} vectors{}", lru->size(), idx->size(),
+      LOG_INFO("cache restored: {} entries, {} vectors{}", lru->size(),
+               engine->index_size(),
                purged_on_load > 0
                    ? std::format(", {} expired purged", purged_on_load)
                    : "");
@@ -354,7 +358,7 @@ int main(int argc, char* argv[]) {
   sigaction(SIGUSR1, &sa, nullptr);
 
   // ---- 3. 启动定期统计 + 定时持久化线程 ----
-  std::thread bg_thread([stats, lru, idx, engine, &cfg] {
+  std::thread bg_thread([stats, lru, engine, &cfg] {
     while (!g_shutdown.load(std::memory_order_acquire)) {
       {
         std::unique_lock lk(g_bg_mutex);
@@ -418,7 +422,8 @@ int main(int argc, char* argv[]) {
     size_t purged = lru->purge_expired();
     lru->save("cache/lru_store.json");
     // 持久化空桩（HNSW 索引通过 LruStore 重建）;
-    LOG_INFO("cache persisted: {} entries, {} vectors{}", lru->size(), idx->size(),
+    LOG_INFO("cache persisted: {} entries, {} vectors{}", lru->size(),
+             engine->index_size(),
              purged > 0 ? std::format(", {} expired purged", purged) : "");
   }
   LOG_INFO("cache hits={} misses={} hit_rate={:.1f}%",

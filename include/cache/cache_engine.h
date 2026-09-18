@@ -61,6 +61,11 @@ class CacheEngine {
   // 持锁调用会在同一线程递归加锁，直接死锁。
   void rebuild_index();
 
+  // 活动索引中的向量数。
+  // 调用方不要再持有构造时传入的索引指针用于观察：rebuild_index() 会把 index_
+  // 换成新对象，旧对象随即失效且不再被引擎使用（原实现据此打印的向量数恒为旧值）。
+  size_t index_size() const;
+
   // 配置访问
   float threshold() const { return threshold_; }
   int top_k() const { return top_k_; }

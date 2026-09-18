@@ -160,6 +160,11 @@ void CacheEngine::rebuild_index() {
   LOG_INFO("cache: index rebuilt, {} vectors, next_id={}", vectors, next_id);
 }
 
+size_t CacheEngine::index_size() const {
+  std::lock_guard lock(mutex_);
+  return index_ ? index_->size() : 0;
+}
+
 std::pair<int, size_t> CacheEngine::ghost_stats() const {
   std::lock_guard lock(mutex_);
   const size_t total = total_search_.load(std::memory_order_relaxed);
