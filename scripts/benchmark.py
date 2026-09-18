@@ -23,7 +23,7 @@ MODEL = "deepseek-v4-flash"
 def call(url, msg, max_tokens=30, timeout=90):
     """发一次请求。返回 (latency_ms, cache_status, body)
 
-    cache_status 取自响应体 `_cache` 字段：hit / miss / bypass / None(未知)
+    cache_status 取自响应体 `_cache` 字段：hit / miss / bypass / merged / None(未知)
     """
     body = json.dumps({"model": MODEL,
                        "messages": [{"role": "user", "content": msg}],
@@ -78,11 +78,15 @@ def replay(url, msgs, rounds=2, label="", quiet=False, first_round_sleep=0.0):
     """回放数据集 rounds 轮，返回每轮统计"""
     per_round = []
     for rd in range(1, rounds + 1):
-        lat_hit, lat_miss, lat_bypass, lat_unknown = [], [], [], []
+        lat_hit, lat_miss, lat_bypass, lat_merged, lat_unknown = [], [], [], [], []
         for i, m in enumerate(msgs):
             lat, st, _ = call(url, m)
             if st == "hit":
                 lat_hit.append(lat)
+            elif st == "merged":
+                # 请求合并：与并发的同义请求共享一次上游调用，本就不是缓存命中，
+                # 因此不计入命中率分子（口径与网关 /stats 的 report() 一致）
+                lat_merged.append(lat)
             elif st == "bypass":
                 lat_bypass.append(lat)
             elif st in ("miss", "timeout"):
@@ -96,8 +100,9 @@ def replay(url, msgs, rounds=2, label="", quiet=False, first_round_sleep=0.0):
                 time.sleep(first_round_sleep)
 
         n_hit, n_miss = len(lat_hit), len(lat_miss)
-        n_bypass, n_unknown = len(lat_bypass), len(lat_unknown)
-        # 命中率分母排除旁路流量（工具调用/流式不可缓存，不应拉低命中率）
+        n_bypass, n_merged = len(lat_bypass), len(lat_merged)
+        n_unknown = len(lat_unknown)
+        # 命中率分母排除旁路流量（工具调用/流式本不可缓存）与合并命中（本就不是缓存命中）
         denom = n_hit + n_miss
         row = {
             "round": rd,
@@ -105,6 +110,7 @@ def replay(url, msgs, rounds=2, label="", quiet=False, first_round_sleep=0.0):
             "hit": n_hit,
             "miss": n_miss,
             "bypass": n_bypass,
+            "merged": n_merged,
             "unknown": n_unknown,
             "hit_rate": round(n_hit / denom * 100, 1) if denom else 0.0,
             "latency_hit": latency_stats(lat_hit),
@@ -112,7 +118,7 @@ def replay(url, msgs, rounds=2, label="", quiet=False, first_round_sleep=0.0):
         }
         per_round.append(row)
         print(f"  {label}R{rd}: hit={n_hit} miss={n_miss} bypass={n_bypass} "
-              f"unknown={n_unknown} 命中率={row['hit_rate']}%"
+              f"merged={n_merged} unknown={n_unknown} 命中率={row['hit_rate']}%"
               + (f"  命中p50={row['latency_hit'].get('p50')}ms "
                  f"未命中p50={row['latency_miss'].get('p50')}ms"
                  if row["latency_hit"] else ""))
@@ -144,6 +150,8 @@ def level_concurrent(url, msgs, concurrency=4, rounds_per_thread=3):
     lats = [r[0] for r in results]
     hit = sum(1 for r in results if r[1] == "hit")
     miss = sum(1 for r in results if r[1] in ("miss", "timeout"))
+    # 并发场景下一次上游调用被多条同义请求共享，非 leader 拿到 _cache:"merged"
+    merged = sum(1 for r in results if r[1] == "merged")
     return {
         "concurrency": concurrency,
         "requests_per_thread": rounds_per_thread * len(msgs),
@@ -152,6 +160,7 @@ def level_concurrent(url, msgs, concurrency=4, rounds_per_thread=3):
         "throughput_rps": round(len(results) / wall, 1) if wall > 0 else 0,
         "hit": hit,
         "miss": miss,
+        "merged": merged,
         "latency": latency_stats(lats),
     }
 
@@ -184,6 +193,7 @@ def main():
         tot_hit = sum(r["hit"] for r in report["replay"])
         tot_miss = sum(r["miss"] for r in report["replay"])
         tot_bypass = sum(r["bypass"] for r in report["replay"])
+        tot_merged = sum(r.get("merged", 0) for r in report["replay"])
         denom = tot_hit + tot_miss
         report["combined"] = {
             "rounds": rounds,
@@ -191,10 +201,11 @@ def main():
             "hit": tot_hit,
             "miss": tot_miss,
             "bypass": tot_bypass,
+            "merged": tot_merged,
             "hit_rate": round(tot_hit / denom * 100, 1) if denom else 0.0,
         }
         print(f"\n合计: hit={tot_hit} miss={tot_miss} bypass={tot_bypass} "
-              f"命中率={report['combined']['hit_rate']}%")
+              f"merged={tot_merged} 命中率={report['combined']['hit_rate']}%")
 
     if args.level == 3:
         probe = msgs[:3]
@@ -202,7 +213,8 @@ def main():
         c = report["concurrent"]
         print(f"\n并发: {c['concurrency']} 线程 × {c['requests_per_thread']} 请求 "
               f"= {c['total_requests']} | 吞吐={c['throughput_rps']} rps "
-              f"| p50={c['latency'].get('p50')}ms p95={c['latency'].get('p95')}ms")
+              f"| p50={c['latency'].get('p50')}ms p95={c['latency'].get('p95')}ms "
+              f"| merged={c.get('merged', 0)}")
 
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
