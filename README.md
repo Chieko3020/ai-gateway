@@ -23,7 +23,7 @@
 
 ### 技术特性
 - **并发模型**: 单 Reactor + 线程池，主线程管理连接，线程池处理缓存和 LLM 转发
-- **向量检索**: 简化实现的 HNSW 图索引（未实现启发剪枝）。**实测受限**：320 向量规模下自检索 top-1 成功率 30.9%、top-3 召回率 31.7%（见 `tests/recall_bench`），是当前命中率的主要瓶颈
+- **向量检索**: 按论文实现 HNSW 图索引（分层结构、几何分布层数、启发式邻居选择、邻居满时收缩重选）。实测（见 `tests/recall_bench`）：320 向量下自检索 top-1 **99.4%**、top-3 召回率 99.7%；1000 / 5000 / 10000 向量下自检索 top-1 均为 **100%**，top-3 召回率 99.7% / 93.8% / 81.7%（`ef_search=50` 固定时规模增大导致束搜索覆盖不足，属 HNSW 固有特性；缓存只需 top-1，故不影响命中），相对暴力检索加速比 1.16x / 2.74x / 4.75x
 - **存储引擎**: LRU + TTL 缓存管理，JSON 持久化
 - **嵌入推理**: C++ ONNX Runtime 进程内 INT8 量化推理，零外部依赖
 - **模型量化**: `scripts/quantize.py` — HuggingFace → FP32 ONNX → 动态量化 INT8 (~90MB→~23MB)
@@ -102,7 +102,7 @@ ai-gateway/
 
 #### cache — 语义缓存引擎
 - **CacheEngine**: 编排缓存流程（Embedding 搜索，命中/未命中判断，命名空间隔离）
-- **HnswIndex**: HNSW 图索引（header-only，简化实现）
+- **HnswIndex**: HNSW 图索引（header-only；按论文实现启发式邻居选择与邻居收缩，`shared_mutex` 保护读写并发，visited 标记线程本地复用）
 - **OnnxEmbedding**: C++ ONNX Runtime 进程内推理 + WordPiece 词表贪心分词
 - **LruStore**: LRU + TTL 内存缓存 + JSON 持久化
 
@@ -231,7 +231,10 @@ for t in build/tests/test_*; do $t; done
 
 # HNSW 召回率基准（手动运行，不纳入 ctest）
 cmake --build build --target recall_bench
+# 真实数据集模式（ONNX 编码后建索引）
 ./build/tests/recall_bench scripts/datasets/synthetic.jsonl model/model_int8.onnx model/vocab.txt
+# 合成向量模式（规模曲线：抽样 200 查询与暴力检索对比）
+./build/tests/recall_bench --synthetic 10000 --dim 512 --queries 200
 ```
 
 ## 实测性能
