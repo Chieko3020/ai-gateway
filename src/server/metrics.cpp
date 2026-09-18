@@ -52,7 +52,7 @@ class TextEncoder {
 
 std::string render_metrics(const Stats& stats, int64_t uptime_seconds,
                            int64_t pool_pending, int64_t pool_active,
-                           int64_t pool_threads) {
+                           int64_t pool_threads, int64_t connections_accepted) {
   const StatsSnapshot s = stats.snapshot();
   TextEncoder e;
 
@@ -128,6 +128,12 @@ std::string render_metrics(const Stats& stats, int64_t uptime_seconds,
   if (pool_threads >= 0)
     e.gauge("ai_gateway_thread_pool_size", "线程池工作线程数",
             static_cast<double>(pool_threads));
+
+  if (connections_accepted >= 0)
+    e.counter("ai_gateway_connections_accepted_total",
+              "累计 accept 的连接数（= TCP 握手次数；keep-alive 下同一连接上的多个"
+              "请求只计 1）",
+              static_cast<double>(connections_accepted));
 
   if (uptime_seconds >= 0)
     e.gauge("ai_gateway_uptime_seconds", "进程运行时长（秒）",

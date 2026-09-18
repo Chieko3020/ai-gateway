@@ -73,6 +73,25 @@ class Stats {
   void record_bypass(int64_t latency_ms,
                      int prompt_tokens, int completion_tokens);
 
+  // 记录一次流式（SSE 透传）请求。
+  // 口径说明（必须显式写清，否则这些延迟数字没法解读）：
+  //   first_byte_ms —— **首字节延迟（TTFT）**：从收到客户端请求到上游首个字节
+  //                    写出去。对流式体验而言这才是用户感知的延迟
+  //   total_ms      —— 整段完成时间（最后一个 token 写到客户端为止），
+  //                    随回答长度增长，与"网关快不快"无关
+  // 进旁路样本池（不进命中率分母，也不与缓冲式响应混进同一个 avg/min/max）
+  void record_stream(int64_t first_byte_ms, int64_t total_ms,
+                     int prompt_tokens, int completion_tokens);
+
+  // 流式请求提前结束的次数（客户端断开 / 写死线到点 / 上游中断）。
+  // 这类请求不进延迟样本池，只单列计数——否则它们会把 avg/min 拉成
+  // "一段没人收完的流的时长"，口径失真
+  void record_stream_aborted();
+  size_t streams_aborted() const {
+    std::shared_lock lock(mutex_);
+    return streams_aborted_;
+  }
+
   // 定期输出统计摘要到日志
   void report() const;
 
@@ -125,8 +144,10 @@ class Stats {
   size_t total_ = 0;
   size_t hits_ = 0;
   size_t misses_ = 0;
-  size_t bypassed_ = 0;  // 不可缓存流量（工具调用）；stream:true 已在入口拒绝
+  size_t bypassed_ = 0;  // 不可缓存流量（工具调用）
   size_t merged_ = 0;    // 请求合并命中（不计入 total_/hits_）
+  size_t streams_ = 0;   // 流式请求完成数（首字节/总时长已入旁路样本池）
+  size_t streams_aborted_ = 0;  // 流式请求提前结束数（不进延迟样本池）
 
   int64_t total_prompt_tokens_ = 0;
   int64_t total_completion_tokens_ = 0;

@@ -209,11 +209,11 @@ int main() {
     st.record_api_call(11, 10, 20);
 
     HttpServer server(sc);
-    server.set_handler([&post_hits](const std::string&) {
+    server.set_handler([&post_hits](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
       ++post_hits;
       return HttpReply{200, "application/json", R"({"ok":true})"};
     });
-    server.add_route("GET", "/metrics", [&st](const std::string&) {
+    server.add_route("GET", "/metrics", [&st](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
       return HttpReply{200, kMetricsContentType, render_metrics(st)};
     });
 

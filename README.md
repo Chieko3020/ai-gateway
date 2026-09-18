@@ -23,13 +23,27 @@
 
 ### 请求能力的边界
 
-- **流式（`stream: true`）暂不支持**：网关返回 `400` + `{"error":"streaming (stream=true) is not supported yet"}`，不转发到上游。
-  上游 SSE 需要增量下发与按事件边界的输出过滤，而当前 `llm_client` 用 `curl_easy_perform` 整段缓冲、响应侧恒发
-  `Content-Length` + `Connection: close`；在透传实现落地前把 SSE 文本装进 `application/json` 信封属于"伪支持"
-  （客户端既解析不出 choices、也无法增量渲染）。因此改为显式拒绝。使用 `stream: true` 的客户端（例如 DSH 的
-  `pi-ai` 层在 openai-completions 里硬编码 `stream: true`）在透传实现前无法把本网关当作 provider。
+- **流式（`stream: true`）真透传**：上游 SSE 逐块转发给客户端（`llm_client` 用 write 回调，
+  不再整段缓冲），`Content-Type` 按上游原样透传（`text/event-stream`），长度语义用
+  `Transfer-Encoding: chunked`。流式请求**不查缓存、不写缓存**（SSE 与单条 JSON 回复无法互转）。
+  输出过滤按 **SSE 事件边界**逐条判定：命中拦截规则的那一条事件被丢弃，其余事件照常透传
+  （不会把整段流替换成错误 JSON）。客户端断开或写死线到点时，网关立即中停上游传输。
+  ```bash
+  curl -N http://127.0.0.1:9000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"deepseek-flash","stream":true,"messages":[{"role":"user","content":"你好"}]}'
+  ```
+  使用 `stream: true` 的客户端（例如 DSH 的 `pi-ai` 层在 openai-completions 里硬编码 `stream: true`）
+  可以直接把本网关当作 provider。
+- **HTTP keep-alive**：HTTP/1.1 默认复用连接（`Connection: close` 的请求仍会被关闭；
+  HTTP/1.0 默认不复用）。空闲连接由 `server.idle_timeout_seconds`（默认 30s）回收。
+  流式响应用 chunked 承载，因此**流式响应结束后连接同样可复用**。
 - **工具调用类请求（`tools` / `functions` / `tool` 角色 / `tool_calls` / `function_call`）走旁路**：不查缓存、
   不写缓存、不参与请求合并，但**仍执行输入/输出安全过滤**，并按上游状态码原样透传。
+- **落盘向量带 embedding 指纹**：`cache/lru_store.json` 里记录产生向量的模型与词表哈希、维度、
+  分词器标识。换了模型或改了分词之后加载，指纹不一致的**向量会被丢弃、文本条目保留**
+  （日志 WARN 提示），并按新模型重建索引——避免"旧向量当新向量用"造成的静默错误命中。
+  旧格式（无指纹）文件同样能读入：此时向量按不可考处理（丢弃）并打印 WARN。
 
 ### 技术特性
 - **并发模型**: 单 Reactor + 线程池，主线程管理连接，线程池处理缓存和 LLM 转发

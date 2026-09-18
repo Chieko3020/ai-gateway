@@ -55,6 +55,21 @@ target_link_libraries(test_http_server ai_gateway_server ai_gateway_common
     ai_gateway_test_check)
 target_compile_definitions(test_http_server PRIVATE GATEWAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
+# SSE 流式透传（本轮新增）：事件边界过滤 + chunked 分帧 + 端到端逐块到达
+add_executable(test_sse_stream test_sse_stream.cpp)
+target_link_libraries(test_sse_stream ai_gateway_server ai_gateway_common
+    ai_gateway_test_check)
+
+# keep-alive：同一连接多请求 / Connection: close 遵守 / 端口复用观测
+add_executable(test_keep_alive test_keep_alive.cpp)
+target_link_libraries(test_keep_alive ai_gateway_server ai_gateway_common
+    ai_gateway_test_check)
+
+# embedding 指纹版本化：指纹计算 + 落盘/加载比对 + 旧格式向后兼容
+add_executable(test_embedding_fingerprint test_embedding_fingerprint.cpp)
+target_link_libraries(test_embedding_fingerprint ai_gateway_cache
+    ai_gateway_common nlohmann_json::nlohmann_json ai_gateway_test_check)
+
 # Module 4: stats
 add_executable(test_stats test_stats.cpp)
 target_link_libraries(test_stats ai_gateway_stats ai_gateway_common ai_gateway_test_check)
@@ -87,6 +102,9 @@ add_test(NAME http_server COMMAND test_http_server)
 add_test(NAME log_rotation COMMAND test_log_rotation)
 add_test(NAME metrics COMMAND test_metrics)
 add_test(NAME tokenizer COMMAND test_tokenizer)
+add_test(NAME sse_stream COMMAND test_sse_stream)
+add_test(NAME keep_alive COMMAND test_keep_alive)
+add_test(NAME embedding_fingerprint COMMAND test_embedding_fingerprint)
 
 # HNSW 自检索召回率断言（合成向量 + 固定种子，确定性）
 add_test(NAME hnsw_recall

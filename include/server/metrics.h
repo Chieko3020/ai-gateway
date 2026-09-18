@@ -19,9 +19,13 @@ inline constexpr const char* kMetricsContentType =
 
 // pool_pending / pool_active / pool_threads 来自 HttpServer 的线程池观测，
 // 传 -1 表示该字段不可用（渲染时跳过，避免上报假数据）。
-// uptime_seconds < 0 时同样跳过 uptime 指标
+// uptime_seconds < 0 时同样跳过 uptime 指标。
+// connections_accepted：累计 accept 成功的连接数（= 服务端执行的 TCP 握手次数）。
+// keep-alive 生效时"同一连接上的 N 个请求"只贡献 1，这个指标是复用收益最直接的
+// 观测面（-1 = 不可用）
 std::string render_metrics(const Stats& stats, int64_t uptime_seconds = -1,
                            int64_t pool_pending = -1, int64_t pool_active = -1,
-                           int64_t pool_threads = -1);
+                           int64_t pool_threads = -1,
+                           int64_t connections_accepted = -1);
 
 }  // namespace ai_gateway

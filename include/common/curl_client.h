@@ -74,6 +74,26 @@ class CurlClient {
     return res;
   }
 
+  // 裸句柄：仅供需要自带传输回调（CURLOPT_HEADERFUNCTION / WRITEFUNCTION）的
+  // 流式调用方使用（backend/llm_client 的 call_llm_stream）。
+  // 拿到句柄后仍需自己设置 CURLOPT_HTTPHEADER = headers()，否则鉴权头会丢
+  CURL* raw() const { return curl_; }
+  curl_slist* headers() const { return headers_; }
+
+  // 与 perform() 同一条 URL/超时/鉴权配置，但不装 write 回调（由调用方自装），
+  // 且无论 CURLE_OK 与否都回填 http_code（例如 write 回调主动 abort 时，
+  // 上游真实状态码仍然可读，上层才能区分"上游报错"与"客户端断开"）
+  CURLcode perform_raw(long* http_code) {
+    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers_);
+    CURLcode res = curl_easy_perform(curl_);
+    if (http_code) {
+      long code = 0;
+      curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
+      *http_code = code;
+    }
+    return res;
+  }
+
   // 重置句柄状态（保留底层连接），用于连接池复用
   void reset() {
     if (headers_) {

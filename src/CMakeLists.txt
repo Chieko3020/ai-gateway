@@ -35,6 +35,7 @@ add_library(ai_gateway_cache STATIC
     cache/lru_store.cpp
     cache/cache_engine.cpp
     cache/onnx_embedding.cpp
+    cache/embedding_fingerprint.cpp
 )
 target_include_directories(ai_gateway_cache PUBLIC ${INCLUDE_ROOT})
 target_link_libraries(ai_gateway_cache PUBLIC ai_gateway_common CURL::libcurl nlohmann_json::nlohmann_json

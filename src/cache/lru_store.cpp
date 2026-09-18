@@ -15,6 +15,10 @@
 
 namespace ai_gateway {
 
+// 落盘文件里承载元数据的保留键。用 "__" 前后缀是为了不与业务键冲突：
+// 业务键形如 "[ns:]msg:N"（见 cache_engine.cpp），不会出现双下划线前后缀
+constexpr const char* kMetaKey = "__meta__";
+
 LruStore::LruStore(size_t max_entries, int64_t ttl_seconds)
     : max_entries_(max_entries), ttl_seconds_(ttl_seconds) {}
 
@@ -214,6 +218,15 @@ bool LruStore::save(const std::string& path) const {
   std::string payload;
   try {
     nlohmann::json arr = nlohmann::json::array();
+    // 指纹元数据条目：key 固定为 "__meta__"。用"数组里的第一个条目"而不是
+    // 改成对象格式（{"meta":..., "entries":[...]}），是为了让**旧版本程序**
+    // 读新文件时仍按数组解析——它只会多出一条 value 为空的条目，不会解析失败
+    if (!expected_fingerprint_.empty()) {
+      nlohmann::json meta;
+      meta["key"] = kMetaKey;
+      meta["fp"] = expected_fingerprint_;
+      arr.push_back(std::move(meta));
+    }
     for (auto& e : snapshot) {
       nlohmann::json entry;
       entry["key"] = e.key;
@@ -276,18 +289,64 @@ bool LruStore::load(const std::string& path) {
     miss_count_ = 0;
     evict_count_ = 0;
     expired_count_ = 0;
+    fingerprint_.clear();
+    file_had_fingerprint_ = false;
+    dropped_vectors_ = 0;
+    fingerprint_mismatch_ = false;
 
+    // ---- 1. 先取指纹元数据 ----
     for (auto& entry : arr) {
+      if (!entry.is_object()) continue;
+      if (entry.value("key", std::string{}) != kMetaKey) continue;
+      if (entry.contains("fp") && entry["fp"].is_string()) {
+        fingerprint_ = entry["fp"].get<std::string>();
+        file_had_fingerprint_ = true;
+      }
+      break;
+    }
+
+    // ---- 2. 判定是否丢弃向量 ----
+    //   调用方给了期望指纹（有模型）时：
+    //     - 文件里没有指纹（旧格式）      -> 丢弃向量（来源不可考，见简报说明）
+    //     - 指纹不一致（换模型/改分词）    -> 丢弃向量
+    //   调用方没给期望指纹（无模型/降级模式）-> 不做校验，原样加载
+    const bool check = !expected_fingerprint_.empty();
+    const bool mismatch =
+        check && (!file_had_fingerprint_ || fingerprint_ != expected_fingerprint_);
+    fingerprint_mismatch_ = mismatch;  // fingerprint_ 保留文件里的原值供日志/诊断
+
+    // ---- 3. 逐条加载 ----
+    for (auto& entry : arr) {
+      if (!entry.is_object()) continue;
+      auto key_it = entry.find("key");
+      if (key_it == entry.end() || !key_it->is_string()) continue;
+      if (*key_it == kMetaKey) continue;  // 元数据条目不是缓存内容
+      auto val_it = entry.find("value");
+      if (val_it == entry.end() || !val_it->is_string())
+        continue;  // 旧程序读新文件时会见到没有 value 的元数据条目，跳过即可
+
       Node node;
-      node.key = entry["key"].get<std::string>();
-      node.value = entry["value"].get<std::string>();
+      node.key = key_it->get<std::string>();
+      node.value = val_it->get<std::string>();
       // 向后兼容：src 是本轮新增字段，旧落盘文件没有
       if (entry.contains("src") && entry["src"].is_string())
         node.source = entry["src"].get<std::string>();
       if (entry.contains("embedding")) {
-        node.embedding.data = entry["embedding"].get<std::vector<float>>();
+        auto vec = entry["embedding"].get<std::vector<float>>();
+        // 指纹不一致：**丢弃向量、保留文本**。
+        // 为什么不整份丢弃：文本条目仍能通过 source 精确命中（embedding 不可用
+        // 时的降级路径本来就是这个语义），而语义索引可以按新模型重建；
+        // 真正危险的是"拿旧向量当新向量用"，这一条被严格禁止
+        if (mismatch) {
+          ++dropped_vectors_;
+        } else if (!vec.empty()) {
+          node.embedding.data = std::move(vec);
+        }
       }
-      auto secs = entry["ctime"].get<int64_t>();
+      auto ct = entry.find("ctime");
+      auto secs = (ct != entry.end() && ct->is_number_integer())
+                      ? ct->get<int64_t>()
+                      : 0;
       node.ctime = Clock::time_point(std::chrono::seconds(secs));
       lru_.push_back(std::move(node));
       iter_map_[lru_.back().key] = --lru_.end();

@@ -45,9 +45,16 @@ struct ParsedRequest {
       headers;
   bool valid = false;
   size_t content_length = 0;
+  // 请求行里的 HTTP 版本（"HTTP/1.1" / "HTTP/1.0"）。keep-alive 的默认语义
+  // 按版本区分：1.1 默认复用、1.0 默认关闭（除非显式 Connection: keep-alive）
+  std::string_view http_version;
 
   // 便捷查询（大小写不敏感）
   std::string_view header(std::string_view key) const;
+
+  // 客户端是否希望复用这条连接（HTTP/1.1 默认是，除非 Connection: close；
+  // HTTP/1.0 默认否，除非 Connection: keep-alive）
+  bool wants_keep_alive() const;
 };
 
 // 从原始 HTTP 数据解析请求

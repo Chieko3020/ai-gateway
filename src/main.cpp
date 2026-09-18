@@ -15,6 +15,7 @@
 
 #include "backend/llm_client.h"
 #include "cache/cache_engine.h"
+#include "cache/embedding_fingerprint.h"
 #include "cache/lru_store.h"
 #include "cache/hnsw_index.h"
 #include "common/log_file.h"
@@ -26,6 +27,7 @@
 #include "server/filter.h"
 #include "server/http_server.h"
 #include "server/metrics.h"
+#include "server/response.h"
 #include "stats/stats.h"
 
 using namespace ai_gateway;
@@ -44,6 +46,12 @@ static uint64_t fnv1a_64(const std::string& s) {
   }
   return h;
 }
+
+// 分词器实现标识：**改了分词规则就必须改这个字符串**。
+// 它进 embedding 指纹，用来覆盖"模型与词表文件都没变、但分词实现改了"这一情形
+// （本项目 2026-09 刚补过 Bert WordPiece 的 lowercase/## 续接规则，正属此类）。
+// 历史值：v1 = 贪心 10 字符窗口（与官方不一致率 58.7%）；v2 = 对齐官方 WordPiece
+static constexpr const char* kTokenizerId = "bert-wordpiece@v2";
 
 // 把一条 message 的 content 拍平成纯文本：
 //   content 为 string       → 原样
@@ -154,22 +162,22 @@ static bool is_tool_request(const std::string& request_body) {
   return false;
 }
 
-// stream:true 明确拒绝，而不是"转发后当 JSON 回包"。
+// stream:true 真透传（本轮实现）。
 //
-// 背景：真正的 SSE 透传需要 llm_client 增量回调、response 去掉 Content-Length
-// 并逐块下发、输出过滤按 SSE 事件边界判定（当前 llm_client 用 curl_easy_perform
-// 整段缓冲，response.cpp 恒发 Content-Length + Connection: close）。在透传落地
-// 之前，把 SSE 文本塞进 application/json 信封是"伪支持"：客户端解析失败且无法
-// 增量渲染。因此这里返回 400，把不可用变成可诊断。
-//
-// 这也是 DSH 的 LLM 层无法用本网关做 provider 的原因：@earendil-works/pi-ai 在
-// openai-completions API 里硬编码 stream: true
+// 历史：此前 stream:true 被直接 400 拒绝（连"伪透传"都不是），原因是 DSH 的 LLM 层
+// @earendil-works/pi-ai 在 openai-completions API 里硬编码 stream: true
 // （~/.dsh/profiles/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js:587），
-// 于是它的每个请求都会命中这个分支。真透传是后续待办，
-// 见 research/personal/ai-gateway-backlog.md 第 1 节。
-static constexpr const char* kStreamUnsupported =
-    R"({"error":"streaming (stream=true) is not supported yet"})";
-
+// 于是它的每个请求都会命中这个分支，网关根本接不进去。
+//
+// 实现要点（与 TODO 里的方案对应）：
+//   1. llm_client 提供 call_llm_stream：write 回调里逐块把上游字节交给 sink，
+//      handler 收到即写客户端 socket（ResponseWriter 直接 send，无缓冲等待）
+//   2. 响应头由 handler 自己写：Content-Type 按上游原样透传（text/event-stream），
+//      长度语义用 Transfer-Encoding: chunked
+//   3. 输出过滤按 SSE 事件边界逐条判定（MessageFilter::sse_feed），不再对整段
+//      做正则替换
+//   4. 客户端断开 / 写死线到点 → sink 返回 false → curl write 回调返回 0 →
+//      上游传输立刻中断（省 token），worker 立即归还 fd
 // 在 OpenAI 响应体中注入缓存状态字段，供压测脚本精确判定是否命中；
 // 额外字段不影响下游对标准字段的解析。
 static std::string annotate_cache_status(const std::string& body,
@@ -195,12 +203,6 @@ static std::string body_digest(const std::string& s) {
   return std::format("len={},h={:016x}", s.size(), h);
 }
 
-// 网关自身生成的 JSON 响应（默认 200；拒绝类响应给出语义正确的状态码：
-// 输入被拒 400、上游内容被拦 502，见 handle_request）
-static HttpReply json_reply(std::string body, int status_code = 200) {
-  return HttpReply{status_code, "application/json", std::move(body)};
-}
-
 // 透传上游状态码：curl 自身失败时 llm_client 已映射为 502/504，
 // 这里再兜一层，确保不会出现 status_code=0 被当成正常码发回客户端
 static int upstream_status(int status_code) {
@@ -222,14 +224,246 @@ void handle_signal(int sig) {
   g_shutdown.store(true, std::memory_order_release);
 }
 
-// 请求处理管道：过滤 + 缓存 + singleflight + LLM + 统计 + 过滤
-// 返回状态码 + 响应体：上游 4xx/5xx 原样透传（见 HttpReply）
-static HttpReply handle_request(const std::string& request_body,
-                                 const GatewayConfig& cfg,
-                                 MessageFilter* filter,
-                                 CacheEngine* engine,
-                                 Singleflight* sf,
-                                 Stats* stats) {
+// 处理结果的统一形状：pair<HttpReply, 能否复用连接>
+//
+// writer 只在流式（SSE 真透传）路径上被使用：那条路径要边收边发，不能等整段
+// 响应体凑齐。缓冲式路径只用返回值。
+//
+// 为什么 keep-alive 要跟 HttpReply 一起返回：流式响应由 handle_stream_request
+// 自己写响应头，keep-alive 的决定必须与 Connection 头在同一处产生，否则会出现
+// "头里写了 keep-alive、连接却被关掉"（或反之）的不一致。
+using HandleOutcome = std::pair<HttpReply, bool>;
+
+// 网关自身生成的 JSON 响应（默认 200；拒绝类响应给出语义正确的状态码：
+// 输入被拒 400、上游内容被拦 502）
+static HandleOutcome json_reply(std::string body, int status_code = 200) {
+  return {HttpReply{status_code, "application/json", std::move(body)}, false};
+}
+
+// 网关自己生成的错误响应：与 json_reply 同义，但名字在错误路径上更直白
+static HandleOutcome error_outcome(std::string body, int status_code) {
+  return json_reply(std::move(body), status_code);
+}
+
+// ---------------------------------------------------------------------------
+// SSE 真透传
+// ---------------------------------------------------------------------------
+
+// 流式请求的 keep-alive：上游是 SSE 长连接，下游同样可以复用。
+// 注意这是"允许复用"，客户端显式 Connection: close 时仍然会关闭
+static constexpr bool kStreamKeepAlive = true;
+
+namespace {
+
+// SSE 透传的接收器：上游每来一块字节，就（按事件边界过滤后）立刻写到客户端。
+//
+// 三件事同时发生在这里：
+//   1. 输出过滤按 SSE 事件边界逐条判定（不能对整段做正则替换）
+//   2. 写失败（客户端断开 / 写死线到）立刻返回 false，让 curl 中断上游传输
+//   3. 统计首字节时刻与 [DONE] 是否完整送达
+class SsePassthroughSink : public LlmStreamSink {
+ public:
+  SsePassthroughSink(MessageFilter* filter, ResponseWriter* writer,
+                     std::chrono::steady_clock::time_point t0, bool keep_alive)
+      : filter_(filter), writer_(writer), t0_(t0), keep_alive_(keep_alive) {}
+
+  // 上游响应头到齐：**在这里**把响应头发给下游。
+  // 为什么不提前发：只有这一刻才知道上游的状态码与 Content-Type，按上游原样
+  // 透传（text/event-stream）是硬要求；也不能等第一个 chunk，那样"上游迟迟不吐
+  // 第一个 token"会被客户端当成网关不响应。
+  bool on_begin(int st, std::string_view ct) override {
+    head_sent_ = writer_->write_stream_head(st, ct, keep_alive_);
+    if (!head_sent_) write_failed_ = true;
+    return head_sent_;
+  }
+
+  bool on_chunk(const char* data, size_t len) override {
+    // 首字节：从"收到客户端请求"到"上游第一个字节到达"。这才是流式体验的真实延迟
+    if (!first_byte_seen_) {
+      first_byte_seen_ = true;
+      first_byte_ms_ =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - t0_)
+              .count();
+    }
+    bytes_in_ += len;
+    scan_for_done(data, len);
+
+    std::string out =
+        filter_->sse_feed(filter_state_, std::string_view(data, len),
+                          /*final_chunk=*/false);
+    if (!out.empty() && !writer_->write_body(out)) {
+      // 客户端断开 / 写死线到：标记原因并让 curl 中断上游
+      write_failed_ = true;
+      abort_ = writer_->abort_reason();
+      return false;
+    }
+    if (filter_state_.rejected) {
+      // 命中屏蔽规则：停止继续放行（上游同样被中断，不再为被拦内容付费）
+      filter_rejected_ = true;
+      return false;
+    }
+    return true;
+  }
+
+  void on_done(StreamAbortReason reason) override {
+    if (write_failed_) return;  // 已因写失败退出，上游传输也已被中断
+    // 冲刷尾部：上游结束时最后一段可能没有以空行结尾
+    std::string tail = filter_->sse_feed(filter_state_, {}, /*final_chunk=*/true);
+    if (!tail.empty() && !writer_->write_body(tail)) {
+      write_failed_ = true;
+      abort_ = writer_->abort_reason();
+    }
+    if (filter_state_.rejected) filter_rejected_ = true;
+    (void)reason;
+  }
+
+  // ---- 观测数据（handler 收尾时读取） ----
+  bool head_sent() const { return head_sent_; }
+  bool done_seen() const { return done_seen_; }
+  bool filter_rejected() const { return filter_rejected_; }
+  bool write_failed() const { return write_failed_; }
+  AbortReason abort_reason() const { return abort_; }
+  int64_t first_byte_ms() const { return first_byte_ms_; }
+  size_t bytes_in() const { return bytes_in_; }
+  const std::string& rejected_event() const {
+    return filter_state_.rejected_event;
+  }
+
+ private:
+  // 在后端字节流里找 "[DONE]"：事件可能跨 chunk，因此把上一块的尾巴（32 字节）
+  // 拼到本次搜索窗口前面。只做"是否出现过"的判定，不改变透传的字节
+  void scan_for_done(const char* data, size_t len) {
+    std::string window;
+    window.reserve(tail_.size() + len);
+    window += tail_;
+    window.append(data, len);
+    if (window.find("[DONE]") != std::string::npos) done_seen_ = true;
+    tail_ = window.size() > 32 ? window.substr(window.size() - 32) : window;
+  }
+
+  MessageFilter* filter_;
+  ResponseWriter* writer_;
+  std::chrono::steady_clock::time_point t0_;
+  bool keep_alive_ = true;
+  bool head_sent_ = false;
+  MessageFilter::SseFilterState filter_state_;
+  std::string tail_;
+  bool done_seen_ = false;
+  bool filter_rejected_ = false;
+  bool write_failed_ = false;
+  bool first_byte_seen_ = false;
+  int64_t first_byte_ms_ = 0;
+  size_t bytes_in_ = 0;
+  AbortReason abort_ = AbortReason::kNone;
+};
+
+}  // namespace
+
+// 处理 stream:true：把上游 SSE 逐块透传给客户端
+static HandleOutcome handle_stream_request(
+    const std::string& request_body, const GatewayConfig& cfg,
+    MessageFilter* filter, Stats* stats, ResponseWriter& writer,
+    std::chrono::steady_clock::time_point t0, bool client_wants_keep_alive) {
+  // 响应头的 Connection 必须如实反映客户端意愿（客户端显式要求 close 时
+  // 写 keep-alive 会把它挂死在"等下一个响应"上）；真正是否复用由连接处理器
+  // 用同一份意愿决定
+  const bool head_keep_alive = kStreamKeepAlive && client_wants_keep_alive;
+  SsePassthroughSink sink(filter, &writer, t0, head_keep_alive);
+  auto result = call_llm_stream(cfg.backend.url, cfg.backend.api_key,
+                                request_body, cfg.backend.timeout_seconds, &sink);
+
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0);
+
+  if (result.streamed) {
+    // ---- 成功进入流式路径 ----
+    // 响应头在 sink.on_begin 里已发（write_stream_head）。若它没发出去（客户端
+    // 在拿到上游头之前就断了），这里不能再补一个响应：连接已经没有意义，
+    // 只能按"提前结束"处理并关闭连接
+    if (!sink.head_sent()) {
+      stats->record_stream_aborted();
+      LOG_WARN("stream: response head not sent (client gone after {} bytes)",
+               sink.bytes_in());
+      return {HttpReply{200, "text/event-stream", {}}, false};
+    }
+    // 结束时写 chunked 终止块（0\r\n\r\n）。写不进去说明客户端已经走了，
+    // 此时连接不能复用
+    bool finished = writer.finish_stream();
+    bool keep_alive = kStreamKeepAlive && finished && !sink.write_failed() &&
+                      sink.abort_reason() != AbortReason::kDeadline &&
+                      sink.abort_reason() != AbortReason::kClientGone;
+
+    if (sink.write_failed() || sink.abort_reason() != AbortReason::kNone) {
+      // 客户端提前断开 / 写死线到点：不进延迟样本池（口径见 stats.h）
+      stats->record_stream_aborted();
+      LOG_WARN("stream: aborted after {} bytes ({}), keep_alive={}",
+               sink.bytes_in(),
+               sink.abort_reason() == AbortReason::kDeadline ? "write deadline"
+                                                             : "client gone",
+               keep_alive ? "yes" : "no");
+    } else {
+      // usage 在 SSE 的最后一个事件里；透传路径要拿到它必须解析事件流，
+      // 本轮**不解析**（token 计数因此为 0，见简报"未修/需决策"）。
+      // 延迟口径：进样本池的是首字节延迟 TTFT，total 只进日志
+      stats->record_stream(sink.first_byte_ms(), elapsed.count(), 0, 0);
+      LOG_INFO_SAMPLED(
+          "stream: done ttft={}ms total={}ms bytes={} done_event={} "
+          "filter_rejected={} keep_alive={}",
+          sink.first_byte_ms(), elapsed.count(), sink.bytes_in(),
+          sink.done_seen() ? "yes" : "no", sink.filter_rejected() ? "yes" : "no",
+          keep_alive ? "yes" : "no");
+    }
+    if (sink.filter_rejected())
+      LOG_WARN("filter: rejected SSE event ({} bytes, contains URL)",
+               sink.rejected_event().size());
+    // 流式响应的状态码与响应头已经写出去了，这里返回的 HttpReply 不会再被发送
+    // （连接处理器见到 writer.committed() 就跳过）
+    return {HttpReply{200, "text/event-stream", {}}, keep_alive};
+  }
+
+  // ---- 没走成流式 ----
+  // 上游返回的不是 SSE（常见：上游 4xx/5xx 的 JSON 错误体）、curl 自己失败，
+  // 或 sink 拒绝了流式。此时 result.body 是完整（或已收到的部分）响应体，
+  // 按普通 JSON 响应回给客户端，状态码沿用上游，保证错误体仍可解析、SDK 能判错
+  if (result.status_code == 0) {
+    LOG_ERROR("stream: upstream call failed: {}", result.curl_error);
+    stats->record_stream_aborted();
+    return error_outcome(
+        std::format(R"({{"error":"upstream error: {}"}})",
+                    result.curl_error.empty() ? std::string("unknown")
+                                              : result.curl_error),
+        502);
+  }
+  if (sink.filter_rejected()) {
+    LOG_WARN("filter: rejected SSE event before headers were sent");
+    return json_reply(R"({"error":"Response filtered"})", 502);
+  }
+
+  auto out_result = filter->check_output(result.body);
+  if (out_result.action == FilterAction::kReject) {
+    LOG_WARN("filter: rejected non-stream upstream output containing URL");
+    return json_reply(R"({"error":"Response filtered"})", 502);
+  }
+  LOG_INFO_SAMPLED("stream: upstream not streamable (status={} ct={}), "
+                   "returned as buffered {} bytes",
+                   result.status_code, result.content_type, result.body.size());
+  // 非流式兜底：状态码透传，但这条连接**不复用**——客户端是按流式发起的，
+  // 异常路径上少一层连接状态歧义更稳妥
+  return {HttpReply{upstream_status(result.status_code), "application/json",
+                    annotate_cache_status(out_result.sanitized,
+                                          "stream_fallback")},
+          false};
+}
+
+static HandleOutcome handle_request(const std::string& request_body,
+                                    const GatewayConfig& cfg,
+                                    MessageFilter* filter,
+                                    CacheEngine* engine,
+                                    Singleflight* sf,
+                                    Stats* stats,
+                                    ResponseWriter& writer,
+                                    bool client_wants_keep_alive) {
   auto t0 = std::chrono::steady_clock::now();
 
   // 1. 输入过滤（所有路径都必须执行）
@@ -248,14 +482,7 @@ static HttpReply handle_request(const std::string& request_body,
       user_msg = f_result.sanitized;
   }
 
-  // 2. stream:true：明确拒绝（不转发到上游）。
-  //    放在输入过滤之后，保证被拒请求同样经过安全过滤器。
-  if (wants_stream(request_body)) {
-    LOG_WARN("cache: reject (stream) stream=true not supported yet");
-    return json_reply(kStreamUnsupported, 400);
-  }
-
-  // 3. 工具调用类流量：不查缓存、不写缓存、不参与请求合并，但仍走双向过滤与状态码透传
+  // 2. 工具调用类流量：不查缓存、不写缓存、不参与请求合并，但仍走双向过滤与状态码透传
   if (is_tool_request(request_body)) {
     auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
                            request_body, cfg.backend.timeout_seconds);
@@ -280,8 +507,15 @@ static HttpReply handle_request(const std::string& request_body,
       // 上游内容无法交付给客户端：502（既非客户端错误，也不该沿用上游状态码）
       return json_reply(R"({"error":"Response filtered"})", 502);
     }
-    return json_reply(annotate_cache_status(out_result.sanitized, "bypass"),
-                      upstream_status(result.status_code));
+    return {HttpReply{upstream_status(result.status_code), "application/json",
+                      annotate_cache_status(out_result.sanitized, "bypass")},
+            true};
+  }
+
+  // 3. stream:true：真透传（SSE）。放在输入过滤之后，保证被拒请求同样经过过滤器
+  if (wants_stream(request_body)) {
+    return handle_stream_request(request_body, cfg, filter, stats, writer, t0,
+                                 client_wants_keep_alive);
   }
 
   // 缓存命中检查时带回的 embedding（避免 cache_reply 重复计算）
@@ -305,7 +539,9 @@ static HttpReply handle_request(const std::string& request_body,
         LOG_WARN("filter: rejected cached output containing URL");
         return json_reply(R"({"error":"Response filtered"})", 502);
       }
-      return json_reply(annotate_cache_status(hit_out.sanitized, "hit"));
+      return {HttpReply{200, "application/json",
+                        annotate_cache_status(hit_out.sanitized, "hit")},
+              true};
     }
     cached_embedding = std::move(hit.embedding);
   }
@@ -344,7 +580,10 @@ static HttpReply handle_request(const std::string& request_body,
             LOG_WARN("filter: rejected merged output containing URL");
             return json_reply(R"({"error":"Response filtered"})", 502);
           }
-          return json_reply(annotate_cache_status(merged_out.sanitized, "merged"));
+          return {
+              HttpReply{200, "application/json",
+                        annotate_cache_status(merged_out.sanitized, "merged")},
+              true};
         }
       } else {
         LOG_DEBUG("singleflight: wait timeout (src_len={})", ns_key.size());
@@ -401,9 +640,13 @@ static HttpReply handle_request(const std::string& request_body,
     LOG_WARN("filter: rejected output containing URL");
     return json_reply(R"({"error":"Response filtered"})", 502);
   }
-  // 上游错误码（4xx/5xx/502/504）原样透传，不再一律 200
-  return json_reply(annotate_cache_status(out_result.sanitized, "miss"),
-                    upstream_status(result.status_code));
+  // 上游错误码（4xx/5xx/502/504）原样透传，不再一律 200。
+  // 状态码 >= 500 时不复用连接（上游故障期间客户端多半会重试，让它们重新握手
+  // 反而能错开到别的实例；且这类响应体常常很短，复用收益有限）
+  const int status = upstream_status(result.status_code);
+  return {HttpReply{status, "application/json",
+                    annotate_cache_status(out_result.sanitized, "miss")},
+          status < 500};
 }
 
 int main(int argc, char* argv[]) {
@@ -481,6 +724,26 @@ int main(int argc, char* argv[]) {
   stats->set_pricing(TokenPricing{cfg.cost.input_per_1k, cfg.cost.output_per_1k});
   auto filter = std::make_shared<MessageFilter>(cfg.filter);
 
+  // ---- 2.5 embedding 指纹：向量只对"产生它的模型"有意义 ----
+  // 换模型或改分词（本项目刚改过 WordPiece 规则）之后，旧向量与新查询向量不在
+  // 同一个空间里，余弦相似度失去意义，且**不会报错**——只会静默返回错误答案。
+  // 因此落盘时记录指纹、加载时比对；不一致就丢弃向量（保留文本）并按新模型重建。
+  EmbeddingFingerprint fp;
+  if (cfg.cache.enabled && onnx_embed->ready()) {
+    fp = make_embedding_fingerprint(cfg.embedding.model_path,
+                                    cfg.embedding.vocab_path, cfg.embedding.dim,
+                                    kTokenizerId);
+    if (!fp.valid()) {
+      // 模型能加载却算不出文件哈希（权限/IO 异常）：不能把空指纹当成"匹配"
+      LOG_WARN("cache: embedding fingerprint unavailable "
+               "(model={} vocab={}), vector origin will NOT be verified",
+               cfg.embedding.model_path, cfg.embedding.vocab_path);
+    } else {
+      lru->set_fingerprint(fp.to_string());
+      LOG_INFO("cache: embedding fingerprint {}", fp.to_string());
+    }
+  }
+
   // 从磁盘恢复缓存
   if (cfg.cache.enabled) {
     // 返回值必须检查：路径不可读/文件损坏时 load 会失败，静默忽略会让"重启不丢缓存"
@@ -488,6 +751,24 @@ int main(int argc, char* argv[]) {
     if (!lru->load("cache/lru_store.json"))
       LOG_WARN("cache: load from cache/lru_store.json failed "
                "(missing or malformed), starting empty");
+    // 指纹判定结果必须显式落日志：这是"静默串答案"唯一的可观测面
+    if (lru->fingerprint_mismatch()) {
+      if (!lru->loaded_file_had_fingerprint()) {
+        LOG_WARN("cache: lru_store.json has no embedding fingerprint (legacy "
+                 "format): dropped {} vector(s), kept text entries; index will "
+                 "be rebuilt with the current model",
+                 lru->dropped_vectors());
+      } else {
+        LOG_WARN("cache: embedding fingerprint mismatch: file=[{}] current=[{}] "
+                 "-> dropped {} vector(s), kept text entries, rebuilding index",
+                 lru->loaded_fingerprint(),
+                 fp.valid() ? fp.to_string() : std::string("<unavailable>"),
+                 lru->dropped_vectors());
+      }
+    } else if (fp.valid() && lru->loaded_file_had_fingerprint()) {
+      LOG_INFO("cache: embedding fingerprint verified ({} vector entries)",
+               lru->size());
+    }
     // 加载后立即清理过期条目：落盘时仍有效、此后超过 TTL 的条目不应继续占用内存与索引
     size_t purged_on_load = lru->purge_expired();
     // 索引由 LruStore 重建，无需独立加载;
@@ -549,18 +830,28 @@ int main(int argc, char* argv[]) {
   g_shutdown.store(false, std::memory_order_release);
 
   Singleflight flight_merge;
-  server.set_handler([&](const std::string& body) {
+  // handle_request 的返回值是 pair<HttpReply, keep_alive>，而路由层只接受
+  // HttpReply（keep-alive 由连接处理器按请求头自行判定）。流式响应在
+  // 连接处理器里走的是"writer.committed() 就直接返回"的旁路，不依赖这里返回的
+  // HttpReply——因此 keep_alive 这一项在本路由上是多余的，丢弃即可
+  server.set_handler([&](const std::string& body, ResponseWriter& writer,
+                         const HttpRequestInfo& info) -> HttpReply {
     // 兜底：线程池 worker 里逃出的异常会直接 std::terminate 整个进程，
-    // 因此任何异常都必须在这里被拦住并转成一个普通错误响应
+    // 因此任何异常都必须在这里被拦住并转成一个普通错误响应。
+    // 注意：异常若发生在流式响应已经开始写之后，这里无法回退已发出的响应头
+    // （客户端会看到一个被截断的流），只能保证进程存活——见简报"已知限制"
     try {
+      // 客户端是否希望复用连接：由连接处理器从版本 + Connection 头解析后传入。
+      // 响应头的 Connection 与"是否真的复用"必须用同一份意愿
       return handle_request(body, cfg, filter.get(), engine.get(),
-                            &flight_merge, stats.get());
+                            &flight_merge, stats.get(), writer, info.keep_alive)
+          .first;
     } catch (const std::exception& e) {
       LOG_ERROR("request handler threw: {}", e.what());
-      return json_reply(R"({"error":"Internal error"})", 500);
+      return HttpReply{500, "application/json", R"({"error":"Internal error"})"};
     } catch (...) {
       LOG_ERROR("request handler threw non-std exception");
-      return json_reply(R"({"error":"Internal error"})", 500);
+      return HttpReply{500, "application/json", R"({"error":"Internal error"})"};
     }
   });
 
@@ -571,17 +862,22 @@ int main(int argc, char* argv[]) {
   //   - 只暴露聚合计数与分位数，不含任何请求内容／哈希，脱敏口径与日志一致
   //   - 不读 active_connections()：conns_ 由 reactor 线程独占，worker 里读是数据竞争
   const auto process_start = std::chrono::steady_clock::now();
-  server.add_route("GET", "/metrics", [stats, &server, process_start](
-                                           const std::string&) {
-    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-                      std::chrono::steady_clock::now() - process_start)
-                      .count();
-    auto body = render_metrics(
-        *stats, uptime, static_cast<int64_t>(server.pending_tasks()),
-        static_cast<int64_t>(server.active_tasks()),
-        static_cast<int64_t>(server.worker_threads()));
-    return HttpReply{200, kMetricsContentType, std::move(body)};
-  });
+  server.add_route("GET", "/metrics",
+                   [stats, &server, process_start](const std::string&,
+                                                   ResponseWriter&,
+                                                   const HttpRequestInfo&) {
+                     auto uptime =
+                         std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now() - process_start)
+                             .count();
+                     auto body = render_metrics(
+                         *stats, uptime,
+                         static_cast<int64_t>(server.pending_tasks()),
+                         static_cast<int64_t>(server.active_tasks()),
+                         static_cast<int64_t>(server.worker_threads()),
+                         static_cast<int64_t>(server.accepted_connections()));
+                     return HttpReply{200, kMetricsContentType, std::move(body)};
+                   });
 
   // ---- 5. 启动 ----
   LOG_INFO("ai-gateway starting on :{}, backend={}", cfg.server.port, cfg.backend.url);

@@ -77,6 +77,30 @@ void Stats::record_bypass(int64_t latency_ms,
   bypass_latency_us_ += latency_ms * 1000;
 }
 
+void Stats::record_stream(int64_t first_byte_ms, int64_t total_ms,
+                          int prompt_tokens, int completion_tokens) {
+  std::lock_guard lock(mutex_);
+  // 延迟样本池里放**首字节延迟**：流式请求的"用户感知延迟"就是 TTFT。
+  // 整段时长随回答长度线性增长，混进同一个分位数池会让 p95 失去意义，
+  // 因此它只进日志不进池（见 report() 的口径说明）
+  bypass_ring_[bypass_ring_pos_] = first_byte_ms;
+  bypass_ring_pos_ = (bypass_ring_pos_ + 1) % kLatencyWindow;
+  if (bypass_ring_count_ < kLatencyWindow) ++bypass_ring_count_;
+  ++bypassed_;
+  ++streams_;
+  total_prompt_tokens_ += prompt_tokens;
+  total_completion_tokens_ += completion_tokens;
+  bypass_latency_us_ += first_byte_ms * 1000;
+  // total_ms 目前只由调用方写进日志：把它也塞进样本池会让分位数含义混乱
+  // （一半样本是 TTFT、一半是整段时长），因此这里显式丢弃
+  (void)total_ms;
+}
+
+void Stats::record_stream_aborted() {
+  std::lock_guard lock(mutex_);
+  ++streams_aborted_;
+}
+
 void Stats::push_latency(int64_t ms) {
   latency_ring_[ring_pos_] = ms;
   ring_pos_ = (ring_pos_ + 1) % kLatencyWindow;
@@ -107,23 +131,29 @@ int64_t Stats::bypass_percentile(double p) const {
 
 void Stats::report() const {
   std::lock_guard lock(mutex_);
-  if (total_ == 0 && bypassed_ == 0 && merged_ == 0) return;
+  if (total_ == 0 && bypassed_ == 0 && merged_ == 0 && streams_aborted_ == 0)
+    return;
 
   double saved = estimated_saved();
-  // 口径说明（报告 M3/M10/M13）：
+  // 口径说明（报告 M3/M10/M13 + 本轮流式）：
   //   requests   = 可缓存流量（未命中 + 命中），不含旁路与合并
   //   hit_rate   = hits / requests，既不把旁路当分母，也不把合并当分子
   //   merged     = 请求合并命中，单独计数
   //   samples    = 主延迟环形缓冲里的样本数，恒等于 requests（≤ 窗口大小 1024）
-  //   bypass_*   = 旁路流量自己的样本池与分位数，不混入上面的 avg/min/max
+  //   bypass_*   = 旁路流量自己的样本池与分位数，不混入上面的 avg/min/max。
+  //                **流式请求也进这个池，进池的值是首字节延迟（TTFT）**：
+  //                流式的"整段完成时间"随回答长度变化，进池会让分位数失去意义；
+  //                这里另开 streams 与 streams_abort 两个计数说明样本构成
   //   cost/saved = 按输入/输出分档单价估算（默认 0.001/0.001 = 旧口径）；
   //                同时打印所用单价，避免"金额变了却查不出换没换价"
   LOG_INFO("[STATS] requests={} hits={} misses={} hit_rate={:.1f}% merged={} "
-           "bypassed={} tokens={} saved={} cost=¥{:.4f} saved=¥{:.4f} "
+           "bypassed={} streams={} streams_abort={} tokens={} saved={} "
+           "cost=¥{:.4f} saved=¥{:.4f} "
            "price_in=¥{}/1K price_out=¥{}/1K "
            "avg={}ms min={}ms max={}ms p50={}ms p95={}ms p99={}ms samples={} "
            "bypass_avg={}ms bypass_p50={}ms bypass_p95={}ms bypass_samples={}",
            total_, hits_, misses_, hit_rate() * 100, merged_, bypassed_,
+           streams_, streams_aborted_,
            total_prompt_tokens_ + total_completion_tokens_,
            tokens_saved_,
            estimated_cost(), saved,

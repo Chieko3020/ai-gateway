@@ -12,6 +12,49 @@ std::string_view ParsedRequest::header(std::string_view key) const {
   return (it != headers.end()) ? it->second : std::string_view{};
 }
 
+namespace {
+// 在逗号分隔的 Connection 头里找某个 token（大小写不敏感）
+bool connection_has_token(std::string_view value, std::string_view token) {
+  size_t pos = 0;
+  while (pos <= value.size()) {
+    auto comma = value.find(',', pos);
+    auto raw = value.substr(
+        pos, comma == std::string_view::npos ? std::string_view::npos
+                                             : comma - pos);
+    // 去首尾空白
+    size_t b = 0, e = raw.size();
+    while (b < e && (raw[b] == ' ' || raw[b] == '\t')) ++b;
+    while (e > b && (raw[e - 1] == ' ' || raw[e - 1] == '\t')) --e;
+    auto item = raw.substr(b, e - b);
+    if (item.size() == token.size()) {
+      bool same = true;
+      for (size_t i = 0; i < item.size(); ++i) {
+        unsigned char a = static_cast<unsigned char>(item[i]);
+        unsigned char c = static_cast<unsigned char>(token[i]);
+        if (a >= 'A' && a <= 'Z') a = static_cast<unsigned char>(a - 'A' + 'a');
+        if (a != c) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return true;
+    }
+    if (comma == std::string_view::npos) break;
+    pos = comma + 1;
+  }
+  return false;
+}
+}  // namespace
+
+bool ParsedRequest::wants_keep_alive() const {
+  auto conn = header("Connection");
+  // Connection: close 优先，且对 HTTP/1.0 / 1.1 都有效（RFC 9112 §9.6）
+  if (connection_has_token(conn, "close")) return false;
+  if (connection_has_token(conn, "keep-alive")) return true;
+  // 缺省语义按版本：1.1 持久连接、1.0 非持久
+  return http_version == "HTTP/1.1";
+}
+
 ParsedRequest parse_request(const char* raw_data, size_t len) {
   ParsedRequest req;
   if (!raw_data || len == 0) return req;
@@ -37,6 +80,9 @@ ParsedRequest parse_request(const char* raw_data, size_t len) {
   auto target = request_line.substr(sp1 + 1, sp2 - sp1 - 1);
   auto qmark = target.find('?');
   req.path = (qmark == std::string_view::npos) ? target : target.substr(0, qmark);
+
+  // 提取 HTTP 版本（sp2 之后到行尾，例如 "HTTP/1.1"）
+  req.http_version = request_line.substr(sp2 + 1);
 
   // ---- 2. 头部: "Key: Value\r\n" 直到空行 ----
   while (pos < len) {

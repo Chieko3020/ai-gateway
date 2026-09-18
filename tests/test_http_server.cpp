@@ -90,7 +90,7 @@ int main() {
     std::atomic<bool> stop_flag{false};
     std::atomic<int> served{0};
     HttpServer server(sc);
-    server.set_handler([&served](const std::string& body) {
+    server.set_handler([&served](const std::string& body, ResponseWriter&, const HttpRequestInfo&) {
       ++served;
       return HttpReply{200, "application/json", "{\"echo\":\"" + body + "\"}"};
     });
@@ -138,7 +138,7 @@ int main() {
 
     std::atomic<bool> stop_flag{false};
     HttpServer server(sc);
-    server.set_handler([](const std::string&) {
+    server.set_handler([](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
       return HttpReply{200, "application/json", "{}"};
     });
 
@@ -181,10 +181,10 @@ int main() {
     std::atomic<bool> stop_flag{false};
     std::atomic<bool> slow_done{false};
     HttpServer server(sc);
-    server.set_handler([](const std::string&) {
+    server.set_handler([](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
       return HttpReply{200, "application/json", "{}"};
     });
-    server.add_route("/slow", [&slow_done](const std::string&) {
+    server.add_route("/slow", [&slow_done](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
       std::this_thread::sleep_for(300ms);
       slow_done.store(true);
       return HttpReply{200, "application/json", "{\"ok\":true}"};
@@ -227,7 +227,7 @@ int main() {
 
     std::atomic<bool> stop_flag{false};
     HttpServer server(sc);
-    server.set_handler([](const std::string&) {
+    server.set_handler([](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
       return HttpReply{200, "application/json", "{}"};
     });
 
@@ -286,10 +286,10 @@ int main() {
 
     std::atomic<bool> stop_flag{false};
     HttpServer server(sc);
-    server.set_handler([](const std::string&) {
+    server.set_handler([](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
       return HttpReply{200, "application/json", "{}"};
     });
-    server.add_route("/big", [&big_body](const std::string&) {
+    server.add_route("/big", [&big_body](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
       return HttpReply{200, "application/octet-stream", big_body};
     });
 
@@ -312,8 +312,13 @@ int main() {
       CHECK(connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
       ok++;
 
+      // 显式 Connection: close：本段测的是"慢客户端不会让大响应被截断"，
+      // 期望的是"写完就关"。若改成 keep-alive，客户端在 4KB 接收缓冲 + 30s 空闲
+      // 超时下要等满 30s 才会因为空闲超时看到 EOF，用例会从 3s 变成 30s。
+      // keep-alive 复用本身由第 7 段用正常大小的响应单独验证
       const char* req =
-          "POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
+          "POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n"
+          "Connection: close\r\n\r\n{}";
       send(fd, req, std::strlen(req), MSG_NOSIGNAL);
       // 什么都不读，让发送缓冲彻底填满（此时服务端必遇 EAGAIN）
       std::this_thread::sleep_for(300ms);
@@ -391,16 +396,16 @@ int main() {
       const std::string payload(4 * 1024 * 1024, 'z');
       std::atomic<uint64_t> eagain{0};
       auto t0 = std::chrono::steady_clock::now();
-      bool complete = send_all_with_deadline(sp[0], payload.data(), payload.size(),
-                                            /*deadline_ms=*/300, &eagain);
+      WriteStatus complete = send_all_with_deadline(
+          sp[0], payload.data(), payload.size(), /*deadline_ms=*/300, &eagain);
       auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - t0)
                             .count();
       std::fprintf(stderr,
                    "[write-deadline] 不读对端: complete=%d, %lldms, EAGAIN=%llu\n",
-                   complete ? 1 : 0, static_cast<long long>(elapsed_ms),
+                   complete == WriteStatus::kOk ? 1 : 0, static_cast<long long>(elapsed_ms),
                    static_cast<unsigned long long>(eagain.load()));
-      CHECK(!complete);          // 写不完
+      CHECK(complete != WriteStatus::kOk);  // 写不完
       ok++;
       CHECK(eagain.load() > 0);  // 确实撞上了 EAGAIN（不是别的原因提前返回）
       ok++;
@@ -431,10 +436,10 @@ int main() {
             std::this_thread::sleep_for(1ms);
           }
         });
-        bool ok_write = send_all_with_deadline(sp2[0], payload.data(),
-                                               payload.size(), 5000, &eagain2);
+        WriteStatus ok_write = send_all_with_deadline(
+            sp2[0], payload.data(), payload.size(), 5000, &eagain2);
         reader.join();
-        CHECK(ok_write);
+        CHECK(ok_write == WriteStatus::kOk);
         ok++;
         CHECK(received.size() == payload.size());
         ok++;

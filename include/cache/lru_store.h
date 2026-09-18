@@ -74,6 +74,22 @@ class LruStore {
   // 持久化：从 JSON 文件加载
   bool load(const std::string& path);
 
+  // ---- embedding 指纹（本轮新增）-----------------------------------------
+  // 落盘时写入、加载时比对：向量只对"产生它的模型"有意义，换模型/改分词之后
+  // 新旧向量不在同一个空间里，静默命中会返回错误答案。见 embedding_fingerprint.h
+  //
+  // 必须在 load() 之前设置：load() 会用给定指纹校验文件内容
+  void set_fingerprint(std::string fp) { expected_fingerprint_ = std::move(fp); }
+  const std::string& fingerprint() const { return fingerprint_; }
+
+  // 文件里记录的指纹（load 后有效；空串 = 旧格式文件没有该字段）
+  const std::string& loaded_fingerprint() const { return fingerprint_; }
+  bool loaded_file_had_fingerprint() const { return file_had_fingerprint_; }
+  // 因指纹不匹配而被丢弃的向量条数（load 后有效）
+  size_t dropped_vectors() const { return dropped_vectors_; }
+  // 本次 load 是否因为指纹不一致而丢弃了向量（调用方据此决定是否整份丢弃）
+  bool fingerprint_mismatch() const { return fingerprint_mismatch_; }
+
   // 统计
   size_t size() const;
   size_t hit_count() const { return hit_count_; }
@@ -123,6 +139,15 @@ class LruStore {
   size_t miss_count_ = 0;
   size_t evict_count_ = 0;
   size_t expired_count_ = 0;
+
+  // 期望的 embedding 指纹（调用方通过 set_fingerprint 给出）
+  std::string expected_fingerprint_;
+  // 文件里实际记录的指纹（空 = 无该字段）
+  std::string fingerprint_;
+  bool file_had_fingerprint_ = false;
+  size_t dropped_vectors_ = 0;
+  // 是否发生过指纹不一致（调用方据此决定"丢弃整个文件"还是"保留文本"）
+  bool fingerprint_mismatch_ = false;
 };
 
 }  // namespace ai_gateway

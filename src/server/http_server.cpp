@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -21,11 +22,187 @@ namespace ai_gateway {
 namespace {
 constexpr int kMaxEvents = 64;
 constexpr int kBacklog = 128;
-constexpr size_t kReadChunk = 4096;    // 每次 recv 的读取块大小
-constexpr int kMaxAcceptBatch = 512;   // 单次 epoll 事件内最多 accept 的连接数
-
+constexpr size_t kReadChunk = 4096;   // 每次 recv 的读取块大小
+constexpr int kMaxAcceptBatch = 512;  // 单次 epoll 事件内最多 accept 的连接数
 }  // namespace
 
+// ===========================================================================
+// 写路径：非阻塞 fd 上"写到底"
+// ===========================================================================
+WriteStatus send_all_with_deadline(
+    int client_fd, const char* data, size_t len, int write_deadline_ms,
+    std::atomic<uint64_t>* eagain_count,
+    std::chrono::steady_clock::time_point total_deadline) {
+  // 旧实现在这里 `if (sent <= 0) break`：非阻塞 fd 上 send() 返回 EAGAIN 时
+  // 会把剩余字节直接丢掉，慢客户端读大响应只会拿到前半截（报告 8.7 第 3 条）。
+  //
+  // 这里改成"等到能写为止"：EAGAIN 时用 poll(POLLOUT) 阻塞等待可写再续发，
+  // 并用**总 deadline**（不是每次 poll 各自计时）兜住慢客户端，
+  // 避免一个连接把 worker 永久占住。
+  //
+  // 为什么不做 EPOLLOUT 写缓冲：那需要把未发完的数据从 worker 交还给 reactor
+  // （跨线程写队列 + eventfd 唤醒 + 重新注册 EPOLLOUT + 所有权转移），
+  // 在本项目"worker 独占 fd 直到写完"的架构下改动面大、竞态风险高；
+  // poll 方案只影响单个 worker 且行为可测（见 test_http_server 的慢客户端用例）。
+  //
+  // total_deadline 是**整条响应**的绝对上限：流式响应对同一个连接会调用本函数
+  // 很多次，只有每次都算相对死线的话，一个"每次读一点点"的慢客户端可以让一条流
+  // 无限期占着 worker
+  const auto now = std::chrono::steady_clock::now();
+  auto call_deadline =
+      now + std::chrono::milliseconds(write_deadline_ms > 0 ? write_deadline_ms : 0);
+  const auto deadline = std::min(call_deadline, total_deadline);
+
+  size_t offset = 0;
+  while (offset < len) {
+    ssize_t sent = send(client_fd, data + offset, len - offset, MSG_NOSIGNAL);
+    if (sent > 0) {
+      offset += static_cast<size_t>(sent);
+      continue;
+    }
+    if (sent < 0 && errno == EINTR) continue;
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      // 计数供回归测试断言"确实走到了等待可写的分支"（否则用例可能没触发 EAGAIN）
+      if (eagain_count)
+        eagain_count->fetch_add(1, std::memory_order_relaxed);
+      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            deadline - std::chrono::steady_clock::now())
+                            .count();
+      if (left <= 0) {
+        LOG_WARN("send: write deadline exceeded, {} of {} bytes unsent",
+                 len - offset, len);
+        return WriteStatus::kDeadline;
+      }
+      pollfd w{client_fd, POLLOUT, 0};
+      int rc = ::poll(&w, 1, static_cast<int>(left));
+      if (rc < 0 && errno != EINTR) {
+        LOG_WARN("send: poll failed: {}", std::strerror(errno));
+        return WriteStatus::kSocket;
+      }
+      if (rc == 0) {
+        LOG_WARN("send: write deadline exceeded, {} of {} bytes unsent",
+                 len - offset, len);
+        return WriteStatus::kDeadline;
+      }
+      continue;  // 可写了，续发
+    }
+    // 真实错误：EPIPE / ECONNRESET 等（客户端已经走了，没什么可补救的）
+    if (sent < 0)
+      LOG_DEBUG("send error: {} ({} of {} bytes sent)", std::strerror(errno),
+                offset, len);
+    return WriteStatus::kSocket;
+  }
+  return WriteStatus::kOk;
+}
+
+// ===========================================================================
+// ResponseWriter
+// ===========================================================================
+bool ResponseWriter::send_raw(std::string_view data) {
+  if (failed_) return false;
+  if (data.empty()) return true;
+
+  // 小数据直接写：HTTP 头与 SSE 事件通常几十到几百字节，避免为它们多走一次
+  // 缓冲拷贝。写不完的部分再进缓冲（后续 flush 续发）。
+  WriteStatus st = WriteStatus::kOk;
+  if (out_.empty()) {
+    st = send_all_with_deadline(fd_, data.data(), data.size(),
+                               write_deadline_ms_, eagain_count_,
+                               total_deadline_);
+    if (st == WriteStatus::kOk) {
+      bytes_sent_ += data.size();
+      return true;
+    }
+    if (st == WriteStatus::kDeadline) {
+      // 死线到：剩下的字节不再保留，直接标记失败
+      failed_ = true;
+      abort_ = AbortReason::kDeadline;
+      return false;
+    }
+    failed_ = true;
+    abort_ = AbortReason::kClientGone;
+    return false;
+  }
+
+  // 已有积压：先追加再整体 flush（保持字节顺序）
+  out_.append(data);
+  return flush();
+}
+
+bool ResponseWriter::flush() {
+  if (failed_) return false;
+  if (out_.empty()) return true;
+  const size_t n = out_.size();
+  WriteStatus st = send_all_with_deadline(fd_, out_.data(), n,
+                                         write_deadline_ms_, eagain_count_,
+                                         total_deadline_);
+  if (st == WriteStatus::kOk) {
+    bytes_sent_ += n;
+    out_.clear();
+    return true;
+  }
+  if (st == WriteStatus::kDeadline) {
+    failed_ = true;
+    abort_ = AbortReason::kDeadline;
+    return false;
+  }
+  failed_ = true;
+  abort_ = AbortReason::kClientGone;
+  return false;
+}
+
+bool ResponseWriter::write_head(int status_code, std::string_view content_type,
+                                size_t content_length, bool keep_alive) {
+  if (committed_ || failed_) return false;
+  committed_ = true;
+  chunked_ = false;
+  ResponseHeader h;
+  h.status_code = status_code;
+  h.content_type = std::string(content_type);
+  h.content_length = content_length;
+  h.keep_alive = keep_alive;
+  h.chunked = false;
+  return send_raw(build_response_head(h));
+}
+
+bool ResponseWriter::write_stream_head(int status_code,
+                                       std::string_view content_type,
+                                       bool keep_alive) {
+  if (committed_ || failed_) return false;
+  committed_ = true;
+  chunked_ = true;
+  ResponseHeader h;
+  h.status_code = status_code;
+  h.content_type = std::string(content_type);
+  h.content_length = kChunkedLength;
+  h.chunked = true;
+  h.keep_alive = keep_alive;
+  // 流式响应头必须**立刻**发出去：客户端（curl -N / SSE 解析器）要看到 200 +
+  // text/event-stream 才开始处理后续事件。缓冲到第一次 body 再发会让"上游迟迟
+  // 不吐第一个 token"的场景表现为网关不响应
+  return send_raw(build_response_head(h));
+}
+
+bool ResponseWriter::write_body(std::string_view data) {
+  if (!committed_ || failed_) return false;
+  if (data.empty()) return true;
+  if (chunked_) {
+    // chunked 分帧：每个 chunk 自带长度。0 长度块专用作终止（见 finish_stream），
+    // 因此空块在这里被跳过
+    std::string framed = encode_chunk(data);
+    return send_raw(framed);
+  }
+  return send_raw(data);
+}
+
+bool ResponseWriter::finish_stream() {
+  if (!committed_ || failed_ || !chunked_) return !failed_;
+  return send_raw(kChunkedTerminator);
+}
+
+// ===========================================================================
+// HttpServer
+// ===========================================================================
 HttpServer::HttpServer(const ServerConfig& config)
     : config_(config) {}
 
@@ -38,6 +215,15 @@ HttpServer::~HttpServer() {
   }
   conns_.clear();
   conn_index_.clear();
+  {
+    std::lock_guard lock(io_mutex_);
+    for (auto& r : io_returns_) close(r.fd);
+    io_returns_.clear();
+  }
+  if (wake_fd_ >= 0) {
+    close(wake_fd_);
+    wake_fd_ = -1;
+  }
   if (listen_fd_ >= 0) {
     close(listen_fd_);
     listen_fd_ = -1;
@@ -124,6 +310,15 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
     return;
   }
 
+  // 唤醒 fd：worker 写完一个 keep-alive 连接后要把它交还 reactor 重新登记，
+  // 不能等最多 100ms 的 epoll 超时（那会给下一个请求平白加上几十毫秒）。
+  // eventfd 的 8 字节计数只当信号用，不承载数据（fd 本身走 io_returns_ 队列）
+  wake_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (wake_fd_ < 0) {
+    LOG_WARN("eventfd() failed: {} (keep-alive 归还最迟 100ms 生效)",
+             std::strerror(errno));
+  }
+
   epoll_event ev{};
   ev.events = EPOLLIN | EPOLLET;  // 边缘触发
   ev.data.fd = listen_fd_;
@@ -132,6 +327,12 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
     close(listen_fd_);
     listen_fd_ = -1;
     return;
+  }
+  if (wake_fd_ >= 0) {
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.fd = wake_fd_;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) < 0)
+      LOG_WARN("epoll_ctl ADD wake_fd failed: {}", std::strerror(errno));
   }
 
   running_ = true;
@@ -196,6 +397,7 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
             continue;
           }
 
+          accepted_connections_.fetch_add(1, std::memory_order_relaxed);
           ev.events = EPOLLIN | EPOLLET;
           ev.data.fd = client_fd;
           if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
@@ -203,10 +405,15 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
             close(client_fd);
             continue;
           }
-          auto it = conns_.emplace(conns_.end(), client_fd, Connection{});
-          it->second.last_activity = std::chrono::steady_clock::now();
+          auto it = conns_.emplace(conns_.end(), client_fd,
+                                   Connection{std::chrono::steady_clock::now()});
           conn_index_[client_fd] = it;
         }
+      } else if (fd == wake_fd_) {
+        // ---- worker 归还的 fd ----
+        uint64_t v = 0;
+        while (read(wake_fd_, &v, sizeof(v)) > 0) {}  // 清空计数（ET 模式）
+        process_returned_fds(/*stop_requested=*/false);
       } else {
         // ---- 客户端数据：读入累积缓冲区，判断请求是否完整 ----
         handle_client(fd);
@@ -216,9 +423,14 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
     // 每个 epoll 节拍做一次连接维护：
     //   - 主动读一遍所有连接（ET 模式下"对端只发 FIN、不再发数据"不一定产生新的
     //     EPOLLIN 边沿，实测在低延迟环回上会漏；主动读才能保证半关闭立刻被发现）
-    //   - 关闭空闲超时的连接（slowloris / 半关闭驻留）
+    //   - 关闭空闲超时的连接（slowloris / 半关闭驻留 / keep-alive 空闲连接）
+    //   - 处理上一轮里 worker 归还的 fd（不依赖 eventfd，做兜底）
     maintain_connections();
   }
+
+  // 停机：把所有还借在 worker 手里的连接按 close 处理（它们在 drain() 之后
+  // 才归还，这里先不处理；drain() 里会再收一次尾）
+  process_returned_fds(/*stop_requested=*/true);
 
   if (epoll_fd_ >= 0) {
     close(epoll_fd_);
@@ -238,72 +450,95 @@ void HttpServer::drain() {
   // run() 已退出：不再有新连接与新任务提交（worker 之间也不会再 execute），
   // 这里只需等在途请求跑完，之后的统计/落盘才不会与它们并发
   pool_.wait_idle();
+  // worker 一律不自己 close(fd)，因此这里必须把归还队列收尾——
+  // 否则停机时这些 fd 既不在 conns_（不归 reactor 管）也没被 close
+  process_returned_fds(/*stop_requested=*/true);
 }
 
-// 自由函数（不是 HttpServer 的私有方法）：这样可以脱离 HTTP 服务直接用
-// socketpair 做确定性单测（见 test_http_server 第 6 段），不必依赖 TCP 时序
-bool send_all_with_deadline(int client_fd, const char* data, size_t len,
-                            int write_deadline_ms,
-                            std::atomic<uint64_t>* eagain_count) {
-  // 旧实现在这里 `if (sent <= 0) break`：非阻塞 fd 上 send() 返回 EAGAIN 时
-  // 会把剩余字节直接丢掉，慢客户端读大响应只会拿到前半截（报告 8.7 第 3 条）。
-  //
-  // 这里改成"等到能写为止"：EAGAIN 时用 poll(POLLOUT) 阻塞等待可写再续发，
-  // 并用**总 deadline**（不是每次 poll 各自计时）兜住慢客户端，
-  // 避免一个连接把 worker 永久占住。
-  //
-  // 为什么不做 EPOLLOUT 写缓冲：那需要把未发完的数据从 worker 交还给 reactor
-  // （跨线程写队列 + eventfd 唤醒 + 重新注册 EPOLLOUT + 所有权转移），
-  // 在本项目"worker 独占 fd 并在结束时 close"的架构下改动面大、竞态风险高；
-  // poll 方案只影响单个 worker 且行为可测（见 test_http_server 的慢客户端用例）。
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(write_deadline_ms);
-  size_t offset = 0;
-  while (offset < len) {
-    ssize_t sent = send(client_fd, data + offset, len - offset, MSG_NOSIGNAL);
-    if (sent > 0) {
-      offset += static_cast<size_t>(sent);
+// ---------------------------------------------------------------------------
+// fd 所有权：worker -> reactor 的归还路径
+// ---------------------------------------------------------------------------
+void HttpServer::grant_borrow(uint64_t token) {
+  std::lock_guard lock(io_mutex_);
+  borrowed_tokens_.insert(token);
+}
+
+bool HttpServer::try_claim_borrow(uint64_t token) {
+  std::lock_guard lock(io_mutex_);
+  return borrowed_tokens_.erase(token) > 0;
+}
+
+void HttpServer::return_fd(int fd, FdAction action, uint64_t token) {
+  {
+    std::lock_guard lock(io_mutex_);
+    // 令牌可能已被 reactor 单方面撤销（try_claim_borrow 失败时不会归还），
+    // 这里统一清掉，避免集合无限增长
+    borrowed_tokens_.erase(token);
+    io_returns_.push_back(FdReturn{fd, action, token});
+  }
+  if (wake_fd_ >= 0) {
+    uint64_t one = 1;
+    ssize_t n = write(wake_fd_, &one, sizeof(one));
+    (void)n;  // 失败也没关系：maintain_connections() 每 100ms 兜底处理一次
+  }
+}
+
+void HttpServer::process_returned_fds(bool stop_requested) {
+  std::vector<FdReturn> batch;
+  {
+    std::lock_guard lock(io_mutex_);
+    batch.swap(io_returns_);
+  }
+  for (const auto& r : batch) {
+    // 连接项仍然由 reactor 持有（worker 只是"借用"），因此这里统一回收
+    if (stop_requested || r.action == FdAction::kClose) {
+      close_connection(r.fd);
       continue;
     }
-    if (sent < 0 && errno == EINTR) continue;
-    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      // 计数供回归测试断言"确实走到了等待可写的分支"（否则用例可能没触发 EAGAIN）
-      if (eagain_count)
-        eagain_count->fetch_add(1, std::memory_order_relaxed);
-      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            deadline - std::chrono::steady_clock::now())
-                            .count();
-      if (left <= 0) {
-        LOG_WARN("send: write deadline ({}ms) exceeded, {} of {} bytes unsent",
-                 write_deadline_ms, len - offset, len);
-        return false;
-      }
-      pollfd w{client_fd, POLLOUT, 0};
-      int rc = ::poll(&w, 1, static_cast<int>(left));
-      if (rc < 0 && errno != EINTR) {
-        LOG_WARN("send: poll failed: {}", std::strerror(errno));
-        return false;
-      }
-      if (rc == 0) {
-        LOG_WARN("send: write deadline ({}ms) exceeded, {} of {} bytes unsent",
-                 write_deadline_ms, len - offset, len);
-        return false;
-      }
-      continue;  // 可写了，续发
-    }
-    // 真实错误：EPIPE / ECONNRESET 等（客户端已经走了，没什么可补救的）
-    if (sent < 0)
-      LOG_DEBUG("send error: {} ({} of {} bytes sent)", std::strerror(errno),
-                offset, len);
-    return false;
+    rearm_keep_alive(r.fd, r.token);
   }
-  return true;
 }
 
-bool HttpServer::send_all(int client_fd, const char* data, size_t len,
-                          int write_deadline_ms) {
-  return send_all_with_deadline(client_fd, data, len, write_deadline_ms,
-                                &send_eagain_count_);
+void HttpServer::rearm_keep_alive(int fd, uint64_t token) {
+  auto it = conn_index_.find(fd);
+  if (it == conn_index_.end()) {
+    // 连接项已经没了：若 fd 仍然有效，说明它已经不属于我们（正常路径上
+    // 不会发生——reactor 只在归还流程里删连接项），保守关闭避免 fd 泄漏
+    LOG_DEBUG("keep-alive: fd {} has no registered connection, closing", fd);
+    ::close(fd);
+    return;
+  }
+  auto& conn = it->second->second;
+  if (conn.borrow_token != token) {
+    // fd 号已被复用（旧连接在借用期间被关闭，新连接拿到了同一个号码）。
+    // 这时既不能 close 也不能重新登记：那个 fd 现在是别人的连接
+    LOG_DEBUG("keep-alive: stale return for fd {} (token {} != {}), ignoring", fd,
+              token, conn.borrow_token);
+    return;
+  }
+
+  // 同一个连接上的第 2 个及以后的请求：计数供测试证明复用真的发生了
+  // （而不是"客户端碰巧连了两次"，那个场景下每条连接的 requests_served 都是 1）
+  if (++conn.requests_served > 1)
+    reused_connections_.fetch_add(1, std::memory_order_relaxed);
+  keep_alive_rearms_.fetch_add(1, std::memory_order_relaxed);
+
+  // worker 借用期间 reactor 不读该 fd，因此缓冲区里只可能有上一个请求之后
+  // 多收到的字节（pipelining）：留给下一轮解析，别丢
+  conn.worker_owned.store(false);
+  conn.last_activity = std::chrono::steady_clock::now();
+
+  epoll_event ev{};
+  ev.events = EPOLLIN | EPOLLET;
+  ev.data.fd = fd;
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+    close_connection(fd);
+    return;
+  }
+
+  // 缓冲里已经有下一个请求（客户端 pipelining）时立即推进状态机，
+  // 不必等下一次可读事件——ET 模式下那些字节不会再有新的边沿
+  if (!conn.buf.empty()) handle_buffer(fd, /*peer_closed=*/false);
 }
 
 void HttpServer::close_connection(int client_fd) {
@@ -318,6 +553,9 @@ void HttpServer::close_connection(int client_fd) {
 }
 
 void HttpServer::maintain_connections() {
+  // 先处理 worker 归还的 fd（不依赖 eventfd 的兜底路径）
+  process_returned_fds(/*stop_requested=*/false);
+
   // 收集本轮要处理的 fd：处理过程中会 erase 连接，不能直接边遍历边改
   std::vector<int> fds;
   fds.reserve(conns_.size());
@@ -331,6 +569,12 @@ void HttpServer::maintain_connections() {
   for (int fd : fds) {
     auto it = conn_index_.find(fd);
     if (it == conn_index_.end()) continue;  // 同一轮里已被处理掉
+
+    // 借给 worker 的连接：所有权不在 reactor 手里，绝不能读或关它
+    // （读会与 worker 的响应写/客户端并发行为抢数据，关会让 worker 的
+    //   send 落到一个已被复用出去的 fd 上）
+    if (it->second->second.worker_owned.load())
+      continue;
 
     // 主动读一次：把因 ET 边沿丢失而滞留在内核缓冲区（含 FIN）的数据取出来。
     // 这里不刷新 last_activity —— 空闲超时必须按"客户端最后一次发字节"计时，
@@ -351,6 +595,8 @@ void HttpServer::maintain_connections() {
     // 仍不完整的连接：检查空闲超时
     it = conn_index_.find(fd);
     if (it == conn_index_.end()) continue;
+    if (it->second->second.worker_owned.load())
+      continue;
     if (has_timeout && now - it->second->second.last_activity >= limit) {
       LOG_WARN("idle timeout ({}s): closing connection, buffered {} bytes",
                config_.idle_timeout_seconds, it->second->second.buf.size());
@@ -431,9 +677,12 @@ static size_t parse_content_length_caseless(std::string_view header_section) {
 void HttpServer::handle_client(int client_fd) {
   auto idx_it = conn_index_.find(client_fd);
   if (idx_it == conn_index_.end()) {
-    // 已被 worker 关闭 / 已被空闲超时清理：fd 号里已无我们的状态
+    // 已被空闲超时清理 / 已被归还流程处理：fd 号里已无我们的状态
     return;
   }
+  // 借给 worker 的连接：worker 正在写响应，reactor 不能读它的 socket
+  if (idx_it->second->second.worker_owned.load())
+    return;
   auto& conn = idx_it->second->second;
 
   ReadState state = read_into_buffer(client_fd, conn.buf);
@@ -457,9 +706,9 @@ void HttpServer::handle_client(int client_fd) {
 }
 
 // 用累积缓冲区判断请求是否完整：
-//   完整 -> 提交线程池并注销连接（返回 true）
-//   不完整且对端已 FIN -> 立即关闭并回收 fd（返回 true，报告 H5 的核心修复）
-//   不完整且对端仍开着 -> 保留（返回 false，等后续数据或空闲超时）
+//   完整 → 标记 worker_owned 后提交线程池（返回 true）
+//   不完整且对端已 FIN → 立即关闭并回收 fd（返回 true，报告 H5 的核心修复）
+//   不完整且对端仍开着 → 保留（返回 false，等后续数据或空闲超时）
 bool HttpServer::handle_buffer(int client_fd, bool peer_closed) {
   auto idx_it = conn_index_.find(client_fd);
   if (idx_it == conn_index_.end()) return true;
@@ -515,28 +764,77 @@ bool HttpServer::handle_buffer(int client_fd, bool peer_closed) {
     return false;
   }
 
-  // 4. 请求完整：从 epoll 移除，提交线程池处理
+  // 4. 请求完整：从 epoll 移除并**借出**给线程池
+  //
+  // 这里不 erase 连接项：fd 的数量上限（max_connections）必须把"正在处理的
+  // 请求"也算进去，否则并发在上限之上时 fd 会被打穿。改为打 worker_owned 标记，
+  // reactor 在 handle_client/maintain_connections 里跳过它。
   if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr) < 0)
     LOG_DEBUG("epoll_ctl DEL failed: {}", std::strerror(errno));
-  std::string request = buf.substr(0, body_start + content_length);
-  conns_.erase(idx_it->second);
-  conn_index_.erase(client_fd);
 
-  pool_.execute([this, client_fd, req = std::move(request)] {
+  std::string request = buf.substr(0, body_start + content_length);
+  // 请求之后可能已经跟着下一个请求（pipelining）：把已消费的部分从缓冲区摘掉，
+  // 剩余字节留给归还后重新登记时继续解析
+  buf.erase(0, body_start + content_length);
+  idx_it->second->second.worker_owned.store(true);
+  const uint64_t borrow_token = ++idx_it->second->second.borrow_token;
+  grant_borrow(borrow_token);
+
+  pool_.execute([this, client_fd, borrow_token, req = std::move(request)] {
+    // 借用认领：这个 fd 号在"提交任务"到"worker 真正开始跑"之间可能已经被
+    // reactor 关闭并复用（空闲超时 / 半关闭），此时绝不能再碰它
+    if (!try_claim_borrow(borrow_token)) {
+      LOG_DEBUG("worker: fd {} borrow revoked before start, dropping task",
+                client_fd);
+      // 这次借出已被撤销：fd 要么已经被 reactor 关闭、要么已经是别人的连接，
+      // 两种情况下都不能 close，直接放弃任务
+      return;
+    }
+
+    bool keep_alive = false;
     try {
-      auto result = conn_handler_.process(req.data(), req.size());
-      // 大响应 + 慢客户端：必须写到底（或到写超时），不能因为 EAGAIN 就截断
-      send_all(client_fd, result.response.data(), result.response.size(),
-               config_.write_timeout_seconds * 1000);
+      // 整条响应的绝对写死线：单次 send 的死线由 send_all 内部按调用计时，
+      // 但对流式响应会调用很多次，必须有一个总上限兜住慢客户端
+      auto total_deadline =
+          std::chrono::steady_clock::now() +
+          std::chrono::seconds(config_.write_timeout_seconds);
+      ResponseWriter writer(client_fd, config_.write_timeout_seconds * 1000,
+                            total_deadline, &send_eagain_count_);
+      auto result = conn_handler_.process(req.data(), req.size(), writer);
+      if (!result.response.empty()) {
+        // 缓冲式响应：一次性写到底（大响应 + 慢客户端走 send_all 的等待路径）
+        WriteStatus st = send_all(client_fd, result.response.data(),
+                                  result.response.size(),
+                                  config_.write_timeout_seconds * 1000,
+                                  total_deadline);
+        keep_alive = result.keep_alive && st == WriteStatus::kOk;
+        if (st != WriteStatus::kOk)
+          LOG_DEBUG("response write aborted ({} bytes)", result.response.size());
+      } else {
+        // 流式响应：handler 已自行写完（含 chunked 终止块）
+        keep_alive = result.keep_alive && !writer.failed();
+      }
     } catch (const std::exception& e) {
       // 任何异常都不能穿越线程池边界（会 std::terminate 整个进程）
       LOG_ERROR("worker task threw: {}", e.what());
+      keep_alive = false;
     } catch (...) {
       LOG_ERROR("worker task threw non-std exception");
+      keep_alive = false;
     }
-    close(client_fd);
+    // 所有权归还：worker 绝不自己 close(fd)（见 http_server.h 顶部说明）。
+    // 归还时带上借用令牌，reactor 据此丢弃"fd 已被复用"的过期归还
+    return_fd(client_fd, keep_alive ? FdAction::kKeepAlive : FdAction::kClose,
+              borrow_token);
   });
   return true;
+}
+
+WriteStatus HttpServer::send_all(
+    int client_fd, const char* data, size_t len, int write_deadline_ms,
+    std::chrono::steady_clock::time_point total_deadline) {
+  return send_all_with_deadline(client_fd, data, len, write_deadline_ms,
+                                &send_eagain_count_, total_deadline);
 }
 
 }  // namespace ai_gateway
