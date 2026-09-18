@@ -39,12 +39,16 @@ CacheEngine::HitResult CacheEngine::try_hit(
     return HitResult{};  // 未命中
   }
 
-  // 2. 向量检索 Top-K（持锁保护 HNSW search）
-  std::vector<HnswResult> results;
+  // 2. 向量检索 Top-K
+  //    在临界区内取出索引副本，之后在临界区外检索该副本：
+  //    rebuild_index() 会替换 index_，旧索引对象的生命周期由这里的 shared_ptr
+  //    引用计数兜住，检索期间不会被析构（原实现直接读裸指针 → 可能 use-after-free）
+  std::shared_ptr<HnswIndex> idx;
   {
     std::lock_guard lock(mutex_);
-    results = index_->search(vec, top_k_);
+    idx = index_;
   }
+  std::vector<HnswResult> results = idx->search(vec, top_k_);
 
   // 3. 遍历结果，检查是否命中（相似度 ≥ 阈值，且命名空间匹配）
   std::string ns_prefix = ns.empty() ? "" : ns + ":";
@@ -98,6 +102,8 @@ void CacheEngine::cache_reply(const std::string& user_message,
 void CacheEngine::rebuild_index() {
   LOG_INFO("cache: rebuilding vector index...");
 
+  // 1. 锁外构建新索引：建图要对每个条目跑一次 O(ef_construction) 搜索，
+  //    整个过程持 mutex_ 会让检索与写入全部阻塞，因此先构建、再交换。
   auto new_index_ptr = std::make_shared<HnswIndex>();
   auto& new_idx = *new_index_ptr;
   int64_t new_id = 1;
@@ -108,10 +114,16 @@ void CacheEngine::rebuild_index() {
         ++new_id;
       });
 
-  index_ = std::move(new_index_ptr);
-  next_id_ = new_id;
+  // 2. 短临界区交换：与 try_hit 的取副本、cache_reply 的 add 互斥
+  size_t vectors = 0;
+  {
+    std::lock_guard lock(mutex_);
+    index_ = std::move(new_index_ptr);
+    next_id_ = new_id;
+    vectors = index_->size();
+  }
 
-  LOG_INFO("cache: index rebuilt, {} vectors", index_->size());
+  LOG_INFO("cache: index rebuilt, {} vectors", vectors);
 }
 
 std::pair<int, size_t> CacheEngine::ghost_stats() const {
@@ -125,9 +137,9 @@ void CacheEngine::try_rebuild_if_ghosty() {
   auto [rate, total] = ghost_stats();
   if (total < 10) return;
   if (rate > 5) {
-    LOG_INFO("cache: ghost rate {}% ({} / {}), auto-rebuilding index",
-             rate, ghost_count_, total_search_);
-    std::lock_guard lock(mutex_);
+    LOG_INFO("cache: ghost rate {}% ({}/{}), auto-rebuilding index", rate,
+             ghost_count_, total);
+    // rebuild_index() 自带 mutex_：这里不能先取锁再调用（同线程递归加锁会死锁）
     rebuild_index();
     ghost_count_ = 0;
     total_search_ = 0;

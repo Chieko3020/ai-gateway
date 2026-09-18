@@ -56,6 +56,8 @@ class CacheEngine {
                    const std::string& ns = "");
 
   // 从 LruStore 重建向量索引（缓存恢复后调用）
+  // 线程安全：函数内部自行加锁，调用方无需（也不得）持 mutex_——
+  // 持锁调用会在同一线程递归加锁，直接死锁。
   void rebuild_index();
 
   // 配置访问
@@ -71,6 +73,11 @@ class CacheEngine {
  private:
   EmbeddingConfig emb_cfg_;
   std::shared_ptr<LruStore> store_;
+
+  // 索引由本引擎独占持有（调用方不应继续持有同一个 shared_ptr 用于观察）。
+  // 读写约定：所有对 index_ 的读（含取出副本）与写（rebuild_index 交换）都在
+  // mutex_ 临界区内完成；检索方在临界区内取一份 shared_ptr 副本后在临界区外使用，
+  // 由引用计数保证检索期间索引对象不被析构。
   std::shared_ptr<HnswIndex> index_;
 
   EmbedFn embed_fn_;
