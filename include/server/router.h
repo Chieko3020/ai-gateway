@@ -6,12 +6,15 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "common/types.h"
+
 namespace ai_gateway {
 
 // 请求头（method, path） 是否匹配 + 对应 handler
 class Router {
  public:
-  using Handler = std::function<std::string(const std::string& body)>;
+  // 处理器返回完整响应内容（含状态码），而非仅响应体字符串
+  using Handler = std::function<HttpReply(const std::string& body)>;
 
   // 注册路由：method + path
   void add(std::string_view method, std::string_view path, Handler handler);

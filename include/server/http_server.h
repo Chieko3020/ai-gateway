@@ -26,8 +26,8 @@
 
 namespace ai_gateway {
 
-// 请求处理器签名：接收请求体 JSON，返回响应体 JSON
-using RequestHandler = std::function<std::string(const std::string& request_body)>;
+// 请求处理器签名：接收请求体 JSON，返回响应内容（状态码 + 响应体）
+using RequestHandler = std::function<HttpReply(const std::string& request_body)>;
 
 class HttpServer {
  public:

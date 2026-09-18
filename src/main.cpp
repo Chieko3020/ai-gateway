@@ -103,6 +103,17 @@ static std::string annotate_cache_status(const std::string& body,
   }
 }
 
+// 网关自身生成的 JSON 响应（默认 200；拒绝类响应沿用既有口径，不改变状态码）
+static HttpReply json_reply(std::string body, int status_code = 200) {
+  return HttpReply{status_code, "application/json", std::move(body)};
+}
+
+// 透传上游状态码：curl 自身失败时 llm_client 已映射为 502/504，
+// 这里再兜一层，确保不会出现 status_code=0 被当成正常码发回客户端
+static int upstream_status(int status_code) {
+  return status_code > 0 ? status_code : 502;
+}
+
 // 线程安全的关闭标志与后台线程唤醒机制
 static std::atomic<bool> g_shutdown{false};
 static std::atomic<bool> g_dump_stats{false};  // SIGUSR1 置位，由后台线程输出统计
@@ -119,12 +130,13 @@ void handle_signal(int sig) {
 }
 
 // 请求处理管道：过滤 + 缓存 + singleflight + LLM + 统计 + 过滤
-static std::string handle_request(const std::string& request_body,
-                                   const GatewayConfig& cfg,
-                                   MessageFilter* filter,
-                                   CacheEngine* engine,
-                                   Singleflight* sf,
-                                   Stats* stats) {
+// 返回状态码 + 响应体：上游 4xx/5xx 原样透传（见 HttpReply）
+static HttpReply handle_request(const std::string& request_body,
+                                 const GatewayConfig& cfg,
+                                 MessageFilter* filter,
+                                 CacheEngine* engine,
+                                 Singleflight* sf,
+                                 Stats* stats) {
   auto t0 = std::chrono::steady_clock::now();
 
   // 1. 输入过滤（所有路径都必须执行）
@@ -135,7 +147,7 @@ static std::string handle_request(const std::string& request_body,
     auto f_result = filter->check_input(user_msg);
     if (f_result.action == FilterAction::kReject) {
       LOG_WARN("filter: rejected input: {}", f_result.reject_msg);
-      return R"({"error":"Request rejected"})";
+      return json_reply(R"({"error":"Request rejected"})");
     }
     if (f_result.action == FilterAction::kTruncate)
       user_msg = f_result.sanitized;
@@ -163,9 +175,10 @@ static std::string handle_request(const std::string& request_body,
     auto out_result = filter->check_output(result.body);
     if (out_result.action == FilterAction::kReject) {
       LOG_WARN("filter: rejected output containing URL");
-      return R"({"error":"Response filtered"})";
+      return json_reply(R"({"error":"Response filtered"})");
     }
-    return annotate_cache_status(out_result.sanitized, "bypass");
+    return json_reply(annotate_cache_status(out_result.sanitized, "bypass"),
+                      upstream_status(result.status_code));
   }
 
   // 缓存命中检查时带回的 embedding（避免 cache_reply 重复计算）
@@ -187,9 +200,9 @@ static std::string handle_request(const std::string& request_body,
       auto hit_out = filter->check_output(hit.reply);
       if (hit_out.action == FilterAction::kReject) {
         LOG_WARN("filter: rejected cached output containing URL");
-        return R"({"error":"Response filtered"})";
+        return json_reply(R"({"error":"Response filtered"})");
       }
-      return annotate_cache_status(hit_out.sanitized, "hit");
+      return json_reply(annotate_cache_status(hit_out.sanitized, "hit"));
     }
     cached_embedding = std::move(hit.embedding);
   }
@@ -220,7 +233,7 @@ static std::string handle_request(const std::string& request_body,
               std::chrono::steady_clock::now() - t0);
           stats->record_cache_hit(elapsed.count());
           LOG_INFO("singleflight: merged key={}", ns_key);
-          return annotate_cache_status(merged, "hit");
+          return json_reply(annotate_cache_status(merged, "hit"));
         }
       } else {
         LOG_DEBUG("singleflight: wait timeout for key={}", ns_key);
@@ -272,9 +285,11 @@ static std::string handle_request(const std::string& request_body,
   auto out_result = filter->check_output(result.body);
   if (out_result.action == FilterAction::kReject) {
     LOG_WARN("filter: rejected output containing URL");
-    return R"({"error":"Response filtered"})";
+    return json_reply(R"({"error":"Response filtered"})");
   }
-  return annotate_cache_status(out_result.sanitized, "miss");
+  // 上游错误码（4xx/5xx/502/504）原样透传，不再一律 200
+  return json_reply(annotate_cache_status(out_result.sanitized, "miss"),
+                    upstream_status(result.status_code));
 }
 
 int main(int argc, char* argv[]) {
@@ -382,10 +397,10 @@ int main(int argc, char* argv[]) {
                             &flight_merge, stats.get());
     } catch (const std::exception& e) {
       LOG_ERROR("request handler threw: {}", e.what());
-      return std::string(R"({"error":"Internal error"})");
+      return json_reply(R"({"error":"Internal error"})", 500);
     } catch (...) {
       LOG_ERROR("request handler threw non-std exception");
-      return std::string(R"({"error":"Internal error"})");
+      return json_reply(R"({"error":"Internal error"})", 500);
     }
   });
 

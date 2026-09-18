@@ -33,8 +33,11 @@ ConnectionResult ConnectionHandler::process(const char* raw_data,
   }
 
   // 4. 调用 handler 获取响应
-  std::string response_body = (*handler)(std::string(req.body));
-  result.response = make_ok_json(std::move(response_body));
+  //    状态码由 handler 决定：上游 4xx/5xx 原样透传给客户端（不再统一 200）
+  auto reply = (*handler)(std::string(req.body));
+  result.response = make_response(reply.status_code,
+                                  std::move(reply.content_type),
+                                  std::move(reply.body));
   return result;
 }
 

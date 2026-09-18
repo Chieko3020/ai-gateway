@@ -30,9 +30,19 @@ inline std::string_view status_text(int code) noexcept {
     case 500: return "Internal Server Error";
     case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
+    case 504: return "Gateway Timeout";
     default:  return "Unknown";
   }
 }
+
+// 请求处理器返回的响应内容：状态码由处理器决定。
+// 上游返回 4xx/5xx 时原样透传，不再一律以 200 返回——
+// 否则调用方无法用状态码做重试/降级，监控会把上游故障全部计成成功。
+struct HttpReply {
+  int status_code = 200;
+  std::string content_type = "application/json";
+  std::string body;
+};
 
 // 请求处理上下文，在一次请求生命周期中传递
 // 注意：当前未启用，预留用于请求追踪（request_id + start_time_us）

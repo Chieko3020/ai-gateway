@@ -52,7 +52,12 @@ LlmResponse call_llm(const std::string& url,
   if (res == CURLE_OK) {
     result.status_code = static_cast<int>(http_code);
   } else {
-    LOG_ERROR("curl request failed: {}", curl_easy_strerror(res));
+    // curl 自身失败（连不上 / 超时）：没有上游状态码，必须映射为网关错误码，
+    // 否则 status_code 保持 0 会被上层当成正常码，最终以 HTTP 200 返回给客户端
+    result.status_code =
+        (res == CURLE_OPERATION_TIMEDOUT) ? 504 : 502;
+    LOG_ERROR("curl request failed: {} (mapped to HTTP {})",
+              curl_easy_strerror(res), result.status_code);
     result.body = std::format(R"(\{{\"error\":\"{}\"}})", curl_easy_strerror(res));
   }
 
