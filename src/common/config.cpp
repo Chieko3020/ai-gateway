@@ -102,12 +102,17 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       auto& l = root["log"];
       out.log.sample_every = l.value("sample_every", uint64_t{1});
       if (out.log.sample_every == 0) out.log.sample_every = 1;
+      out.log.max_bytes = l.value("max_bytes", size_t{10 * 1024 * 1024});
+      out.log.keep_files = l.value("keep_files", 5);
+      // 负份数会让"删除最老一份"的下标越界，夹到最小值 1
+      if (out.log.keep_files < 1) out.log.keep_files = 1;
     }
 
     LOG_INFO("config loaded: port={}, backend={}, model={}, max_conn={}, "
-             "idle_timeout={}s",
+             "idle_timeout={}s, log_rotate={} bytes keep={}",
              out.server.port, out.backend.url, out.backend.model,
-             out.server.max_connections, out.server.idle_timeout_seconds);
+             out.server.max_connections, out.server.idle_timeout_seconds,
+             out.log.max_bytes, out.log.keep_files);
     return 0;
   } catch (const std::exception& e) {
     LOG_ERROR("config parse error: {}", e.what());

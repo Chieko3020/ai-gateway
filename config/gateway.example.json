@@ -30,6 +30,9 @@
     "blocked_keywords": []
   },
   "log": {
-    "sample_every": 1
+    "sample_every": 1,
+    "max_bytes": 10485760,
+    "keep_files": 5,
+    "_note": "max_bytes=0 关闭轮转（单文件一直追加）；否则 gateway.log 满 max_bytes 后改名为 gateway.log.1，旧的依次后移，最老一份删除，共保留 keep_files 份历史"
   }
 }

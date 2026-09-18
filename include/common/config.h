@@ -64,6 +64,10 @@ struct LogConfig {
   // 每请求 INFO 的采样率：1 = 全量（默认），N > 1 = 每 N 条只留 1 条。
   // WARN/ERROR 永不采样。热路径日志是全局串行热点，高并发下应调大该值
   uint64_t sample_every = 1;
+  // 单文件大小上限：达到后 gateway.log → gateway.log.1，旧的依次后移，
+  // 最老的一份删除。0 = 关闭轮转（回到"单文件一直追加"的旧行为）
+  size_t max_bytes = 10 * 1024 * 1024;  // 10MB
+  int keep_files = 5;                   // 保留历史份数（不含当前文件）
 };
 
 // 网关总配置

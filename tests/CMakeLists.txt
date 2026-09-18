@@ -59,6 +59,10 @@ target_compile_definitions(test_http_server PRIVATE GATEWAY_SOURCE_DIR="${CMAKE_
 add_executable(test_stats test_stats.cpp)
 target_link_libraries(test_stats ai_gateway_stats ai_gateway_common ai_gateway_test_check)
 
+# 日志轮转（报告 8.7 第 4 条）：切分/保留份数/行边界/关闭开关
+add_executable(test_log_rotation test_log_rotation.cpp)
+target_link_libraries(test_log_rotation ai_gateway_common ai_gateway_test_check)
+
 add_test(NAME filter COMMAND test_filter)
 add_test(NAME request COMMAND test_request)
 add_test(NAME response COMMAND test_response)
@@ -69,6 +73,7 @@ add_test(NAME config COMMAND test_config)
 add_test(NAME singleflight COMMAND test_singleflight)
 add_test(NAME cache_engine COMMAND test_cache_engine)
 add_test(NAME http_server COMMAND test_http_server)
+add_test(NAME log_rotation COMMAND test_log_rotation)
 
 # HNSW 自检索召回率断言（合成向量 + 固定种子，确定性）
 add_test(NAME hnsw_recall

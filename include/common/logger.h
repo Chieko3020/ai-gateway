@@ -96,12 +96,19 @@ void emit(LogLevel lv, std::string_view fmt_str, Args&&... args) {
     if (f.is_open()) {
       f << line;
       if (flush_now) f.flush();
+      // 按写入字节数记账并（必要时）轮转。在 log_mutex() 内结算，
+      // 这样两个 worker 不会同时 rename 同一个文件（见 log_file.h）
+      detail::account_log_bytes(line.size());
     }
   } catch (const std::exception& e) {
     auto fallback = std::format("[{} {}] (fmt error: {})\n", timestamp(), level_tag(lv), e.what());
     std::cerr << fallback;
     auto& f = detail::log_file();
-    if (f.is_open()) { f << fallback; f.flush(); }
+    if (f.is_open()) {
+      f << fallback;
+      f.flush();
+      detail::account_log_bytes(fallback.size());
+    }
   }
 }
 

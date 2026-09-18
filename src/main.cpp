@@ -418,11 +418,17 @@ int main(int argc, char* argv[]) {
     LOG_ERROR("backend.url is required");
     return static_cast<int>(ErrorCode::kConfigError);
   }
+  // 日志轮转策略：必须在配置加载后立刻生效（否则配置里的 max_bytes 要等到
+  // 第一条热路径日志才被读取）。若当前文件已超限，set_log_rotation 会先归档
+  ai_gateway::detail::set_log_rotation(
+      ai_gateway::detail::LogRotation{cfg.log.max_bytes, cfg.log.keep_files});
   // 热路径日志采样：必须在服务开始处理请求前生效（默认 1 = 全量）
   ai_gateway::detail::set_log_sample_every(cfg.log.sample_every);
   if (cfg.log.sample_every > 1)
     LOG_WARN("log sampling enabled: 1 of every {} hot-path INFO lines is kept",
              cfg.log.sample_every);
+  LOG_INFO("log rotation: max_bytes={} keep_files={} (0 = disabled)",
+           cfg.log.max_bytes, cfg.log.keep_files);
 
   // ---- 2. 初始化模块 ----
   // ttl_days * 86400 是 int 乘法：ttl_days > 24855 会溢出成负数，
