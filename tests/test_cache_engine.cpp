@@ -36,8 +36,7 @@ std::vector<float> vec_of_text(const std::string& text) {
   return v;
 }
 
-std::vector<float> embed_fn(std::string, std::string, std::string, std::string text,
-                            int) {
+std::vector<float> embed_fn(const std::string& text, int) {
   return vec_of_text(text);
 }
 
@@ -87,7 +86,8 @@ int main() {
     // 等 q1/q2 过期并清理：键空间留下空洞（msg:1/msg:2 消失，编号但已前进）
     size_t purged = 0;
     CHECK(purge_until_empty(lru, &purged)); ok++;
-    CHECK(purged >= 4); ok++;  // 2 条回复各产生 msg:N 与 ns_key 两个条目
+    // M4：每条回复只落一个条目（旧实现额外写一份 ns_key 副本，这里是 4）
+    CHECK(purged == 2); ok++;
 
     engine.cache_reply("q3", a3, vec_of_text("q3"), "");  // 键 msg:3
     engine.cache_reply("q4", "A4-问题4的答案", vec_of_text("q4"), "");  // 键 msg:4
@@ -179,6 +179,48 @@ int main() {
     CHECK(hits + misses == 400); ok++;
     CHECK(misses == 0); ok++;  // 重建期间旧索引副本仍由引用计数保活
     CHECK(engine.index_size() == kEntries); ok++;
+  }
+
+  // ── 4. M4：一条回复只占一个条目 + 降级精确匹配 ────────────────────────
+  {
+    auto lru = std::make_shared<LruStore>(2, 0);  // 只装 2 条，永不过期
+    // embed_fn 可切换：先正常向量化，再模拟 embedding 不可用
+    bool embed_ok = true;
+    auto engine = std::make_shared<CacheEngine>(
+        ec, cc, lru,
+        std::make_shared<HnswIndex>(HnswConfig{kDim, 16, 100, 50}),
+        [&embed_ok](const std::string& text, int) {
+          if (!embed_ok) return std::vector<float>{};
+          return vec_of_text(text);
+        });
+
+    engine->cache_reply("m4-q1", "A1", vec_of_text("m4-q1"), "");
+    engine->cache_reply("m4-q2", "A2", vec_of_text("m4-q2"), "");
+    // 旧实现每条回复写 2 个条目 -> max_entries=2 时实际只剩 1 条回复
+    CHECK(lru->size() == 2); ok++;
+    CHECK(engine->index_size() == 2); ok++;
+
+    auto probe1 = engine->try_hit("m4-q1", "");
+    CHECK(probe1.hit); ok++;
+    CHECK(probe1.reply == "A1"); ok++;
+
+    // embedding 不可用时的降级路径：必须能精确命中（靠条目内保存的 source 键）
+    embed_ok = false;
+    auto exact1 = engine->try_hit("m4-q1", "");
+    CHECK(exact1.hit); ok++;
+    CHECK(exact1.reply == "A1"); ok++;
+    auto exact_miss = engine->try_hit("m4-unknown", "");
+    CHECK(!exact_miss.hit); ok++;
+
+    // 带 namespace：source 键含 ns 前缀，隔离必须成立
+    embed_ok = true;
+    engine->cache_reply("m4-q3", "A3", vec_of_text("m4-q3"), "uuidA");
+    embed_ok = false;
+    auto ns_hit = engine->try_hit("m4-q3", "uuidA");
+    CHECK(ns_hit.hit); ok++;
+    CHECK(ns_hit.reply == "A3"); ok++;
+    auto ns_other = engine->try_hit("m4-q3", "uuidB");
+    CHECK(!ns_other.hit); ok++;  // 另一个 namespace 不应命中原条目的 source
   }
 
   return test_check::finish("test_cache_engine", ok);

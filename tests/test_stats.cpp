@@ -1,6 +1,7 @@
 // Stats 单元测试
 #include "test_check.h"
 #include <iostream>
+#include "common/logger.h"
 #include "stats/stats.h"
 using namespace ai_gateway;
 
@@ -52,6 +53,64 @@ int main() {
     CHECK(q.percentile(95) >= 94 && q.percentile(95) <= 96); ok++;
     CHECK(q.percentile(100) == 100); ok++;
   }
+
+    // 报告 M3：旁路样本独立成池，samples 与 requests 口径自洽
+    {
+        Stats m;
+        for (int i = 1; i <= 10; ++i) m.record_api_call(i * 10, 1, 0);  // 10..100
+        m.record_bypass(900, 10, 10);   // 旁路延迟远大于主延迟
+        CHECK(m.latency_samples() == 10); ok++;        // 只含可缓存流量
+        CHECK(m.bypass_latency_samples() == 1); ok++;
+        CHECK(m.percentile(100) == 100); ok++;         // 不被 900ms 的旁路污染
+        CHECK(m.bypass_percentile(100) == 900); ok++;
+        CHECK(m.total_requests() == 10); ok++;
+        CHECK(m.bypassed() == 1); ok++;
+    }
+
+    // 报告 M10：合并命中单独计数，不进入 hits/total（命中率不被抬高）
+    {
+        Stats g;
+        g.record_api_call(30, 10, 5);
+        double rate_before = g.hit_rate();
+        g.record_merge(5);
+        CHECK(g.merged() == 1); ok++;
+        CHECK(g.cache_hits() == 0); ok++;
+        CHECK(g.total_requests() == 1); ok++;
+        CHECK(g.hit_rate() == rate_before); ok++;
+        CHECK(g.latency_samples() == 2); ok++;  // 合并的延迟样本仍计入主池
+    }
+
+    // 报告 M13：纯旁路流量下 min 不得是 INT64_MAX
+    {
+        Stats b;
+        b.record_bypass(120, 1, 1);
+        b.record_bypass(340, 1, 1);
+        CHECK(b.min_latency_ms() == 0); ok++;   // 无主池样本 -> 0（而不是 INT64_MAX）
+        CHECK(b.max_latency_ms() == 0); ok++;
+        CHECK(b.avg_latency_ms() == 0); ok++;
+        b.report();  // 纯旁路也要能正常输出（含 bypass_* 分位数）
+        b.record_api_call(7, 0, 0);
+        CHECK(b.min_latency_ms() == 7); ok++;
+    }
+
+    // 报告 L7：热路径 INFO 采样判定（默认 1 = 全量；N = 每 N 条留 1 条）
+    {
+        auto& every = ::ai_gateway::detail::log_sample_every();
+        auto& counter = ::ai_gateway::detail::log_line_counter();
+        every.store(1);
+        int kept = 0;
+        for (int i = 0; i < 10; ++i) if (::ai_gateway::detail::sampled_log()) ++kept;
+        CHECK(kept == 10); ok++;   // 全量
+
+        every.store(4);
+        counter.store(0);
+        kept = 0;
+        for (int i = 0; i < 40; ++i) if (::ai_gateway::detail::sampled_log()) ++kept;
+        CHECK(kept == 10); ok++;   // 40 条里留 10 条
+        every.store(1);
+        counter.store(0);
+        CHECK(::ai_gateway::detail::sampled_log()); ok++;
+    }
 
     return test_check::finish("test_stats", ok);
 }

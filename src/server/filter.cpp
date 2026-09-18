@@ -33,8 +33,9 @@ FilterResult MessageFilter::check_input(std::string_view message) const {
     return result;
   }
 
-  // 4. 长度限制
-  if (static_cast<int>(message.size()) > config_.max_input_chars) {
+  // 4. 长度限制（<=0 表示不截断，与 check_output 口径一致）
+  if (config_.max_input_chars > 0 &&
+      static_cast<int>(message.size()) > config_.max_input_chars) {
     result.action = FilterAction::kTruncate;
     result.sanitized = std::string(message.substr(0, config_.max_input_chars));
     return result;
@@ -55,8 +56,11 @@ FilterResult MessageFilter::check_output(std::string_view message) const {
     return result;
   }
 
-  // 长度截断
-  if (static_cast<int>(message.size()) > config_.max_output_chars) {
+  // 长度截断：max_output_chars <= 0 表示不截断。
+  // 旧默认值 600 会把绝大多数正常回答静默截断到 600 字节——对"透明代理"定位而言
+  // 这是错误的默认值，因此语义改为"0 = 不限制"（报告 L9）
+  if (config_.max_output_chars > 0 &&
+      static_cast<int>(message.size()) > config_.max_output_chars) {
     result.action = FilterAction::kTruncate;
     result.sanitized = std::string(message.substr(0, config_.max_output_chars));
     return result;
@@ -83,14 +87,22 @@ bool MessageFilter::contains_blocked_keyword(std::string_view text) const {
 }
 
 bool MessageFilter::contains_injection(std::string_view text) {
-  // 检测常见 prompt injection 模式
+  // 检测常见 prompt injection 模式。
+  // 只保留"本身就是攻击指令"的特征：system prompt / you are now / new instructions
+  // 这类良性短语（用户正常讨论提示词工程就会命中）已移除——默认配置下它们会把
+  // 大量正常请求判成注入并拒绝（报告 L9）
   static const std::vector<std::string_view> patterns = {
       "ignore previous",
       "ignore all instructions",
+      "ignore the above",
+      "disregard previous",
+      "disregard all prior",
       "forget your prompt",
-      "system prompt",
-      "you are now",
-      "new instructions",
+      "forget all previous",
+      "reveal your system prompt",
+      "print your system prompt",
+      "repeat your system prompt",
+      "override your instructions",
       "[/INST]",
       "<|im_start|>",
       "<|system|>",

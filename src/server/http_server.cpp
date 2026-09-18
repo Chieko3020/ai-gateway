@@ -21,7 +21,8 @@ namespace {
 constexpr int kMaxEvents = 64;
 constexpr int kBacklog = 128;
 constexpr size_t kReadChunk = 4096;    // 每次 recv 的读取块大小
-constexpr size_t kMaxHeaderBytes = 65536;  // 头部最大 64KB，防止 slowloris
+constexpr int kMaxAcceptBatch = 512;   // 单次 epoll 事件内最多 accept 的连接数
+
 }  // namespace
 
 HttpServer::HttpServer(const ServerConfig& config)
@@ -29,12 +30,13 @@ HttpServer::HttpServer(const ServerConfig& config)
 
 HttpServer::~HttpServer() {
   stop();
-  // 关闭所有残留的连接缓冲
-  for (auto& [fd, buf] : conn_buffers_) {
-    (void)buf;
+  // 关闭所有残留的连接
+  for (auto& [fd, conn] : conns_) {
+    (void)conn;
     close(fd);
   }
-  conn_buffers_.clear();
+  conns_.clear();
+  conn_index_.clear();
   if (listen_fd_ >= 0) {
     close(listen_fd_);
     listen_fd_ = -1;
@@ -92,7 +94,15 @@ int HttpServer::create_listen_socket() {
     return -1;
   }
 
-  LOG_INFO("listening on port {}", config_.port);
+  // port=0 时由内核分配端口：回读实际端口供日志与测试使用
+  sockaddr_in bound{};
+  socklen_t bound_len = sizeof(bound);
+  if (getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bound_len) == 0)
+    listen_port_ = ntohs(bound.sin_port);
+  else
+    listen_port_ = config_.port;
+
+  LOG_INFO("listening on port {}", listen_port_);
   return fd;
 }
 
@@ -128,7 +138,7 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
       break;
     }
 
-    // 短暂超时以便检查 running_ 和 external_shutdown
+    // 短暂超时：既用于检查 running_/external_shutdown，也是空闲连接的扫描节拍
     int nfds = epoll_wait(epoll_fd_, events, kMaxEvents, 100);
     if (nfds < 0) {
       if (errno == EINTR) continue;
@@ -141,8 +151,10 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
 
       if (fd == listen_fd_) {
         // ---- 新连接 ----
-        // ET 模式下循环 accept，限流最多 16 个防主线程饥饿
-        for (int accepted = 0; accepted < 16; ++accepted) {
+        // ET 模式下循环 accept 直到 EAGAIN：必须把 accept 队列排空，否则
+        // max_connections 只会约束"已 accept 的表"，队列里排队的连接照样能完成
+        // 三次握手并占用 backlog 槽位，上限形同虚设。单次上限仅用于防主线程饥饿。
+        for (int accepted = 0; accepted < kMaxAcceptBatch; ++accepted) {
           sockaddr_in client_addr{};
           socklen_t addr_len = sizeof(client_addr);
           int client_fd = accept4(listen_fd_,
@@ -155,6 +167,26 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
             break;
           }
 
+          // 连接数上限：直接拒绝而不是先收进来。没有这个上限时，fd 耗尽会让
+          // accept 全面失败（含健康检查），整个服务不可用（报告 H5）。
+          if (config_.max_connections > 0 &&
+              conns_.size() >= config_.max_connections) {
+            LOG_WARN("connection limit reached ({}), rejecting new connection",
+                     config_.max_connections);
+            auto resp = make_service_unavailable(
+                R"({"error":"Too many connections"})");
+            const char* p = resp.data();
+            size_t remaining = resp.size();
+            while (remaining > 0) {
+              ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
+              if (sent <= 0) break;
+              p += sent;
+              remaining -= static_cast<size_t>(sent);
+            }
+            close(client_fd);
+            continue;
+          }
+
           ev.events = EPOLLIN | EPOLLET;
           ev.data.fd = client_fd;
           if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
@@ -162,12 +194,21 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
             close(client_fd);
             continue;
           }
+          auto it = conns_.emplace(conns_.end(), client_fd, Connection{});
+          it->second.last_activity = std::chrono::steady_clock::now();
+          conn_index_[client_fd] = it;
         }
       } else {
         // ---- 客户端数据：读入累积缓冲区，判断请求是否完整 ----
         handle_client(fd);
       }
     }
+
+    // 每个 epoll 节拍做一次连接维护：
+    //   - 主动读一遍所有连接（ET 模式下"对端只发 FIN、不再发数据"不一定产生新的
+    //     EPOLLIN 边沿，实测在低延迟环回上会漏；主动读才能保证半关闭立刻被发现）
+    //   - 关闭空闲超时的连接（slowloris / 半关闭驻留）
+    maintain_connections();
   }
 
   if (epoll_fd_ >= 0) {
@@ -184,31 +225,99 @@ void HttpServer::stop() {
   running_ = false;
 }
 
-// 非阻塞循环 recv，把当前所有可读数据追加到缓冲区
-// 返回 false 表示连接出错需关闭；true 表示正常（可能 EOF 或 EAGAIN）
-bool HttpServer::read_into_buffer(int client_fd, std::string& buf) {
+void HttpServer::drain() {
+  // run() 已退出：不再有新连接与新任务提交（worker 之间也不会再 execute），
+  // 这里只需等在途请求跑完，之后的统计/落盘才不会与它们并发
+  pool_.wait_idle();
+}
+
+void HttpServer::close_connection(int client_fd) {
+  if (epoll_fd_ >= 0)
+    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
+  auto it = conn_index_.find(client_fd);
+  if (it != conn_index_.end()) {
+    conns_.erase(it->second);
+    conn_index_.erase(it);
+  }
+  close(client_fd);
+}
+
+void HttpServer::maintain_connections() {
+  // 收集本轮要处理的 fd：处理过程中会 erase 连接，不能直接边遍历边改
+  std::vector<int> fds;
+  fds.reserve(conns_.size());
+  for (auto& [fd, conn] : conns_) fds.push_back(fd);
+
+  const bool has_timeout = config_.idle_timeout_seconds > 0;
+  const auto now = std::chrono::steady_clock::now();
+  const auto limit = std::chrono::seconds(config_.idle_timeout_seconds);
+
+  size_t closed_idle = 0;
+  for (int fd : fds) {
+    auto it = conn_index_.find(fd);
+    if (it == conn_index_.end()) continue;  // 同一轮里已被处理掉
+
+    // 主动读一次：把因 ET 边沿丢失而滞留在内核缓冲区（含 FIN）的数据取出来。
+    // 这里不刷新 last_activity —— 空闲超时必须按"客户端最后一次发字节"计时，
+    // 否则维护本身会把连接续命。
+    ReadState state = read_into_buffer(fd, it->second->second.buf);
+    if (state == ReadState::kError) {
+      LOG_WARN("recv failed: {}", std::strerror(errno));
+      close_connection(fd);
+      continue;
+    }
+    if (state == ReadState::kData) {
+      it->second->second.last_activity = now;
+      if (handle_buffer(fd, /*peer_closed=*/false)) continue;
+    } else if (state == ReadState::kEof) {
+      if (handle_buffer(fd, /*peer_closed=*/true)) continue;
+    }
+
+    // 仍不完整的连接：检查空闲超时
+    it = conn_index_.find(fd);
+    if (it == conn_index_.end()) continue;
+    if (has_timeout && now - it->second->second.last_activity >= limit) {
+      LOG_WARN("idle timeout ({}s): closing connection, buffered {} bytes",
+               config_.idle_timeout_seconds, it->second->second.buf.size());
+      close_connection(fd);
+      ++closed_idle;
+    }
+  }
+  if (closed_idle > 0)
+    LOG_DEBUG("idle timeout: closed {} connection(s)", closed_idle);
+}
+
+// 非阻塞循环 recv，把当前所有可读数据追加到缓冲区。
+// 三态返回：kData/kEof 表示本次读到过东西（含对端关闭），kAgain 表示当前无数据，
+// kError 表示真实错误。旧实现只返回 bool，把"对端 FIN"与"暂时无数据"都当成 true，
+// 于是半关闭连接会被永久留在 epoll 里等一个永不到来的可读事件（报告 H5）。
+HttpServer::ReadState HttpServer::read_into_buffer(int client_fd,
+                                                   std::string& buf) {
   char tmp[kReadChunk];
+  bool got_data = false;
   while (true) {
     ssize_t n = recv(client_fd, tmp, sizeof(tmp), 0);
     if (n > 0) {
-      buf.append(tmp, n);
+      buf.append(tmp, static_cast<size_t>(n));
+      got_data = true;
       continue;
     }
     if (n == 0) {
-      return true;  // 对端关闭写端，交由上层用已有缓冲区判断
+      // 对端关闭写端（FIN）：缓冲区里已是全部可用数据，交由上层判断是否完整
+      return got_data ? ReadState::kData : ReadState::kEof;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      return true;  // 本轮可读数据读完
+      return got_data ? ReadState::kData : ReadState::kAgain;
     }
     if (errno == EINTR) {
       continue;
     }
-    return false;  // 真实错误
+    return ReadState::kError;
   }
 }
 
 // 从头部区段解析 Content-Length，失败返回 0
-static size_t parse_content_length(std::string_view header_section) {
+static size_t parse_content_length_caseless(std::string_view header_section) {
   // 大小写不敏感查找 "Content-Length:"
   size_t pos = 0;
   while (pos < header_section.size()) {
@@ -245,36 +354,58 @@ static size_t parse_content_length(std::string_view header_section) {
 }
 
 void HttpServer::handle_client(int client_fd) {
-  std::string& buf = conn_buffers_[client_fd];
-  if (!read_into_buffer(client_fd, buf)) {
+  auto idx_it = conn_index_.find(client_fd);
+  if (idx_it == conn_index_.end()) {
+    // 已被 worker 关闭 / 已被空闲超时清理：fd 号里已无我们的状态
+    return;
+  }
+  auto& conn = idx_it->second->second;
+
+  ReadState state = read_into_buffer(client_fd, conn.buf);
+  if (state == ReadState::kError) {
     LOG_WARN("recv failed: {}", std::strerror(errno));
-    conn_buffers_.erase(client_fd);
-    close(client_fd);
+    close_connection(client_fd);
     return;
   }
-  if (buf.empty()) {
-    conn_buffers_.erase(client_fd);
-    close(client_fd);
+  // kAgain 表示"当前无数据"——不刷新活动时间，让空闲超时能真正生效；
+  // kData/kEof 都表示本轮读到了字节（或对端已关闭），刷新活动时间
+  if (state == ReadState::kData)
+    conn.last_activity = std::chrono::steady_clock::now();
+
+  if (conn.buf.empty()) {
+    // 无数据：只有对端已关闭（FIN）时才立即回收，EAGAIN 时保留连接等下一批数据
+    if (state == ReadState::kEof) close_connection(client_fd);
     return;
   }
+
+  handle_buffer(client_fd, state == ReadState::kEof);
+}
+
+// 用累积缓冲区判断请求是否完整：
+//   完整 -> 提交线程池并注销连接（返回 true）
+//   不完整且对端已 FIN -> 立即关闭并回收 fd（返回 true，报告 H5 的核心修复）
+//   不完整且对端仍开着 -> 保留（返回 false，等后续数据或空闲超时）
+bool HttpServer::handle_buffer(int client_fd, bool peer_closed) {
+  auto idx_it = conn_index_.find(client_fd);
+  if (idx_it == conn_index_.end()) return true;
+  std::string& buf = idx_it->second->second.buf;
 
   // 1. 定位头部结束 \r\n\r\n
   auto header_end = buf.find("\r\n\r\n");
   if (header_end == std::string::npos) {
-    // 头部未收齐；超过头部上限则断开防 slowloris
-    if (buf.size() > kMaxHeaderBytes) {
-      LOG_WARN("header too large: {} bytes, closing", buf.size());
-      conn_buffers_.erase(client_fd);
-      close(client_fd);
-      return;
+    // 头部未收齐：超过头部上限断开防 slowloris；对端已 FIN 也立即回收
+    if (buf.size() > config_.max_header_bytes || peer_closed) {
+      LOG_WARN("incomplete header ({} bytes, eof={}), closing", buf.size(),
+               peer_closed);
+      close_connection(client_fd);
+      return true;
     }
-    // ET 模式下保持注册，等待下一批数据到达
-    return;
+    return false;
   }
 
   // 2. 解析 Content-Length
   std::string_view header_section(buf.data(), header_end);
-  size_t content_length = parse_content_length(header_section);
+  size_t content_length = parse_content_length_caseless(header_section);
   if (content_length > config_.max_body_bytes) {
     LOG_WARN("body too large: {} > {} bytes, closing",
              content_length, config_.max_body_bytes);
@@ -288,41 +419,56 @@ void HttpServer::handle_client(int client_fd) {
         break;
       }
       p += sent;
-      remaining -= sent;
+      remaining -= static_cast<size_t>(sent);
     }
-    conn_buffers_.erase(client_fd);
-    close(client_fd);
-    return;
+    close_connection(client_fd);
+    return true;
   }
 
   // 3. 判断 body 是否收齐
   size_t body_start = header_end + 4;
   if (buf.size() < body_start + content_length) {
-    // body 未收齐，ET 模式下保持注册等待更多数据
-    return;
+    // body 未收齐：对端已经不会再发数据（FIN）→ 立刻回收 fd 与缓冲区；
+    // 这正是报告 H5 的泄漏场景（旧实现在这里直接 return，连接永久驻留）
+    if (peer_closed) {
+      LOG_WARN("client half-closed with incomplete body ({} < {}), closing",
+               buf.size() - body_start, content_length);
+      close_connection(client_fd);
+      return true;
+    }
+    return false;
   }
 
   // 4. 请求完整：从 epoll 移除，提交线程池处理
   if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr) < 0)
     LOG_DEBUG("epoll_ctl DEL failed: {}", std::strerror(errno));
   std::string request = buf.substr(0, body_start + content_length);
-  conn_buffers_.erase(client_fd);
+  conns_.erase(idx_it->second);
+  conn_index_.erase(client_fd);
 
   pool_.execute([this, client_fd, req = std::move(request)] {
-    auto result = conn_handler_.process(req.data(), req.size());
-    const char* p = result.response.data();
-    size_t remaining = result.response.size();
-    while (remaining > 0) {
-      ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
-      if (sent <= 0) {
-        if (sent < 0) LOG_DEBUG("send error: {}", std::strerror(errno));
-        break;
+    try {
+      auto result = conn_handler_.process(req.data(), req.size());
+      const char* p = result.response.data();
+      size_t remaining = result.response.size();
+      while (remaining > 0) {
+        ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
+        if (sent <= 0) {
+          if (sent < 0) LOG_DEBUG("send error: {}", std::strerror(errno));
+          break;
+        }
+        p += sent;
+        remaining -= static_cast<size_t>(sent);
       }
-      p += sent;
-      remaining -= sent;
+    } catch (const std::exception& e) {
+      // 任何异常都不能穿越线程池边界（会 std::terminate 整个进程）
+      LOG_ERROR("worker task threw: {}", e.what());
+    } catch (...) {
+      LOG_ERROR("worker task threw non-std exception");
     }
     close(client_fd);
   });
+  return true;
 }
 
 }  // namespace ai_gateway

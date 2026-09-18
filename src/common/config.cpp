@@ -48,6 +48,9 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       auto& s = root["server"];
       out.server.port = s.value("port", 9000);
       out.server.max_body_bytes = s.value("max_body_bytes", 20 * 1024 * 1024ull);
+      out.server.max_connections = s.value("max_connections", size_t{256});
+      out.server.idle_timeout_seconds = s.value("idle_timeout_seconds", 10);
+      out.server.max_header_bytes = s.value("max_header_bytes", size_t{65536});
     }
 
     // --- backend ---
@@ -62,9 +65,13 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
     // --- embedding ---
     if (root.contains("embedding")) {
       auto& e = root["embedding"];
-      out.embedding.url = e.value("url", "");
-      out.embedding.model = e.value("model", "");
-      out.embedding.api_key = resolve_api_key(e);
+      out.embedding.model_path = e.value("model_path", "model/model_int8.onnx");
+      out.embedding.vocab_path = e.value("vocab_path", "model/vocab.txt");
+      out.embedding.dim = e.value("dim", 512);
+      if (out.embedding.dim <= 0) {
+        LOG_ERROR("embedding.dim={} must be > 0", out.embedding.dim);
+        return 1;
+      }
     }
 
     // --- cache ---
@@ -80,7 +87,7 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
     if (root.contains("filter")) {
       auto& f = root["filter"];
       out.filter.max_input_chars = f.value("max_input_chars", 500);
-      out.filter.max_output_chars = f.value("max_output_chars", 600);
+      out.filter.max_output_chars = f.value("max_output_chars", 0);
       out.filter.block_urls = f.value("block_urls", true);
       if (f.contains("blocked_keywords") && f["blocked_keywords"].is_array()) {
         out.filter.blocked_keywords.clear();  // 防止重复 load 累加
@@ -90,8 +97,17 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       }
     }
 
-    LOG_INFO("config loaded: port={}, backend={}, model={}",
-             out.server.port, out.backend.url, out.backend.model);
+    // --- log ---
+    if (root.contains("log")) {
+      auto& l = root["log"];
+      out.log.sample_every = l.value("sample_every", uint64_t{1});
+      if (out.log.sample_every == 0) out.log.sample_every = 1;
+    }
+
+    LOG_INFO("config loaded: port={}, backend={}, model={}, max_conn={}, "
+             "idle_timeout={}s",
+             out.server.port, out.backend.url, out.backend.model,
+             out.server.max_connections, out.server.idle_timeout_seconds);
     return 0;
   } catch (const std::exception& e) {
     LOG_ERROR("config parse error: {}", e.what());

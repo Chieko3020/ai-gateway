@@ -1,6 +1,8 @@
 // LRU Store 单元测试
 #include "test_check.h"
 #include <chrono>
+#include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <thread>
 #include "cache/lru_store.h"
@@ -50,6 +52,75 @@ int main() {
         q.put("k", "v");
         CHECK(q.purge_expired() == 0); ok++;
         CHECK(q.size() == 1); ok++;
+    }
+
+    // save/load：原子替换 + src 字段 + 向后兼容旧文件（报告 M2/M4/M9）
+    {
+        const std::string path = "/tmp/ai_gateway_lru_test.json";
+        std::remove(path.c_str());
+
+        LruStore w(10, 0);
+        w.put_with_embedding("msg:1", "reply-1", {1.0f, 2.0f, 3.0f});
+        w.set_source("msg:1", "ns1:q1");
+        w.put("msg:2", "reply-2");
+        w.set_source("msg:2", "q2");
+        CHECK(w.save(path)); ok++;
+
+        // 原子写：目标文件存在、临时文件已消失
+        CHECK(std::ifstream(path).good()); ok++;
+        CHECK(!std::ifstream(path + ".tmp").good()); ok++;
+
+        LruStore r(10, 0);
+        CHECK(r.load(path)); ok++;
+        CHECK(r.size() == 2); ok++;
+        CHECK(r.get("msg:1") == "reply-1"); ok++;
+        CHECK(r.get_embedding("msg:1").size() == 3); ok++;
+        // src 字段跨进程保留：降级精确匹配在重启后仍然可用
+        CHECK(r.get_exact("ns1:q1") == "reply-1"); ok++;
+        CHECK(r.get_exact("q2") == "reply-2"); ok++;
+        CHECK(!r.get_exact("q-unknown").has_value()); ok++;
+
+        // 旧落盘文件（没有 src 字段）必须仍能读进来
+        {
+            const std::string legacy = path + ".legacy";
+            std::ofstream ofs(legacy);
+            ofs << R"([{"key":"msg:7","value":"legacy-reply","ctime":)"
+                << (std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count())
+                << R"(}])";
+            ofs.close();
+            LruStore lr(10, 0);
+            CHECK(lr.load(legacy)); ok++;
+            CHECK(lr.get("msg:7") == "legacy-reply"); ok++;  // 缺 src 不影响基本读
+            CHECK(lr.get_exact("msg:7") == "legacy-reply"); ok++;
+            std::remove(legacy.c_str());
+        }
+
+        // 损坏文件：load 返回 false（而不是静默当成空缓存）
+        {
+            const std::string broken = path + ".broken";
+            std::ofstream ofs(broken);
+            ofs << "[{\"key\":\"msg:8\"";
+            ofs.close();
+            LruStore br(10, 0);
+            CHECK(!br.load(broken)); ok++;
+            std::remove(broken.c_str());
+        }
+
+        // 父目录不存在时主动补建（否则调用方以为已落盘，实际一份都没写）
+        {
+            const std::string nested = "/tmp/ai-gateway-nested-dir/x.json";
+            std::remove(nested.c_str());
+            std::remove("/tmp/ai-gateway-nested-dir/.keep");
+            LruStore f(4, 0);
+            f.put("k", "v");
+            CHECK(f.save(nested)); ok++;
+            CHECK(std::ifstream(nested).good()); ok++;
+            std::remove(nested.c_str());
+            std::remove("/tmp/ai-gateway-nested-dir");
+        }
+        std::remove(path.c_str());
     }
 
     return test_check::finish("test_lru_store", ok);

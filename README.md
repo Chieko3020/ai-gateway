@@ -37,7 +37,7 @@
 - **存储引擎**: LRU + TTL 缓存管理，JSON 持久化
 - **嵌入推理**: C++ ONNX Runtime 进程内 INT8 量化推理，零外部依赖
 - **模型量化**: `scripts/quantize.py` — HuggingFace → FP32 ONNX → 动态量化 INT8 (~90MB→~23MB)
-- **连接池**: libcurl Keep-Alive 复用 TCP 连接
+- **连接池**: libcurl Keep-Alive 复用 TCP 连接（每线程一个 `CURL*`，互不共享）
 
 ## 技术栈
 
@@ -113,6 +113,7 @@ ai-gateway/
 #### cache — 语义缓存引擎
 - **CacheEngine**: 编排缓存流程（Embedding 搜索，命中/未命中判断，命名空间隔离）
 - **HnswIndex**: HNSW 图索引（header-only；按论文实现启发式邻居选择与邻居收缩，`shared_mutex` 保护读写并发，visited 标记线程本地复用）
+- **LruStore**: LRU + TTL 内存缓存 + JSON 持久化（锁内只取快照，序列化与落盘在锁外；临时文件 + `fsync` + `rename` 原子替换）
 - **OnnxEmbedding**: C++ ONNX Runtime 进程内推理 + WordPiece 词表贪心分词
 - **LruStore**: LRU + TTL 内存缓存 + JSON 持久化
 
@@ -139,7 +140,7 @@ ai-gateway/
 │  模块2: CacheEngine                                              │
 │    1. C++ ONNX Runtime 进程内向量化 (WordPiece 词表 + INT8 推理, 512d)  │
 │    2. HNSW 图索引检索 Top-K 相似条目                              │
-│    3. max(cosine) >= 0.80                                        │
+│    3. max(cosine) >= 0.85                                        │
 │       命中: 返回 LruStore 中的缓存回复                             │
 │       未命中: 继续                                                │
 ├────────────────────────────────────────────────────────────────┤
@@ -218,14 +219,19 @@ sudo systemctl enable --now ai-gateway
 | `backend.url` | DeepSeek API | LLM 后端 URL（OpenAI 兼容） |
 | `backend.model` | deepseek-v4-flash | 模型名称 |
 | `backend.timeout_seconds` | 60 | 请求超时 |
-| `embedding.url` | 127.0.0.1:8081 | 已弃用（C++ ONNX 替代） |
+| `embedding.model_path` | model/model_int8.onnx | 进程内 ONNX 模型路径 |
+| `embedding.vocab_path` | model/vocab.txt | WordPiece 词表路径 |
+| `embedding.dim` | 512 | 向量维度；与模型实际输出不符时启动即失败 |
 | `cache.enabled` | true | 启用语义缓存 |
-| `cache.similarity_threshold` | 0.80 | 余弦相似度阈值 |
+| `cache.similarity_threshold` | 0.85 | 余弦相似度阈值 |
 | `cache.max_entries` | 10000 | 最大缓存条目 |
 | `cache.ttl_days` | 7 | 缓存过期天数 |
 | `filter.max_input_chars` | 500 | 输入最大字符 |
-| `filter.max_output_chars` | 600 | 输出最大字符 |
+| `filter.max_output_chars` | 0 | 输出最大字符（0 = 不截断） |
 | `filter.block_urls` | true | 拦截 URL |
+| `server.max_connections` | 256 | 并发连接上限（超出回 503） |
+| `server.idle_timeout_seconds` | 10 | 连接空闲超时（秒） |
+| `log.sample_every` | 1 | 每请求 INFO 采样率（1 = 全量，N = 每 N 条留 1 条） |
 
 API Key 通过 `config/gateway.env`（systemd `EnvironmentFile`）或环境变量 `LLM_API_KEY` 注入。
 
@@ -262,7 +268,7 @@ cmake --build build --target recall_bench
 | 网关自身处理延迟 | < 1ms | < 1ms | 不含 LLM 与 Embedding |
 
 **读法**：R1 是"首次提问"——每个语义簇的首条必然未命中，同义改写还要跨过
-`similarity_threshold`（默认 0.8）才算命中，因此 R1 反映的是**语义匹配的严格程度**；
+`similarity_threshold`（默认 0.85）才算命中，因此 R1 反映的是**语义匹配的严格程度**；
 R2 是"重复提问"，命中率 100% 说明**缓存写入与检索链路完全正常**。
 
 **HNSW 召回修复（本次重测的主要产出）**：修复前 `tests/recall_bench` 实测自研 HNSW 在 320 向量规模下

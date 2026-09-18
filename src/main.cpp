@@ -31,45 +31,98 @@ using namespace ai_gateway;
 using json = nlohmann::json;
 using namespace std::chrono_literals;
 
-// FNV-1a 32-bit 确定性哈希：保证跨进程一致，避免 std::hash 因随机种子导致
-// 重启后同一 system prompt 算出不同 namespace 使缓存隔离失效
-static uint32_t fnv1a_32(const std::string& s) {
-  uint32_t h = 0x811c9dc5u;
-  for (char c : s) {
-    h ^= static_cast<uint8_t>(c);
-    h *= 0x01000193u;
+// FNV-1a 64-bit 确定性哈希：保证跨进程一致（std::hash 有随机种子，重启后同一
+// system prompt 会算出不同 namespace，缓存隔离失效）。
+// 32 位版本碰撞概率虽低但非零，碰撞即"不同 system prompt 共用一个缓存命名空间"，
+// 后果是跨对话串答案，因此升到 64 位（报告 L4）
+static uint64_t fnv1a_64(const std::string& s) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : s) {
+    h ^= c;
+    h *= 0x100000001b3ull;
   }
   return h;
 }
 
-// 从 OpenAI 格式请求体中提取第一条 system message 内容，用于缓存隔离
-// 返回 system prompt 的 FNV-1a 32-bit hex
+// 把一条 message 的 content 拍平成纯文本：
+//   content 为 string       → 原样
+//   content 为数组（多模态） → 拼接各 text 片段（image_url 等非文本片段跳过）
+//   content 缺失/其它类型    → 空串
+// 旧实现直接 value("content","")：数组形式会抛 type_error 被吞掉，
+// 于是多模态请求的 check_input 根本不执行（报告 M11 的绕过面）
+static std::string message_text(const json& msg) {
+  if (!msg.is_object()) return "";
+  auto it = msg.find("content");
+  if (it == msg.end()) return "";
+  if (it->is_string()) return it->get<std::string>();
+  if (it->is_array()) {
+    std::string out;
+    for (const auto& part : *it) {
+      if (part.is_string()) {
+        out += part.get<std::string>();
+        continue;
+      }
+      if (!part.is_object()) continue;
+      auto t = part.find("text");
+      if (t != part.end() && t->is_string()) out += t->get<std::string>();
+    }
+    return out;
+  }
+  return "";
+}
+
+// 提取 system 消息内容用于缓存隔离：扫描全部 messages（system 不在首位时
+// 旧实现会静默丢失隔离），拼接多段 system 文本后取 FNV-1a 64 位。
+// 返回值形如 "ns<16 位 hex>"：
+//   - 带 ns 前缀，避免与"客户端消息本身恰好是 16 位十六进制数"撞进同一 key 空间
+//   - 位宽变化会让已有落盘缓存的 namespace 前缀全部改变（一次性失配，见简报）
 static std::string extract_namespace(const std::string& request_body) {
   try {
     auto req = json::parse(request_body);
     auto& msgs = req.at("messages");
-    if (!msgs.empty() && msgs[0].value("role", "") == "system") {
-      auto content = msgs[0].value("content", "");
-      if (!content.empty()) {
-        return std::format("{:08x}", fnv1a_32(content));
-      }
+    std::string system_text;
+    for (const auto& m : msgs) {
+      if (!m.is_object()) continue;
+      if (m.value("role", "") != "system") continue;
+      auto text = message_text(m);
+      if (text.empty()) continue;
+      if (!system_text.empty()) system_text += "\n";
+      system_text += text;
     }
+    if (!system_text.empty())
+      return std::format("ns{:016x}", fnv1a_64(system_text));
   } catch (...) {}
   return "";  // 客户端没有 system message 或解析失败，返回空字符串表示不做隔离
 }
 
-// 从 OpenAI 格式请求体中提取最后一条 user message
+// 从 OpenAI 格式请求体中提取最后一条 user message（用于缓存键与向量化）
 static std::string extract_user_message(const std::string& request_body) {
   try {
     auto req = json::parse(request_body);
     auto& msgs = req.at("messages");
     for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) {
-      if ((*it).value("role", "") == "user") {
-        return (*it).value("content", "");
-      }
+      if (!it->is_object()) continue;
+      if (it->value("role", "") == "user") return message_text(*it);
     }
   } catch (...) {}
   return "";
+}
+
+// 拼接所有 message 的文本：输入过滤的检查面（旧实现只查最后一条 user 消息）
+static std::string collect_all_text(const std::string& request_body) {
+  std::string out;
+  try {
+    auto req = json::parse(request_body);
+    auto it = req.find("messages");
+    if (it == req.end() || !it->is_array()) return "";
+    for (const auto& m : *it) {
+      auto text = message_text(m);
+      if (text.empty()) continue;
+      if (!out.empty()) out += "\n";
+      out += text;
+    }
+  } catch (...) {}
+  return out;
 }
 
 // 请求分类：旁路（tool 类）与拒绝（stream）是两件事，必须分开判定。
@@ -130,6 +183,17 @@ static std::string annotate_cache_status(const std::string& body,
   }
 }
 
+// 响应体/消息的短摘要：日志里不落原文，只落"长度 + 64 位哈希"，
+// 既能给排查用的关联标识，又不泄露用户内容（报告 M5）
+static std::string body_digest(const std::string& s) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : s) {
+    h ^= c;
+    h *= 0x100000001b3ull;
+  }
+  return std::format("len={},h={:016x}", s.size(), h);
+}
+
 // 网关自身生成的 JSON 响应（默认 200；拒绝类响应给出语义正确的状态码：
 // 输入被拒 400、上游内容被拦 502，见 handle_request）
 static HttpReply json_reply(std::string body, int status_code = 200) {
@@ -171,11 +235,13 @@ static HttpReply handle_request(const std::string& request_body,
   //    旁路（工具调用/流式）只应跳过缓存与请求合并，不能跳过安全过滤：
   //    否则客户端加一个 "stream": true 就能绕过注入检测、URL 拦截、屏蔽词与长度截断
   std::string user_msg = extract_user_message(request_body);
-  if (!user_msg.empty()) {
-    auto f_result = filter->check_input(user_msg);
+  std::string filter_text = collect_all_text(request_body);
+  if (!filter_text.empty()) {
+    auto f_result = filter->check_input(filter_text);
     if (f_result.action == FilterAction::kReject) {
       LOG_WARN("filter: rejected input: {}", f_result.reject_msg);
-      return json_reply(R"({"error":"Request rejected"})");
+      // 输入被拒是客户端错误（旧实现返回 200 + error body，调用方无法据此重试/降级）
+      return json_reply(R"({"error":"Request rejected"})", 400);
     }
     if (f_result.action == FilterAction::kTruncate)
       user_msg = f_result.sanitized;
@@ -204,13 +270,14 @@ static HttpReply handle_request(const std::string& request_body,
       } catch (...) {}
     }
     stats->record_bypass(elapsed.count(), pt, ct);
-    LOG_INFO("cache: bypass (tool) status={} {}ms",
-             result.status_code, elapsed.count());
+    LOG_INFO_SAMPLED("cache: bypass (tool) status={} {}ms",
+                     result.status_code, elapsed.count());
 
     auto out_result = filter->check_output(result.body);
     if (out_result.action == FilterAction::kReject) {
       LOG_WARN("filter: rejected output containing URL");
-      return json_reply(R"({"error":"Response filtered"})");
+      // 上游内容无法交付给客户端：502（既非客户端错误，也不该沿用上游状态码）
+      return json_reply(R"({"error":"Response filtered"})", 502);
     }
     return json_reply(annotate_cache_status(out_result.sanitized, "bypass"),
                       upstream_status(result.status_code));
@@ -235,7 +302,7 @@ static HttpReply handle_request(const std::string& request_body,
       auto hit_out = filter->check_output(hit.reply);
       if (hit_out.action == FilterAction::kReject) {
         LOG_WARN("filter: rejected cached output containing URL");
-        return json_reply(R"({"error":"Response filtered"})");
+        return json_reply(R"({"error":"Response filtered"})", 502);
       }
       return json_reply(annotate_cache_status(hit_out.sanitized, "hit"));
     }
@@ -266,12 +333,20 @@ static HttpReply handle_request(const std::string& request_body,
         if (merged_ok) {
           auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::steady_clock::now() - t0);
-          stats->record_cache_hit(elapsed.count());
-          LOG_INFO("singleflight: merged key={}", ns_key);
-          return json_reply(annotate_cache_status(merged, "hit"));
+          // 合并命中不是缓存命中：单独计数、单独状态（报告 M10）。
+          // 日志只落长度与哈希，不落 key 原文（= namespace:完整用户消息，报告 M5）
+          stats->record_merge(elapsed.count());
+          LOG_INFO_SAMPLED("singleflight: merged {}", body_digest(ns_key));
+          // 合并回来的同样是上游原文，必须与未命中路径一样过输出过滤
+          auto merged_out = filter->check_output(merged);
+          if (merged_out.action == FilterAction::kReject) {
+            LOG_WARN("filter: rejected merged output containing URL");
+            return json_reply(R"({"error":"Response filtered"})", 502);
+          }
+          return json_reply(annotate_cache_status(merged_out.sanitized, "merged"));
         }
       } else {
-        LOG_DEBUG("singleflight: wait timeout for key={}", ns_key);
+        LOG_DEBUG("singleflight: wait timeout (src_len={})", ns_key.size());
       }
     }
     sf_slot = sf->insert(ns_key, cached_embedding);
@@ -310,17 +385,20 @@ static HttpReply handle_request(const std::string& request_body,
   // 10. 统计
   stats->record_api_call(elapsed.count(), prompt_tokens, completion_tokens);
 
+  // 每请求一条 INFO 属热路径：默认全量输出，可用 log_sample_every 采样降级。
+  // 只记长度与短摘要，不记上游响应体原文（可能含用户数据，报告 M5）
   if (ok)
-    LOG_INFO("{} {} {}ms", result.status_code, result.body.size(), elapsed.count());
+    LOG_INFO_SAMPLED("{} {} bytes {}ms", result.status_code, result.body.size(),
+                     elapsed.count());
   else
-    LOG_WARN("{} {} {}ms", result.status_code,
-             result.body.size() > 0 ? result.body : "(empty)", elapsed.count());
+    LOG_WARN("upstream {} {} bytes {}ms body_digest={}", result.status_code,
+             result.body.size(), elapsed.count(), body_digest(result.body));
 
   // 11. 输出过滤
   auto out_result = filter->check_output(result.body);
   if (out_result.action == FilterAction::kReject) {
     LOG_WARN("filter: rejected output containing URL");
-    return json_reply(R"({"error":"Response filtered"})");
+    return json_reply(R"({"error":"Response filtered"})", 502);
   }
   // 上游错误码（4xx/5xx/502/504）原样透传，不再一律 200
   return json_reply(annotate_cache_status(out_result.sanitized, "miss"),
@@ -340,18 +418,45 @@ int main(int argc, char* argv[]) {
     LOG_ERROR("backend.url is required");
     return static_cast<int>(ErrorCode::kConfigError);
   }
+  // 热路径日志采样：必须在服务开始处理请求前生效（默认 1 = 全量）
+  ai_gateway::detail::set_log_sample_every(cfg.log.sample_every);
+  if (cfg.log.sample_every > 1)
+    LOG_WARN("log sampling enabled: 1 of every {} hot-path INFO lines is kept",
+             cfg.log.sample_every);
 
   // ---- 2. 初始化模块 ----
-  auto lru = std::make_shared<LruStore>(cfg.cache.max_entries,
-                                        cfg.cache.ttl_days * 86400);
+  // ttl_days * 86400 是 int 乘法：ttl_days > 24855 会溢出成负数，
+  // 于是"永不过期"被静默打开（报告 L5）
+  constexpr int kMaxTtlDays = 3650;  // 10 年，超出视为配置错误
+  if (cfg.cache.ttl_days < 0 || cfg.cache.ttl_days > kMaxTtlDays) {
+    LOG_ERROR("cache.ttl_days={} out of range [0, {}]", cfg.cache.ttl_days,
+              kMaxTtlDays);
+    return static_cast<int>(ErrorCode::kConfigError);
+  }
+  const int64_t ttl_seconds = static_cast<int64_t>(cfg.cache.ttl_days) * 86400;
+  auto lru = std::make_shared<LruStore>(cfg.cache.max_entries, ttl_seconds);
 
-  // 本地 ONNX 嵌入推理
+  // 本地 ONNX 嵌入推理：模型路径与维度来自 embedding 配置段（不再硬编码，
+  // 否则示例里的模型名永远不会生效，报告 M15）
   auto onnx_embed = std::make_shared<OnnxEmbedding>(
-      "model/model_int8.onnx",
-      "model/vocab.txt", 512);
+      cfg.embedding.model_path, cfg.embedding.vocab_path, cfg.embedding.dim);
 
-  auto embed_fn = [onnx_embed](const std::string&, const std::string&,
-                                const std::string&, const std::string& text,
+  // 维度不符必须启动即失败：OnnxEmbedding 内部对超出模型输出的维度会做
+  // min(dims, out_dim) 截断，静默截断会让索引维度与配置声明不一致
+  if (onnx_embed->ready()) {
+    auto probe = onnx_embed->encode("dimension probe");
+    if (static_cast<int>(probe.size()) != cfg.embedding.dim) {
+      LOG_ERROR("embedding.dim={} does not match model output dim={} "
+                "({})", cfg.embedding.dim, probe.size(),
+                cfg.embedding.model_path);
+      return static_cast<int>(ErrorCode::kConfigError);
+    }
+  } else {
+    LOG_WARN("onnx embedding unavailable ({}), semantic cache degrades to "
+             "exact match", cfg.embedding.model_path);
+  }
+
+  auto embed_fn = [onnx_embed](const std::string& text,
                                 int) -> std::vector<float> {
     return onnx_embed->ready() ? onnx_embed->encode(text)
                                 : std::vector<float>{};
@@ -361,13 +466,19 @@ int main(int argc, char* argv[]) {
   // 否则会长期持有一个已失效的旧索引对象（日志里的向量数也会取自旧对象）
   auto engine = std::make_shared<CacheEngine>(
       cfg.embedding, cfg.cache, lru,
-      std::make_shared<HnswIndex>(HnswConfig{512, 16, 100, 50}), embed_fn);
+      std::make_shared<HnswIndex>(
+          HnswConfig{cfg.embedding.dim, 16, 100, 50}),
+      embed_fn);
   auto stats = std::make_shared<Stats>();
   auto filter = std::make_shared<MessageFilter>(cfg.filter);
 
   // 从磁盘恢复缓存
   if (cfg.cache.enabled) {
-    lru->load("cache/lru_store.json");
+    // 返回值必须检查：路径不可读/文件损坏时 load 会失败，静默忽略会让"重启不丢缓存"
+    // 的说法失真（报告 M9）
+    if (!lru->load("cache/lru_store.json"))
+      LOG_WARN("cache: load from cache/lru_store.json failed "
+               "(missing or malformed), starting empty");
     // 加载后立即清理过期条目：落盘时仍有效、此后超过 TTL 的条目不应继续占用内存与索引
     size_t purged_on_load = lru->purge_expired();
     // 索引由 LruStore 重建，无需独立加载;
@@ -417,7 +528,8 @@ int main(int argc, char* argv[]) {
       }
       // 定期持久化缓存，避免宕机丢了cache
       if (cfg.cache.enabled && lru->size() > 0) {
-        lru->save("cache/lru_store.json");
+        if (!lru->save("cache/lru_store.json"))
+          LOG_ERROR("cache: periodic save to cache/lru_store.json failed");
         // 持久化空桩（HNSW 索引通过 LruStore 重建）;
       }
     }
@@ -455,7 +567,10 @@ int main(int argc, char* argv[]) {
   stats->report();
   if (cfg.cache.enabled) {
     size_t purged = lru->purge_expired();
-    lru->save("cache/lru_store.json");
+    if (!lru->save("cache/lru_store.json"))
+      LOG_ERROR("cache: final save to cache/lru_store.json failed "
+                "({} entries were not persisted)",
+                lru->size());
     // 持久化空桩（HNSW 索引通过 LruStore 重建）;
     LOG_INFO("cache persisted: {} entries, {} vectors{}", lru->size(),
              engine->index_size(),

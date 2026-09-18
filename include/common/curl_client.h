@@ -11,7 +11,13 @@ namespace ai_gateway {
 
 class CurlClient {
  public:
-  CurlClient() : curl_(curl_easy_init()) {}
+  CurlClient() : curl_(curl_easy_init()) {
+    if (curl_) {
+      // libcurl 要求多线程程序必须设置 NOSIGNAL：否则超时依赖 SIGALRM，
+      // 信号可能投递到任意线程（报告 M6）
+      curl_easy_setopt(curl_, CURLOPT_NOSIGNAL, 1L);
+    }
+  }
   ~CurlClient() {
     if (headers_) curl_slist_free_all(headers_);
     if (curl_) curl_easy_cleanup(curl_);
@@ -38,9 +44,11 @@ class CurlClient {
                      static_cast<long>(body_.size()));
   }
 
-  // 设置超时（秒）
+  // 设置超时（秒）：总时限 + 连接阶段单独时限。
+  // 只设 CURLOPT_TIMEOUT 时，连接阶段（TCP SYN 重传）仍可能长时间占用本线程
   void set_timeout(int seconds) {
     curl_easy_setopt(curl_, CURLOPT_TIMEOUT, static_cast<long>(seconds));
+    curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT, static_cast<long>(kConnectTimeoutSeconds));
   }
 
   // 添加 Authorization Bearer 头（日志中apikey脱敏为 ***）
@@ -78,6 +86,9 @@ class CurlClient {
   }
 
  private:
+  // 连接阶段上限：取总超时与 10s 的较小值，保证慢后端不占满线程
+  static constexpr int kConnectTimeoutSeconds = 10;
+
   void add_header(const std::string& h) {
     headers_ = curl_slist_append(headers_, h.c_str());
   }

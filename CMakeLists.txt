@@ -19,5 +19,15 @@ if(COMPILER_SUPPORTS_AVX2)
   message(STATUS "AVX2+FMA enabled for SIMD dot product")
 endif()
 
+option(BUILD_TESTS "Build the test suite (ctest targets)" ON)
+# 必须写在顶层：enable_testing() 只在子目录里调用时，构建根目录的 CTestTestfile.cmake
+# 不会生成，在根目录跑 ctest 会报 "No tests were found!!!"（报告 L1）
+if(BUILD_TESTS)
+  enable_testing()
+endif()
+
 add_subdirectory(src)
-add_subdirectory(tests EXCLUDE_FROM_ALL)
+
+if(BUILD_TESTS)
+  add_subdirectory(tests)
+endif()

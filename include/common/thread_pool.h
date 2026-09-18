@@ -71,6 +71,20 @@ class ThreadPool {
     return tasks_.size();
   }
 
+  // 已从队列取出、正在执行的任务数
+  size_t active() const {
+    std::lock_guard lock(mutex_);
+    return active_;
+  }
+
+  // 等待队列排空且所有在途任务执行完毕。
+  // 用于优雅关闭：直接析构线程池（或不等就继续）会让调用方在 worker 仍在跑时
+  // 就开始输出统计/落盘，与在途请求并发访问共享状态（报告 M12）。
+  void wait_idle() {
+    std::unique_lock lock(mutex_);
+    idle_cv_.wait(lock, [this] { return tasks_.empty() && active_ == 0; });
+  }
+
  private:
   void worker_loop() {
     while (true) {
@@ -81,8 +95,13 @@ class ThreadPool {
         if (stop_ && tasks_.empty()) return;
         task = std::move(tasks_.front());
         tasks_.pop();
+        ++active_;
       }
       task();
+      {
+        std::lock_guard lock(mutex_);
+        if (--active_ == 0 && tasks_.empty()) idle_cv_.notify_all();
+      }
     }
   }
 
@@ -90,7 +109,9 @@ class ThreadPool {
   std::queue<std::function<void()>> tasks_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
+  std::condition_variable idle_cv_;
   std::atomic<bool> stop_{false};
+  size_t active_ = 0;  // 受 mutex_ 保护
 };
 
 }  // namespace ai_gateway

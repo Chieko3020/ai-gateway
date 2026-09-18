@@ -41,10 +41,27 @@ void Stats::record_cache_hit(int64_t latency_ms) {
   min_latency_ = std::min(min_latency_, latency_ms);
 }
 
+void Stats::record_merge(int64_t latency_ms) {
+  std::lock_guard lock(mutex_);
+  push_latency(latency_ms);
+  // 不计入 total_/hits_：合并是"共享了一次在途请求"，不是"从缓存取到内容"。
+  // 若按缓存命中计数，命中率的分子会被合并行为抬高（报告 M10）
+  ++merged_;
+  auto us = latency_ms * 1000;
+  total_latency_us_ += us;
+  max_latency_ = std::max(max_latency_, latency_ms);
+  min_latency_ = std::min(min_latency_, latency_ms);
+}
+
 void Stats::record_bypass(int64_t latency_ms,
                           int prompt_tokens, int completion_tokens) {
   std::lock_guard lock(mutex_);
-  push_latency(latency_ms);
+  // 旁路样本进独立环形缓冲：旧实现把它们混进 latency_ring_，导致 report() 的
+  // samples 与 requests 口径矛盾（samples=3 而 requests=1），且旁路延迟（数百 ms）
+  // 会污染 avg/min/max 之外的分位数（报告 M3）
+  bypass_ring_[bypass_ring_pos_] = latency_ms;
+  bypass_ring_pos_ = (bypass_ring_pos_ + 1) % kLatencyWindow;
+  if (bypass_ring_count_ < kLatencyWindow) ++bypass_ring_count_;
   // 刻意不增加 total_：旁路流量不参与命中率计算
   ++bypassed_;
   total_prompt_tokens_ += prompt_tokens;
@@ -58,33 +75,51 @@ void Stats::push_latency(int64_t ms) {
   if (ring_count_ < kLatencyWindow) ++ring_count_;
 }
 
-int64_t Stats::percentile(double p) const {
-  if (ring_count_ == 0) return 0;
-  std::vector<int64_t> xs(latency_ring_.begin(),
-                          latency_ring_.begin() + static_cast<long>(ring_count_));
+namespace {
+int64_t percentile_of(const std::array<int64_t, Stats::kLatencyWindow>& ring,
+                      size_t count, double p) {
+  if (count == 0) return 0;
+  std::vector<int64_t> xs(ring.begin(),
+                          ring.begin() + static_cast<long>(count));
   std::sort(xs.begin(), xs.end());
   double idx = (p / 100.0) * static_cast<double>(xs.size() - 1);
   size_t i = static_cast<size_t>(idx < 0 ? 0 : idx);
   if (i >= xs.size()) i = xs.size() - 1;
   return xs[i];
 }
+}  // namespace
+
+int64_t Stats::percentile(double p) const {
+  return percentile_of(latency_ring_, ring_count_, p);
+}
+
+int64_t Stats::bypass_percentile(double p) const {
+  return percentile_of(bypass_ring_, bypass_ring_count_, p);
+}
 
 void Stats::report() const {
   std::lock_guard lock(mutex_);
-  if (total_ == 0 && bypassed_ == 0) return;
+  if (total_ == 0 && bypassed_ == 0 && merged_ == 0) return;
 
   double saved = estimated_saved();
-  LOG_INFO("[STATS] requests={} hits={} misses={} hit_rate={:.1f}% bypassed={} "
-           "tokens={} saved={} cost=¥{:.4f} saved=¥{:.4f} "
-           "avg={}ms min={}ms max={}ms p50={}ms p95={}ms p99={}ms "
-           "bypass_avg={}ms samples={}",
-           total_, hits_, misses_, hit_rate() * 100, bypassed_,
+  // 口径说明（报告 M3/M10/M13）：
+  //   requests   = 可缓存流量（未命中 + 命中），不含旁路与合并
+  //   hit_rate   = hits / requests，既不把旁路当分母，也不把合并当分子
+  //   merged     = 请求合并命中，单独计数
+  //   samples    = 主延迟环形缓冲里的样本数，恒等于 requests（≤ 窗口大小 1024）
+  //   bypass_*   = 旁路流量自己的样本池与分位数，不混入上面的 avg/min/max
+  LOG_INFO("[STATS] requests={} hits={} misses={} hit_rate={:.1f}% merged={} "
+           "bypassed={} tokens={} saved={} cost=¥{:.4f} saved=¥{:.4f} "
+           "avg={}ms min={}ms max={}ms p50={}ms p95={}ms p99={}ms samples={} "
+           "bypass_avg={}ms bypass_p50={}ms bypass_p95={}ms bypass_samples={}",
+           total_, hits_, misses_, hit_rate() * 100, merged_, bypassed_,
            total_prompt_tokens_ + total_completion_tokens_,
            tokens_saved_,
            estimated_cost(), saved,
-           avg_latency_ms(), min_latency_, max_latency_,
-           percentile(50), percentile(95), percentile(99),
-           avg_bypass_latency_ms(), ring_count_);
+           avg_latency_ms(), min_latency_ms(), max_latency_,
+           percentile(50), percentile(95), percentile(99), ring_count_,
+           avg_bypass_latency_ms(), bypass_percentile(50), bypass_percentile(95),
+           bypass_ring_count_);
 }
 
 double Stats::hit_rate() const {
@@ -125,6 +160,12 @@ int64_t Stats::avg_bypass_latency_ms() const {
   return bypassed_ > 0
              ? (bypass_latency_us_ / 1000) / static_cast<int64_t>(bypassed_)
              : 0;
+}
+
+int64_t Stats::min_latency_ms() const {
+  // 不加锁：与 avg_latency_ms()/avg_bypass_latency_ms() 一致——report() 已持锁后
+  // 调用它，这里再加锁会变成同一线程重复加锁（EDEADLK / Resource deadlock avoided）
+  return ring_count_ > 0 ? min_latency_ : 0;
 }
 
 int64_t Stats::max_latency_ms() const {

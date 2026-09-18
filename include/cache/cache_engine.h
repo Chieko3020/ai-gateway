@@ -26,11 +26,11 @@ namespace ai_gateway {
 
 class CacheEngine {
  public:
-  // 传入配置和依赖组件
-  using EmbedFn = std::function<std::vector<float>(
-      std::string url, std::string key,
-      std::string model, std::string text,
-      int timeout)>;
+  // 向量化回调：只传文本与超时。
+  // 旧签名还传 url/api_key/model 三个参数，它们对应的配置段本轮已删除
+  // （模型路径与维度改由 EmbeddingConfig 驱动进程内 ONNX，报告 M15）
+  using EmbedFn =
+      std::function<std::vector<float>(const std::string& text, int timeout)>;
 
   CacheEngine(const EmbeddingConfig& emb_cfg,
               const CacheConfig& cache_cfg,

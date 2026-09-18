@@ -53,14 +53,15 @@ CacheEngine::HitResult CacheEngine::try_hit(
   auto ns_key = ns.empty() ? user_message : ns + ":" + user_message;
 
   // 1. 向量化用户消息（不持锁 embed_fn_ 可能很慢）
-  auto vec = embed_fn_(emb_cfg_.url, emb_cfg_.api_key,
-                           emb_cfg_.model, user_message, 5);
+  auto vec = embed_fn_(user_message, 5);
   if (vec.empty()) {
-    // 嵌入失败 降级为精确匹配
+    // 嵌入失败 降级为精确匹配。
+    // 匹配的是"条目的原始查表键"（由 set_source 写入），因此不需要为每条回复
+    // 再存一份完整副本（旧实现为此把 max_entries 的实际容量砍半，报告 M4）
     LOG_WARN("cache: embedding failed, fallback to exact match");
-    auto exact = store_->get(ns_key);
+    auto exact = store_->get_exact(ns_key);
     if (exact.has_value()) {
-      LOG_INFO("cache: HIT (exact) ns={}", ns.empty() ? "default" : ns);
+      LOG_INFO_SAMPLED("cache: HIT (exact) ns={}", ns.empty() ? "default" : ns);
       return HitResult{true, std::move(exact.value()), 1.0f};
     }
     return HitResult{};  // 未命中
@@ -85,8 +86,8 @@ CacheEngine::HitResult CacheEngine::try_hit(
       if (!ns.empty() && !r.key.starts_with(ns_prefix)) continue;
       auto cached = store_->get(r.key);
       if (cached.has_value()) {
-        LOG_INFO("cache: HIT key={} sim={:.3f} ns={}", r.key, r.similarity,
-                 ns.empty() ? "default" : ns);
+        LOG_INFO_SAMPLED("cache: HIT key={} sim={:.3f} ns={}", r.key,
+                         r.similarity, ns.empty() ? "default" : ns);
         return HitResult{true, std::move(cached.value()), r.similarity};
       }
       ghost_count_.fetch_add(1, std::memory_order_relaxed);
@@ -94,9 +95,8 @@ CacheEngine::HitResult CacheEngine::try_hit(
   }
 
   // 4. 未命中 带回 embedding 避免 cache_reply 重复计算
-  LOG_INFO("cache: MISS top_sim={:.3f} threshold={:.3f}",
-           results.empty() ? 0.0f : results[0].similarity,
-           threshold_);
+  LOG_INFO_SAMPLED("cache: MISS top_sim={:.3f} threshold={:.3f}",
+                   results.empty() ? 0.0f : results[0].similarity, threshold_);
   return HitResult{false, "", 0.0f, std::move(vec)};
 }
 
@@ -109,21 +109,24 @@ void CacheEngine::cache_reply(const std::string& user_message,
   auto key = std::format("{}msg:{}", ns.empty() ? "" : ns + ":", next_id_);
   ++next_id_;
 
+  // 原始查表键（namespace:user_message）：只作为条目的 source 字段保存，
+  // 不再额外存一份回复——旧实现每条回复写两个条目，max_entries=10000 实际只装 5000 条
   auto ns_key = ns.empty() ? user_message : ns + ":" + user_message;
 
   if (cached_embedding.empty()) {
-    store_->put(std::move(key), reply);
-    store_->put(std::move(ns_key), reply);
+    store_->put(key, reply);
+    store_->set_source(key, std::move(ns_key));
+    LOG_DEBUG("cache: stored key={} (no embedding) len={}", key, reply.size());
     return;
   }
 
   store_->put_with_embedding(key, reply, cached_embedding);
+  store_->set_source(key, ns_key);
   index_->add(next_id_ - 1, key, cached_embedding);
-  store_->put(std::move(ns_key), reply);
 
-  LOG_DEBUG("cache: stored key={} ns_key={} dims={}", key,
-            ns.empty() ? user_message : ns + ":" + user_message,
-            cached_embedding.size());
+  // 不打印源消息原文（ns_key 含完整用户消息），只落长度（报告 M5）
+  LOG_DEBUG("cache: stored key={} content_len={} src_len={} dims={}", key,
+            reply.size(), ns_key.size(), cached_embedding.size());
 }
 
 void CacheEngine::rebuild_index() {

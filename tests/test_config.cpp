@@ -19,11 +19,37 @@ int main() {
             std::string(GATEWAY_SOURCE_DIR) + "/config/gateway.example.json", cfg);
     }
 
-    CHECK(rc == 0);  // 示例配置必须可加载
-    CHECK(cfg.server.port >= 0);
-    CHECK(cfg.server.max_body_bytes > 0);
-    CHECK(!cfg.backend.url.empty());
-    CHECK(cfg.cache.similarity_threshold > 0);
+    int ok = 0;
+    CHECK(rc == 0); ok++;  // 示例配置必须可加载
+    CHECK(cfg.server.port >= 0); ok++;
+    CHECK(cfg.server.max_body_bytes > 0); ok++;
+    CHECK(!cfg.backend.url.empty()); ok++;
+    CHECK(cfg.cache.similarity_threshold > 0); ok++;
 
-    return test_check::finish("test_config", 5);
+    // 报告 L10：默认阈值与文档/示例必须一致（代码为准 = 0.85）
+    CHECK(cfg.cache.similarity_threshold > 0.84f &&
+          cfg.cache.similarity_threshold < 0.86f); ok++;
+    // 报告 L9：示例配置不再把正常回答截断到 600 字节
+    CHECK(cfg.filter.max_output_chars == 0); ok++;
+    // 报告 M15：embedding 段驱动模型路径与维度
+    CHECK(cfg.embedding.dim > 0); ok++;
+    CHECK(!cfg.embedding.model_path.empty()); ok++;
+    CHECK(!cfg.embedding.vocab_path.empty()); ok++;
+    // 报告 H5：连接上限与空闲超时在配置中可见且有合理默认
+    CHECK(cfg.server.max_connections > 0); ok++;
+    CHECK(cfg.server.idle_timeout_seconds > 0); ok++;
+    // 报告 L7：采样率默认全量
+    CHECK(cfg.log.sample_every >= 1); ok++;
+
+    // 默认值兜底：空配置（不存在的键）时的默认必须自洽
+    {
+        GatewayConfig def;
+        CHECK(def.filter.max_output_chars == 0); ok++;
+        CHECK(def.server.max_connections == 256); ok++;
+        CHECK(def.server.idle_timeout_seconds == 10); ok++;
+        CHECK(def.embedding.dim == 512); ok++;
+        CHECK(def.log.sample_every == 1); ok++;
+    }
+
+    return test_check::finish("test_config", ok);
 }

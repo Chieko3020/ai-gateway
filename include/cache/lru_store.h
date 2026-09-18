@@ -46,6 +46,15 @@ class LruStore {
   // 获取关联的 embedding；不存在返回空 vector
   std::vector<float> get_embedding(const std::string& key);
 
+  // 记录"该条目对应的原始查表键"（namespace:user_message）。
+  // 语义缓存的条目键是 msg:N，向量检索失败时的降级路径需要原样文本才能精确命中，
+  // 因此把来源键挂在同一条目上（旧实现为此额外存了一份完整回复，见报告 M4）
+  void set_source(const std::string& key, std::string source);
+
+  // 精确匹配：key 命中或条目的 source 命中，返回第一条未过期条目的回复。
+  // 用于 embedding 不可用时的降级路径（旧实现靠"再存一份 ns_key"实现）
+  std::optional<std::string> get_exact(const std::string& lookup_key);
+
   // 遍历所有非过期条目的 embedding（供索引重建使用）
   void for_each_embedding(
       const std::function<void(const std::string&,
@@ -56,7 +65,10 @@ class LruStore {
   //       并让 size() 与落盘文件只反映仍然有效的条目
   size_t purge_expired();
 
-  // 持久化：保存到 JSON 文件
+  // 持久化：保存到 JSON 文件。
+  // 实现为"锁内取快照 + 锁外序列化 + 临时文件 fsync + rename 原子替换"：
+  // 锁内做 DOM 构建与写盘会让所有 get/put 停顿数秒（报告 M2），
+  // 直接截断写原文件则在崩溃时留下半截 JSON、下次 load 失败导致整份缓存丢失（M9）
   bool save(const std::string& path) const;
 
   // 持久化：从 JSON 文件加载
@@ -82,8 +94,18 @@ class LruStore {
   struct Node {
     std::string key;
     std::string value;
+    std::string source;  // 原始查表键（namespace:user_message），可为空
     Embedding embedding;
     TimePoint ctime;  // 创建时间（TTL 判断用）
+  };
+
+  // save() 用的条目快照：在锁内只做"拷贝数据"，锁外才是 DOM/写盘
+  struct SaveEntry {
+    std::string key;
+    std::string value;
+    std::string source;
+    std::vector<float> embedding;
+    int64_t ctime_seconds = 0;
   };
 
   using LruList = std::list<Node>;

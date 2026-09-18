@@ -49,11 +49,16 @@ target_compile_definitions(test_config PRIVATE
 add_executable(test_singleflight test_singleflight.cpp)
 target_link_libraries(test_singleflight ai_gateway_common ai_gateway_test_check)
 
+# HTTP 服务的连接生命周期（报告 H5 半关闭/空闲超时/连接上限、M12 drain）
+add_executable(test_http_server test_http_server.cpp)
+target_link_libraries(test_http_server ai_gateway_server ai_gateway_common
+    ai_gateway_test_check)
+target_compile_definitions(test_http_server PRIVATE GATEWAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 # Module 4: stats
 add_executable(test_stats test_stats.cpp)
 target_link_libraries(test_stats ai_gateway_stats ai_gateway_common ai_gateway_test_check)
 
-enable_testing()
 add_test(NAME filter COMMAND test_filter)
 add_test(NAME request COMMAND test_request)
 add_test(NAME response COMMAND test_response)
@@ -63,6 +68,7 @@ add_test(NAME stats COMMAND test_stats)
 add_test(NAME config COMMAND test_config)
 add_test(NAME singleflight COMMAND test_singleflight)
 add_test(NAME cache_engine COMMAND test_cache_engine)
+add_test(NAME http_server COMMAND test_http_server)
 
 # HNSW 自检索召回率断言（合成向量 + 固定种子，确定性）
 add_test(NAME hnsw_recall
