@@ -78,7 +78,7 @@ CacheEngine::HitResult CacheEngine::try_hit(
 
   // 3. 遍历结果，检查是否命中（相似度 ≥ 阈值，且命名空间匹配）
   std::string ns_prefix = ns.empty() ? "" : ns + ":";
-  ++total_search_;
+  total_search_.fetch_add(1, std::memory_order_relaxed);
   for (auto& r : results) {
     if (r.similarity >= threshold_) {
       if (!ns.empty() && !r.key.starts_with(ns_prefix)) continue;
@@ -88,7 +88,7 @@ CacheEngine::HitResult CacheEngine::try_hit(
                  ns.empty() ? "default" : ns);
         return HitResult{true, std::move(cached.value()), r.similarity};
       }
-      ++ghost_count_;
+      ghost_count_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -162,9 +162,11 @@ void CacheEngine::rebuild_index() {
 
 std::pair<int, size_t> CacheEngine::ghost_stats() const {
   std::lock_guard lock(mutex_);
-  if (total_search_ == 0) return {0, 0};
-  int rate = static_cast<int>(ghost_count_ * 100 / total_search_);
-  return {rate, total_search_};
+  const size_t total = total_search_.load(std::memory_order_relaxed);
+  if (total == 0) return {0, 0};
+  const size_t ghosts = ghost_count_.load(std::memory_order_relaxed);
+  int rate = static_cast<int>(ghosts * 100 / total);
+  return {rate, total};
 }
 
 void CacheEngine::try_rebuild_if_ghosty() {
@@ -172,11 +174,11 @@ void CacheEngine::try_rebuild_if_ghosty() {
   if (total < 10) return;
   if (rate > 5) {
     LOG_INFO("cache: ghost rate {}% ({}/{}), auto-rebuilding index", rate,
-             ghost_count_, total);
+             ghost_count_.load(std::memory_order_relaxed), total);
     // rebuild_index() 自带 mutex_：这里不能先取锁再调用（同线程递归加锁会死锁）
     rebuild_index();
-    ghost_count_ = 0;
-    total_search_ = 0;
+    ghost_count_.store(0, std::memory_order_relaxed);
+    total_search_.store(0, std::memory_order_relaxed);
   }
 }
 

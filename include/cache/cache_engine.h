@@ -8,6 +8,7 @@
 //      未命中返回 nullopt，由上层转发 LLM 后将结果 + 向量存入缓存
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -88,9 +89,10 @@ class CacheEngine {
   // 保护 next_id_ + HNSW add/search 并发（LruStore 自有锁）
   mutable std::mutex mutex_;
 
-  // 幽灵向量观测计数器
-  size_t ghost_count_ = 0;
-  size_t total_search_ = 0;
+  // 幽灵向量观测计数器：try_hit() 在 mutex_ 之外自增（原实现是裸 size_t，
+  // 与 ghost_stats()/try_rebuild_if_ghosty() 的读取构成数据竞争），故用原子量
+  std::atomic<size_t> ghost_count_{0};
+  std::atomic<size_t> total_search_{0};
 };
 
 }  // namespace ai_gateway
