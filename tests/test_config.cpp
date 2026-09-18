@@ -40,6 +40,14 @@ int main() {
     CHECK(cfg.server.idle_timeout_seconds > 0); ok++;
     // 报告 L7：采样率默认全量
     CHECK(cfg.log.sample_every >= 1); ok++;
+    // 报告 8.7 第 7 条：费用单价可按输入/输出分档配置
+    CHECK(cfg.cost.input_per_1k >= 0 && cfg.cost.output_per_1k >= 0); ok++;
+    // 示例配置里的分档单价（输入 ¥1/M、输出 ¥4/M）
+    CHECK(cfg.cost.input_per_1k == 0.001); ok++;
+    CHECK(cfg.cost.output_per_1k == 0.004); ok++;
+    // 日志轮转参数来自配置（示例配置显式给出 10MB / 5 份）
+    CHECK(cfg.log.max_bytes == 10 * 1024 * 1024); ok++;
+    CHECK(cfg.log.keep_files == 5); ok++;
 
     // 默认值兜底：空配置（不存在的键）时的默认必须自洽
     {
@@ -49,6 +57,12 @@ int main() {
         CHECK(def.server.idle_timeout_seconds == 30); ok++;
         CHECK(def.embedding.dim == 512); ok++;
         CHECK(def.log.sample_every == 1); ok++;
+        // 轮转默认开启（10MB / 5 份）：不配置也不会退回"无限追加"
+        CHECK(def.log.max_bytes == 10 * 1024 * 1024); ok++;
+        CHECK(def.log.keep_files == 5); ok++;
+        // 单价缺省 = 旧的统一口径，保证不配置时报表金额与修复前完全一致
+        CHECK(def.cost.input_per_1k == 0.001); ok++;
+        CHECK(def.cost.output_per_1k == 0.001); ok++;
     }
 
     return test_check::finish("test_config", ok);

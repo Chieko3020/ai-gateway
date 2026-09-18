@@ -476,6 +476,8 @@ int main(int argc, char* argv[]) {
           HnswConfig{cfg.embedding.dim, 16, 100, 50}),
       embed_fn);
   auto stats = std::make_shared<Stats>();
+  // 输入/输出分档单价：配置缺省时是 0.001/0.001（与旧口径完全一致）
+  stats->set_pricing(TokenPricing{cfg.cost.input_per_1k, cfg.cost.output_per_1k});
   auto filter = std::make_shared<MessageFilter>(cfg.filter);
 
   // 从磁盘恢复缓存

@@ -108,11 +108,27 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       if (out.log.keep_files < 1) out.log.keep_files = 1;
     }
 
+    // --- cost ---
+    // 缺省 = 旧的统一单价（0.001/0.001），配置只写一边时另一边沿用缺省；
+    // 负价会让"费用"变成负数（等于给缓存刷收益），直接判为配置错误
+    if (root.contains("cost")) {
+      auto& c = root["cost"];
+      out.cost.input_per_1k = c.value("input_per_1k", 0.001);
+      out.cost.output_per_1k = c.value("output_per_1k", 0.001);
+      if (out.cost.input_per_1k < 0 || out.cost.output_per_1k < 0) {
+        LOG_ERROR("cost price must be >= 0 (input_per_1k={}, output_per_1k={})",
+                  out.cost.input_per_1k, out.cost.output_per_1k);
+        return 1;
+      }
+    }
+
     LOG_INFO("config loaded: port={}, backend={}, model={}, max_conn={}, "
-             "idle_timeout={}s, log_rotate={} bytes keep={}",
+             "idle_timeout={}s, log_rotate={} bytes keep={}, "
+             "price=¥{}/1K in, ¥{}/1K out",
              out.server.port, out.backend.url, out.backend.model,
              out.server.max_connections, out.server.idle_timeout_seconds,
-             out.log.max_bytes, out.log.keep_files);
+             out.log.max_bytes, out.log.keep_files,
+             out.cost.input_per_1k, out.cost.output_per_1k);
     return 0;
   } catch (const std::exception& e) {
     LOG_ERROR("config parse error: {}", e.what());

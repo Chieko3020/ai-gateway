@@ -70,6 +70,14 @@ struct LogConfig {
   int keep_files = 5;                   // 保留历史份数（不含当前文件）
 };
 
+// 费用估算配置（元 / 1K tokens）。
+// 缺省值与旧口径一致（0.001/0.001 统一单价），因此不配置时报表金额不变；
+// 要按真实分档计价就显式写 cost 段（DeepSeek v4-flash：输入 ¥0.001、输出 ¥0.004）
+struct CostConfig {
+  double input_per_1k = 0.001;
+  double output_per_1k = 0.001;
+};
+
 // 网关总配置
 struct GatewayConfig {
   ServerConfig server;
@@ -78,6 +86,7 @@ struct GatewayConfig {
   CacheConfig cache;
   FilterConfig filter;
   LogConfig log;
+  CostConfig cost;
 
   static int load(const std::string& path, GatewayConfig& out);
 };

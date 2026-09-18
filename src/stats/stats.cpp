@@ -30,10 +30,18 @@ void Stats::record_cache_hit(int64_t latency_ms) {
   ++total_;
   ++hits_;
 
-  // 估算节省的 token：取历史平均每次调用的 token 数
+  // 估算节省的 token：取历史平均每次调用的 token 数。
+  // 旧实现把 prompt 与 completion 相加后再除，金额只能用统一单价；这里额外分开
+  // 累计（合计值 tokens_saved_ 与旧口径一致），于是 estimated_saved() 能按
+  // 输入/输出分档计价（报告 8.7 第 7 条）
   auto total_tokens = total_prompt_tokens_ + total_completion_tokens_;
   int64_t avg_tokens = (misses_ > 0) ? total_tokens / misses_ : 0;
   tokens_saved_ += avg_tokens;
+  if (misses_ > 0) {
+    saved_prompt_tokens_ += total_prompt_tokens_ / static_cast<int64_t>(misses_);
+    saved_completion_tokens_ +=
+        total_completion_tokens_ / static_cast<int64_t>(misses_);
+  }
 
   auto us = latency_ms * 1000;
   total_latency_us_ += us;
@@ -108,14 +116,18 @@ void Stats::report() const {
   //   merged     = 请求合并命中，单独计数
   //   samples    = 主延迟环形缓冲里的样本数，恒等于 requests（≤ 窗口大小 1024）
   //   bypass_*   = 旁路流量自己的样本池与分位数，不混入上面的 avg/min/max
+  //   cost/saved = 按输入/输出分档单价估算（默认 0.001/0.001 = 旧口径）；
+  //                同时打印所用单价，避免"金额变了却查不出换没换价"
   LOG_INFO("[STATS] requests={} hits={} misses={} hit_rate={:.1f}% merged={} "
            "bypassed={} tokens={} saved={} cost=¥{:.4f} saved=¥{:.4f} "
+           "price_in=¥{}/1K price_out=¥{}/1K "
            "avg={}ms min={}ms max={}ms p50={}ms p95={}ms p99={}ms samples={} "
            "bypass_avg={}ms bypass_p50={}ms bypass_p95={}ms bypass_samples={}",
            total_, hits_, misses_, hit_rate() * 100, merged_, bypassed_,
            total_prompt_tokens_ + total_completion_tokens_,
            tokens_saved_,
            estimated_cost(), saved,
+           pricing_.input_per_1k, pricing_.output_per_1k,
            avg_latency_ms(), min_latency_ms(), max_latency_,
            percentile(50), percentile(95), percentile(99), ring_count_,
            avg_bypass_latency_ms(), bypass_percentile(50), bypass_percentile(95),
@@ -130,13 +142,60 @@ int64_t Stats::avg_latency_ms() const {
   return total_ > 0 ? (total_latency_us_ / 1000) / static_cast<int64_t>(total_) : 0;
 }
 
+void Stats::set_pricing(const TokenPricing& p) {
+  std::lock_guard lock(mutex_);
+  pricing_ = p;
+}
+
+TokenPricing Stats::pricing() const {
+  std::shared_lock lock(mutex_);
+  return pricing_;
+}
+
 double Stats::estimated_cost() const {
-  auto total_tokens = total_prompt_tokens_ + total_completion_tokens_;
-  return total_tokens * kCostPer1KTokens / 1000.0;
+  // 不加锁：与 avg_latency_ms() 等一致，report()/snapshot() 已在锁内调用
+  return static_cast<double>(total_prompt_tokens_) *
+             pricing_.input_per_1k / 1000.0 +
+         static_cast<double>(total_completion_tokens_) *
+             pricing_.output_per_1k / 1000.0;
 }
 
 double Stats::estimated_saved() const {
-  return tokens_saved_ * kCostPer1KTokens / 1000.0;
+  // 单价缺省时（0.001/0.001）等价于旧口径：tokens_saved * 0.001 / 1000
+  return static_cast<double>(saved_prompt_tokens_) * pricing_.input_per_1k /
+             1000.0 +
+         static_cast<double>(saved_completion_tokens_) * pricing_.output_per_1k /
+             1000.0;
+}
+
+StatsSnapshot Stats::snapshot() const {
+  std::shared_lock lock(mutex_);
+  StatsSnapshot s;
+  s.requests = total_;
+  s.hits = hits_;
+  s.misses = misses_;
+  s.bypassed = bypassed_;
+  s.merged = merged_;
+  s.hit_rate = hit_rate();
+  s.prompt_tokens = total_prompt_tokens_;
+  s.completion_tokens = total_completion_tokens_;
+  s.tokens_saved = tokens_saved_;
+  s.input_per_1k = pricing_.input_per_1k;
+  s.output_per_1k = pricing_.output_per_1k;
+  s.cost_yuan = estimated_cost();
+  s.saved_yuan = estimated_saved();
+  s.avg_latency_ms = avg_latency_ms();
+  s.min_latency_ms = min_latency_ms();
+  s.max_latency_ms = max_latency_;
+  s.p50_latency_ms = percentile(50);
+  s.p95_latency_ms = percentile(95);
+  s.p99_latency_ms = percentile(99);
+  s.latency_samples = ring_count_;
+  s.bypass_avg_latency_ms = avg_bypass_latency_ms();
+  s.bypass_p50_latency_ms = bypass_percentile(50);
+  s.bypass_p95_latency_ms = bypass_percentile(95);
+  s.bypass_latency_samples = bypass_ring_count_;
+  return s;
 }
 
 int64_t Stats::total_prompt_tokens() const {

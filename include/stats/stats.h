@@ -12,8 +12,43 @@
 namespace ai_gateway {
 
 // DeepSeek v4-flash 估算：输入 ¥1/M tok, 输出 ¥4/M tok
-// 简化：统一按 ¥0.001/1K tokens 估算
+// 旧实现把两者压成一个单价（统一 ¥0.001/1K tokens），输出侧被低估 4 倍。
+// 该常量作为**默认单价**保留：配置里不写 cost 段时仍按旧口径估算（向后兼容）
 constexpr double kCostPer1KTokens = 0.001;
+
+// 输入/输出分档单价（元 / 1K tokens）
+struct TokenPricing {
+  double input_per_1k = kCostPer1KTokens;
+  double output_per_1k = kCostPer1KTokens;
+};
+
+// 一次读一致性快照（/metrics 用）：避免逐字段 getter 拼出互相矛盾的数
+struct StatsSnapshot {
+  size_t requests = 0;      // 可缓存流量 = hits + misses
+  size_t hits = 0;
+  size_t misses = 0;
+  size_t bypassed = 0;
+  size_t merged = 0;
+  double hit_rate = 0.0;
+  int64_t prompt_tokens = 0;
+  int64_t completion_tokens = 0;
+  int64_t tokens_saved = 0;
+  double cost_yuan = 0.0;
+  double saved_yuan = 0.0;
+  double input_per_1k = kCostPer1KTokens;
+  double output_per_1k = kCostPer1KTokens;
+  int64_t avg_latency_ms = 0;
+  int64_t min_latency_ms = 0;
+  int64_t max_latency_ms = 0;
+  int64_t p50_latency_ms = 0;
+  int64_t p95_latency_ms = 0;
+  int64_t p99_latency_ms = 0;
+  size_t latency_samples = 0;
+  int64_t bypass_avg_latency_ms = 0;
+  int64_t bypass_p50_latency_ms = 0;
+  int64_t bypass_p95_latency_ms = 0;
+  size_t bypass_latency_samples = 0;
+};
 
 class Stats {
  public:
@@ -56,8 +91,16 @@ class Stats {
   int64_t total_tokens_saved() const;
 
   // 费用估算
+  //
+  // 单价可配置：输入与输出分开计价（DeepSeek 实际是 ¥1/M 输入、¥4/M 输出）。
+  // 未配置时 pricing() 是 0.001/0.001，estimated_cost() 的数值与旧口径完全一致
+  void set_pricing(const TokenPricing& p);
+  TokenPricing pricing() const;
   double estimated_cost() const;
   double estimated_saved() const;
+
+  // 一次性快照（/metrics 与报表用）
+  StatsSnapshot snapshot() const;
 
   // 延迟统计
   int64_t avg_latency_ms() const;
@@ -87,7 +130,13 @@ class Stats {
 
   int64_t total_prompt_tokens_ = 0;
   int64_t total_completion_tokens_ = 0;
-  int64_t tokens_saved_ = 0;  // 缓存命中省下的 token 估算
+  int64_t tokens_saved_ = 0;  // 缓存命中省下的 token 估算（in + out 合计）
+  // 省下的部分按输入/输出分开累计，才能用分档单价估算金额。
+  // tokens_saved_ 的数值与旧口径一致（= 平均单次调用的 prompt+completion）
+  int64_t saved_prompt_tokens_ = 0;
+  int64_t saved_completion_tokens_ = 0;
+
+  TokenPricing pricing_{};  // 受 mutex_ 保护
 
   int64_t total_latency_us_ = 0;
   int64_t bypass_latency_us_ = 0;

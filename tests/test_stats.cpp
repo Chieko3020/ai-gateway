@@ -1,5 +1,6 @@
 // Stats 单元测试
 #include "test_check.h"
+#include <cmath>
 #include <iostream>
 #include "common/logger.h"
 #include "stats/stats.h"
@@ -91,6 +92,47 @@ int main() {
         b.report();  // 纯旁路也要能正常输出（含 bypass_* 分位数）
         b.record_api_call(7, 0, 0);
         CHECK(b.min_latency_ms() == 7); ok++;
+    }
+
+    // 报告 8.7 第 7 条：费用估算区分输入/输出单价
+    {
+        // 缺省口径与旧实现完全一致：统一 0.001/1K
+        Stats c;
+        c.record_api_call(10, 1000, 2000);
+        CHECK(c.pricing().input_per_1k == kCostPer1KTokens); ok++;
+        CHECK(c.pricing().output_per_1k == kCostPer1KTokens); ok++;
+        // 3000 tokens * 0.001 / 1000 = 0.003（= 旧公式的结果）
+        CHECK(std::abs(c.estimated_cost() - 0.003) < 1e-12); ok++;
+
+        // 分档：输入 0.001 / 输出 0.004（DeepSeek 的实际比例）
+        Stats t;
+        t.set_pricing(TokenPricing{0.001, 0.004});
+        t.record_api_call(10, 1000, 2000);
+        // 1000*0.001/1000 + 2000*0.004/1000 = 0.001 + 0.008 = 0.009
+        CHECK(std::abs(t.estimated_cost() - 0.009) < 1e-12); ok++;
+        // 判别力：统一单价的旧口径给 0.003，两者必须不同
+        CHECK(std::abs(t.estimated_cost() - 0.003) > 1e-9); ok++;
+        CHECK(t.pricing().output_per_1k == 0.004); ok++;
+
+        // 命中节省也按分档算：一次未命中(1000 in / 2000 out)之后的命中，
+        // 省的正是"平均一次调用"的量 = 1000 in + 2000 out
+        t.record_cache_hit(5);
+        CHECK(t.total_tokens_saved() == 3000); ok++;                 // 合计口径不变
+        CHECK(std::abs(t.estimated_saved() - 0.009) < 1e-12); ok++;  // 0.001 + 0.008
+        CHECK(std::abs(t.estimated_saved() - 0.003) > 1e-9); ok++;   // 旧口径是 0.003
+
+        // snapshot() 一次性快照必须与逐字段 getter 一致（/metrics 用的就是它）
+        auto s = t.snapshot();
+        CHECK(s.requests == t.total_requests()); ok++;
+        CHECK(s.hits == t.cache_hits()); ok++;
+        CHECK(s.misses == t.cache_misses()); ok++;
+        CHECK(s.tokens_saved == t.total_tokens_saved()); ok++;
+        CHECK(std::abs(s.cost_yuan - t.estimated_cost()) < 1e-12); ok++;
+        CHECK(std::abs(s.saved_yuan - t.estimated_saved()) < 1e-12); ok++;
+        CHECK(s.input_per_1k == 0.001 && s.output_per_1k == 0.004); ok++;
+        CHECK(s.avg_latency_ms == t.avg_latency_ms()); ok++;
+        CHECK(s.latency_samples == t.latency_samples()); ok++;
+        CHECK(s.bypass_latency_samples == t.bypass_latency_samples()); ok++;
     }
 
     // 报告 L7：热路径 INFO 采样判定（默认 1 = 全量；N = 每 N 条留 1 条）
