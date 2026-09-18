@@ -90,21 +90,24 @@ class HnswIndex {
     for (int lc = std::min(level, max_level_); lc >= 0; --lc) {
       auto candidates = search_layer(embedding, ep, cfg_.ef_construction, lc);
       int max_conn = (lc == 0) ? M_max0 : M_max;
-      // 取最近 max_conn 个邻居并添加双向链接
-      std::vector<HnswDistNode> sorted;
-      while (!candidates.empty()) { sorted.push_back(candidates.top()); candidates.pop(); }
-      int taken = std::min(max_conn, static_cast<int>(sorted.size()));
-      nodes_[cur].neighbors[lc].reserve(taken);
-      for (int i = 0; i < taken; ++i) {
-        int nei = sorted[i].id;
-        if (nei == cur) continue;
-        nodes_[cur].neighbors[lc].push_back(nei);
-        // 若未超过限制则添加反向边
-        int rev_max = (lc == 0) ? M_max0 : M_max;
-        if (static_cast<int>(nodes_[nei].neighbors[lc].size()) < rev_max)
-          nodes_[nei].neighbors[lc].push_back(cur);
+
+      std::vector<HnswDistNode> cands;
+      while (!candidates.empty()) {
+        cands.push_back(candidates.top());
+        candidates.pop();
       }
-      ep = sorted[0].id;
+
+      // 用启发式选择本节点的邻居（多样性筛选），而不是直接取最近 max_conn 个
+      std::vector<int> selected = selectNeighborsHeuristic(cands, max_conn);
+      nodes_[cur].neighbors[lc] = selected;
+
+      // 建立双向连接；邻居已满时收缩重选，而不是直接放弃反向边
+      for (int nei : selected) {
+        if (nei == cur) continue;
+        connectWithShrink(cur, nei, lc, max_conn);
+      }
+
+      if (!cands.empty()) ep = cands.front().id;
     }
     if (level > max_level_) {
       max_level_ = level;
@@ -155,6 +158,50 @@ class HnswIndex {
 
   using MinHeap = std::priority_queue<HnswDistNode, std::vector<HnswDistNode>, std::greater<HnswDistNode>>;
   using MaxHeap = std::priority_queue<HnswDistNode>;
+
+  // 启发式邻居选择（论文 Algorithm 4 SELECT-NEIGHBORS-HEURISTIC）：
+  // 候选按到查询点的距离升序尝试加入；若某候选到"已选邻居"的距离比它到查询点更近，
+  // 说明它与已选邻居方向重复（冗余），丢弃它——以此让邻居方向分散、维持图连通。
+  // 副作用：就地按距离升序排序传入的候选列表。
+  std::vector<int> selectNeighborsHeuristic(std::vector<HnswDistNode>& candidates,
+                                            int M) {
+    std::sort(candidates.begin(), candidates.end(),
+              [](const HnswDistNode& a, const HnswDistNode& b) { return a.dist < b.dist; });
+    std::vector<int> selected;
+    selected.reserve(static_cast<size_t>(M));
+    for (const auto& cand : candidates) {
+      if (static_cast<int>(selected.size()) >= M) break;
+      bool keep = true;
+      for (int s : selected) {
+        if (l2(nodes_[cand.id].vec, nodes_[s].vec) < cand.dist) {
+          keep = false;
+          break;
+        }
+      }
+      if (keep) selected.push_back(cand.id);
+    }
+    return selected;
+  }
+
+  // 邻居已满时的收缩（论文 Algorithm 1 第 12-13 行）：
+  // 把"新节点 + 现有邻居"合并后按启发式重选 max_conn 个，被淘汰的边断开。
+  // 原实现是"满了就不加反向边"，会让后插入的节点没有入边、在检索中不可达
+  // （实测自检索 top-1 仅 30.9% 的直接原因）。
+  void connectWithShrink(int cur, int nei, int lc, int max_conn) {
+    auto& nbrs = nodes_[nei].neighbors[lc];
+    for (int x : nbrs) {
+      if (x == cur) return;  // 已连接，无需重复
+    }
+    if (static_cast<int>(nbrs.size()) < max_conn) {
+      nbrs.push_back(cur);
+      return;
+    }
+    std::vector<HnswDistNode> cands;
+    cands.reserve(nbrs.size() + 1);
+    for (int x : nbrs) cands.push_back({x, l2(nodes_[nei].vec, nodes_[x].vec)});
+    cands.push_back({cur, l2(nodes_[nei].vec, nodes_[cur].vec)});
+    nbrs = selectNeighborsHeuristic(cands, max_conn);
+  }
 
   MinHeap search_layer(const std::vector<float>& query, int ep, int ef, int lc) {
     std::vector<bool> visited(nodes_.size(), false);
