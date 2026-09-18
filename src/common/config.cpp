@@ -51,6 +51,9 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       out.server.max_connections = s.value("max_connections", size_t{256});
       out.server.idle_timeout_seconds = s.value("idle_timeout_seconds", 30);
       out.server.max_header_bytes = s.value("max_header_bytes", size_t{65536});
+      out.server.write_timeout_seconds = s.value("write_timeout_seconds", 10);
+      // 0/负数会让"写超时"退化成立刻放弃（等价于旧的截断行为），夹到最小值 1
+      if (out.server.write_timeout_seconds < 1) out.server.write_timeout_seconds = 1;
     }
 
     // --- backend ---

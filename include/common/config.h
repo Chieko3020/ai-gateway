@@ -20,6 +20,11 @@ struct ServerConfig {
   int idle_timeout_seconds = 30;
   // 头部区段最大字节数（slowloris 防护）
   size_t max_header_bytes = 65536;
+  // 响应写超时（秒，必须 > 0）：worker 在大响应 + 慢客户端（非阻塞 fd 上 EAGAIN）
+  // 时最多等这么久把响应写完，超时则断开。
+  // 取值就是"一个慢客户端最多占住一个 worker 多久"——旧实现遇到 EAGAIN 直接把
+  // 剩余字节丢掉（响应被截断），这个上限是正确性与吞吐之间的取舍旋钮
+  int write_timeout_seconds = 10;
 };
 
 // LLM 后端配置（OpenAI 兼容）

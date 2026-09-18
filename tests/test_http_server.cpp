@@ -6,11 +6,16 @@
 //   2. 空闲超时：只连不发的连接在 idle_timeout_seconds 后被关闭
 //   3. max_connections：达到上限后新连接直接收到 503
 //   4. drain()：在途请求执行完毕后才返回（M12）
+//   5. 大响应（4MB）+ 慢客户端（4KB 接收缓冲、先不读）：非阻塞 fd 上的 EAGAIN
+//      不得截断响应（报告 8.7 第 3 条）
+//   6. 写超时：写不完时按死线放弃（socketpair 确定性验证，不依赖 TCP 时序）
 //
 // 判别力说明：把 read_into_buffer 改回"EOF 也返回 true、body 未收齐时直接 return"
 // 的旧逻辑后，第 1 段断言失败（fd 数不回落）；去掉 accept 处的 max_connections
 // 检查后，第 3 段的 503 断言失败；把 drain() 改成空实现后，第 4 段
 // "drain 返回时在途 handler 已完成"失败。
+// 把 send_all() 换回修复前的 `if (sent <= 0) break;`（EAGAIN 即放弃）后，
+// 第 5 段"body 完整 / 末尾标记存在"断言失败（只能收到发送窗口填满前的那几十 KB）。
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -257,6 +262,188 @@ int main() {
     stop_flag.store(true);
     t.join();
     server.drain();
+  }
+
+  // ── 5. 大响应 + 慢客户端：非阻塞 fd 上的 EAGAIN 不得截断响应 ─────────
+  // 场景：1MB 响应，客户端先把 SO_RCVBUF 压到 4KB 并不读，让服务端的发送窗口
+  // 迅速填满（send() 必然返回 EAGAIN），300ms 后再把数据读完。
+  // 修复前：send() 一遇 EAGAIN 就 break，客户端只能拿到前几 KB（且长度与
+  // Content-Length 不符）；修复后：worker 用 poll(POLLOUT) 等可写续发，收满 1MB。
+  {
+    ServerConfig sc;
+    sc.port = 0;
+    sc.idle_timeout_seconds = 30;
+    sc.max_connections = 64;
+    sc.write_timeout_seconds = 10;  // 远大于下面的慢读窗口，保证只考验写路径
+
+    // 必须大于内核给 socket 的发送缓冲（本机实测 loopback 上 SO_SNDBUF≈2.6MB，
+    // 1MB 响应会被整块塞进缓冲、根本不触发 EAGAIN，那样的用例等于没测），
+    // 因此这里用 4MB，并用 send_eagain_count() 断言分支确实被执行过
+    constexpr size_t kBodyBytes = 4 * 1024 * 1024;  // 4MB
+    std::string big_body(kBodyBytes, 'x');
+    big_body.replace(kBodyBytes - 16, 16, "TAIL-MARKER-END1");  // 末尾标记
+    const std::string expect_body = big_body;
+
+    std::atomic<bool> stop_flag{false};
+    HttpServer server(sc);
+    server.set_handler([](const std::string&) {
+      return HttpReply{200, "application/json", "{}"};
+    });
+    server.add_route("/big", [&big_body](const std::string&) {
+      return HttpReply{200, "application/octet-stream", big_body};
+    });
+
+    std::thread t([&] { server.run(&stop_flag); });
+    CHECK(wait_listening(server, 5000));
+    ok++;
+    const int port = server.listen_port();
+
+    // 客户端：小接收缓冲 + 先不读
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(fd >= 0);
+    ok++;
+    if (fd >= 0) {
+      int rcvbuf = 4096;
+      setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+      sockaddr_in a{};
+      a.sin_family = AF_INET;
+      a.sin_port = htons(static_cast<uint16_t>(port));
+      inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+      CHECK(connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+      ok++;
+
+      const char* req =
+          "POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
+      send(fd, req, std::strlen(req), MSG_NOSIGNAL);
+      // 什么都不读，让发送缓冲彻底填满（此时服务端必遇 EAGAIN）
+      std::this_thread::sleep_for(300ms);
+
+      std::string resp;
+      resp.reserve(kBodyBytes + 512);
+      char buf[65536];
+      while (true) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+          resp.append(buf, static_cast<size_t>(n));
+          continue;
+        }
+        if (n == 0) break;  // 服务端写完就 close（Connection: close）
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          std::this_thread::sleep_for(5ms);
+          continue;
+        }
+        break;
+      }
+      close(fd);
+      std::fprintf(stderr,
+                   "[slow-client] 收到 %zu 字节（期望 header+%zu），body 后 16 字节: %.16s\n",
+                   resp.size(), kBodyBytes,
+                   resp.size() > 16 ? resp.c_str() + resp.size() - 16 : "");
+
+      // 头部 + body 必须完整：修复前这里只有几十 KB，且末尾标记缺失
+      CHECK(resp.size() >= kBodyBytes);
+      ok++;
+      CHECK(resp.find("200 OK") != std::string::npos);
+      ok++;
+      CHECK(resp.find("Content-Length: " + std::to_string(kBodyBytes)) !=
+            std::string::npos);
+      ok++;
+      auto header_end = resp.find("\r\n\r\n");
+      CHECK(header_end != std::string::npos);
+      ok++;
+      std::string got_body = resp.substr(header_end + 4);
+      CHECK(got_body.size() == expect_body.size());
+      ok++;
+      CHECK(got_body == expect_body);
+      ok++;
+      CHECK(got_body.find("TAIL-MARKER-END1") != std::string::npos);
+      ok++;
+      // 判别力自检：没走到 EAGAIN 的话这个用例什么也没验证（例如换了台
+      // socket 缓冲特别大的机器），必须显式失败而不是"通过"
+      CHECK(server.send_eagain_count() > 0);
+      ok++;
+      std::fprintf(stderr, "[slow-client] send 遇到 EAGAIN 次数 = %llu\n",
+                   static_cast<unsigned long long>(server.send_eagain_count()));
+    }
+
+    stop_flag.store(true);
+    t.join();
+    server.drain();
+  }
+
+  // ── 6. 写超时：直达 send_all_with_deadline（socketpair，确定性）────────
+  // 第 5 段验证"能写到底"，这一段验证"写不完时不会挂死"。
+  // 为什么不走 TCP：服务端带未发完数据 close() 后，FIN 会排在那堆数据后面，
+  // 客户端侧观察"对端关闭"并不可靠（实测要等 10s 以上且看不到 EOF），
+  // 因此这里用 socketpair + 极小 SO_SNDBUF 把超时语义直接测出来。
+  {
+    int sp[2] = {-1, -1};
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    ok++;
+    if (sp[0] >= 0) {
+      int sndbuf = 4096;
+      setsockopt(sp[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+      // 非阻塞写端 + 不读的读端
+      int flags = fcntl(sp[0], F_GETFL, 0);
+      fcntl(sp[0], F_SETFL, flags | O_NONBLOCK);
+
+      const std::string payload(4 * 1024 * 1024, 'z');
+      std::atomic<uint64_t> eagain{0};
+      auto t0 = std::chrono::steady_clock::now();
+      bool complete = send_all_with_deadline(sp[0], payload.data(), payload.size(),
+                                            /*deadline_ms=*/300, &eagain);
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+      std::fprintf(stderr,
+                   "[write-deadline] 不读对端: complete=%d, %lldms, EAGAIN=%llu\n",
+                   complete ? 1 : 0, static_cast<long long>(elapsed_ms),
+                   static_cast<unsigned long long>(eagain.load()));
+      CHECK(!complete);          // 写不完
+      ok++;
+      CHECK(eagain.load() > 0);  // 确实撞上了 EAGAIN（不是别的原因提前返回）
+      ok++;
+      // 300ms 死线：必须在 300ms~2s 内返回（旧实现遇到 EAGAIN 会立刻返回，
+      // 用 elapsed 下限把"立刻放弃"和"等满死线再放弃"区分开）
+      CHECK(elapsed_ms >= 250 && elapsed_ms < 2000);
+      ok++;
+
+      // 换个会读的对端：同样的调用必须写完并返回 true
+      int sp2[2] = {-1, -1};
+      CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp2) == 0);
+      ok++;
+      if (sp2[0] >= 0) {
+        int flags2 = fcntl(sp2[0], F_GETFL, 0);
+        fcntl(sp2[0], F_SETFL, flags2 | O_NONBLOCK);
+        std::atomic<uint64_t> eagain2{0};
+        std::string received;
+        std::thread reader([&] {
+          char buf[65536];
+          while (received.size() < payload.size()) {
+            ssize_t n = recv(sp2[1], buf, sizeof(buf), 0);
+            if (n > 0) {
+              received.append(buf, static_cast<size_t>(n));
+              continue;
+            }
+            if (n == 0) break;
+            if (errno == EINTR) continue;
+            std::this_thread::sleep_for(1ms);
+          }
+        });
+        bool ok_write = send_all_with_deadline(sp2[0], payload.data(),
+                                               payload.size(), 5000, &eagain2);
+        reader.join();
+        CHECK(ok_write);
+        ok++;
+        CHECK(received.size() == payload.size());
+        ok++;
+        close(sp2[0]);
+        close(sp2[1]);
+      }
+      close(sp[0]);
+      close(sp[1]);
+    }
   }
 
   return test_check::finish("test_http_server", ok);

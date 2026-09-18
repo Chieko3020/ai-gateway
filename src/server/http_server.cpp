@@ -3,6 +3,7 @@
 
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -178,6 +179,9 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
               conns_.size() >= config_.max_connections) {
             LOG_WARN("connection limit reached ({}), rejecting new connection",
                      config_.max_connections);
+            // 注意：这里是 reactor 线程，绝不能用会阻塞的 send_all()——
+            // 拒绝响应只有几十字节、socket 发送缓冲为空，正常不会 EAGAIN。
+            // 大响应（唯一会真正撞上 EAGAIN 的场景）在 worker 里走 send_all()
             auto resp = make_service_unavailable(
                 R"({"error":"Too many connections"})");
             const char* p = resp.data();
@@ -234,6 +238,72 @@ void HttpServer::drain() {
   // run() 已退出：不再有新连接与新任务提交（worker 之间也不会再 execute），
   // 这里只需等在途请求跑完，之后的统计/落盘才不会与它们并发
   pool_.wait_idle();
+}
+
+// 自由函数（不是 HttpServer 的私有方法）：这样可以脱离 HTTP 服务直接用
+// socketpair 做确定性单测（见 test_http_server 第 6 段），不必依赖 TCP 时序
+bool send_all_with_deadline(int client_fd, const char* data, size_t len,
+                            int write_deadline_ms,
+                            std::atomic<uint64_t>* eagain_count) {
+  // 旧实现在这里 `if (sent <= 0) break`：非阻塞 fd 上 send() 返回 EAGAIN 时
+  // 会把剩余字节直接丢掉，慢客户端读大响应只会拿到前半截（报告 8.7 第 3 条）。
+  //
+  // 这里改成"等到能写为止"：EAGAIN 时用 poll(POLLOUT) 阻塞等待可写再续发，
+  // 并用**总 deadline**（不是每次 poll 各自计时）兜住慢客户端，
+  // 避免一个连接把 worker 永久占住。
+  //
+  // 为什么不做 EPOLLOUT 写缓冲：那需要把未发完的数据从 worker 交还给 reactor
+  // （跨线程写队列 + eventfd 唤醒 + 重新注册 EPOLLOUT + 所有权转移），
+  // 在本项目"worker 独占 fd 并在结束时 close"的架构下改动面大、竞态风险高；
+  // poll 方案只影响单个 worker 且行为可测（见 test_http_server 的慢客户端用例）。
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(write_deadline_ms);
+  size_t offset = 0;
+  while (offset < len) {
+    ssize_t sent = send(client_fd, data + offset, len - offset, MSG_NOSIGNAL);
+    if (sent > 0) {
+      offset += static_cast<size_t>(sent);
+      continue;
+    }
+    if (sent < 0 && errno == EINTR) continue;
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      // 计数供回归测试断言"确实走到了等待可写的分支"（否则用例可能没触发 EAGAIN）
+      if (eagain_count)
+        eagain_count->fetch_add(1, std::memory_order_relaxed);
+      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            deadline - std::chrono::steady_clock::now())
+                            .count();
+      if (left <= 0) {
+        LOG_WARN("send: write deadline ({}ms) exceeded, {} of {} bytes unsent",
+                 write_deadline_ms, len - offset, len);
+        return false;
+      }
+      pollfd w{client_fd, POLLOUT, 0};
+      int rc = ::poll(&w, 1, static_cast<int>(left));
+      if (rc < 0 && errno != EINTR) {
+        LOG_WARN("send: poll failed: {}", std::strerror(errno));
+        return false;
+      }
+      if (rc == 0) {
+        LOG_WARN("send: write deadline ({}ms) exceeded, {} of {} bytes unsent",
+                 write_deadline_ms, len - offset, len);
+        return false;
+      }
+      continue;  // 可写了，续发
+    }
+    // 真实错误：EPIPE / ECONNRESET 等（客户端已经走了，没什么可补救的）
+    if (sent < 0)
+      LOG_DEBUG("send error: {} ({} of {} bytes sent)", std::strerror(errno),
+                offset, len);
+    return false;
+  }
+  return true;
+}
+
+bool HttpServer::send_all(int client_fd, const char* data, size_t len,
+                          int write_deadline_ms) {
+  return send_all_with_deadline(client_fd, data, len, write_deadline_ms,
+                                &send_eagain_count_);
 }
 
 void HttpServer::close_connection(int client_fd) {
@@ -414,6 +484,7 @@ bool HttpServer::handle_buffer(int client_fd, bool peer_closed) {
   if (content_length > config_.max_body_bytes) {
     LOG_WARN("body too large: {} > {} bytes, closing",
              content_length, config_.max_body_bytes);
+    // 同样在 reactor 线程内，响应只有几十字节（见上面 503 分支的说明）
     auto resp = make_payload_too_large(R"({"error":"Payload too large"})");
     const char* p = resp.data();
     size_t remaining = resp.size();
@@ -454,17 +525,9 @@ bool HttpServer::handle_buffer(int client_fd, bool peer_closed) {
   pool_.execute([this, client_fd, req = std::move(request)] {
     try {
       auto result = conn_handler_.process(req.data(), req.size());
-      const char* p = result.response.data();
-      size_t remaining = result.response.size();
-      while (remaining > 0) {
-        ssize_t sent = send(client_fd, p, remaining, MSG_NOSIGNAL);
-        if (sent <= 0) {
-          if (sent < 0) LOG_DEBUG("send error: {}", std::strerror(errno));
-          break;
-        }
-        p += sent;
-        remaining -= static_cast<size_t>(sent);
-      }
+      // 大响应 + 慢客户端：必须写到底（或到写超时），不能因为 EAGAIN 就截断
+      send_all(client_fd, result.response.data(), result.response.size(),
+               config_.write_timeout_seconds * 1000);
     } catch (const std::exception& e) {
       // 任何异常都不能穿越线程池边界（会 std::terminate 整个进程）
       LOG_ERROR("worker task threw: {}", e.what());

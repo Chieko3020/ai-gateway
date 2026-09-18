@@ -34,6 +34,13 @@
 
 namespace ai_gateway {
 
+// 非阻塞 fd 上"写到底"：遇 EAGAIN 用 poll(POLLOUT) 等可写再续发，直到写完 /
+// 超过总 deadline / 出现真实错误。返回是否全部写完。
+// 自由函数以便脱离 HTTP 服务单测（socketpair，见 test_http_server 第 6 段）
+bool send_all_with_deadline(int client_fd, const char* data, size_t len,
+                            int write_deadline_ms,
+                            std::atomic<uint64_t>* eagain_count);
+
 // 请求处理器签名：接收请求体 JSON，返回响应内容（状态码 + 响应体）
 using RequestHandler = std::function<HttpReply(const std::string& request_body)>;
 
@@ -83,6 +90,13 @@ class HttpServer {
   size_t active_tasks() const { return pool_.active(); }
   size_t worker_threads() const { return pool_.size(); }
 
+  // 写路径上真正遇到 EAGAIN 的次数（原子计数，任意线程可读）。
+  // 用途：慢客户端回归测试用它证明"确实走到了非阻塞写要等待可写的分支"，
+  // 否则用例可能只是碰巧没触发 EAGAIN 而"通过"
+  uint64_t send_eagain_count() const {
+    return send_eagain_count_.load(std::memory_order_relaxed);
+  }
+
  private:
   // 创建非阻塞监听 socket
   int create_listen_socket();
@@ -101,6 +115,14 @@ class HttpServer {
 
   // 关闭并清理一个连接（从 epoll 摘除 + erase 状态 + close）
   void close_connection(int client_fd);
+
+  // 非阻塞 fd 上"写到底"：遇到 EAGAIN 用 poll(POLLOUT) 等可写再续发，
+  // 直到写完 / 超过 write_deadline_ms / 出现真实错误。
+  // 返回是否全部写完（false = 超时或出错，调用方负责 close）。
+  // 必须在 worker 里调用：它可能阻塞（这是慢客户端只会拖住一个 worker、
+  // 而不是像旧实现那样把响应截断的代价）
+  bool send_all(int client_fd, const char* data, size_t len,
+                int write_deadline_ms);
 
   // 用累积缓冲区判断请求是否完整并推进状态机；
   // 返回 true 表示该连接已被消费（提交线程池或已关闭），false 表示仍需等待更多数据
@@ -133,6 +155,9 @@ class HttpServer {
   std::list<std::pair<int, Connection>> conns_;
   std::unordered_map<int, std::list<std::pair<int, Connection>>::iterator>
       conn_index_;
+
+  // 写路径遇到 EAGAIN 的次数（worker 写，测试/metrics 读 -> 必须原子）
+  std::atomic<uint64_t> send_eagain_count_{0};
 };
 
 }  // namespace ai_gateway
