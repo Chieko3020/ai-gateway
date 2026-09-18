@@ -93,8 +93,11 @@ class HnswIndex {
     for (int lc = max_level_; lc > level; --lc)
       ep = search_layer(embedding, ep, 1, lc).top().id;
 
-    int M_max = 2 * cfg_.M;
-    int M_max0 = 2 * M_max;
+    // 对齐论文的连接上限：高层 M_max = M，0 层 M_max0 = 2M。
+    // 原实现放大到 2M / 4M 是"以密度换召回"的补偿；补上启发式剪枝与满时收缩后，
+    // 连接质量由剪枝保证，可以回到论文取值（图更稀疏、构建与检索更省）。
+    const int M_max = cfg_.M;
+    const int M_max0 = 2 * cfg_.M;
     for (int lc = std::min(level, max_level_); lc >= 0; --lc) {
       auto candidates = search_layer(embedding, ep, cfg_.ef_construction, lc);
       int max_conn = (lc == 0) ? M_max0 : M_max;
