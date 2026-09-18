@@ -23,7 +23,7 @@
 
 ### 技术特性
 - **并发模型**: 单 Reactor + 线程池，主线程管理连接，线程池处理缓存和 LLM 转发
-- **向量检索**: 简化实现的 HNSW 图索引（未实现启发剪枝），10K 向量内召回率 95%
+- **向量检索**: 简化实现的 HNSW 图索引（未实现启发剪枝）。**实测受限**：320 向量规模下自检索 top-1 成功率 30.9%、top-3 召回率 31.7%（见 `tests/recall_bench`），是当前命中率的主要瓶颈
 - **存储引擎**: LRU + TTL 缓存管理，JSON 持久化
 - **嵌入推理**: C++ ONNX Runtime 进程内 INT8 量化推理，零外部依赖
 - **模型量化**: `scripts/quantize.py` — HuggingFace → FP32 ONNX → 动态量化 INT8 (~90MB→~23MB)
@@ -224,26 +224,33 @@ API Key 通过 `config/gateway.env`（systemd `EnvironmentFile`）或环境变�
 ```bash
 cmake --build build --target test_filter test_lru_store test_request \
                                           test_response test_router \
-                                          test_stats
+                                          test_stats test_config
 
 for t in build/tests/test_*; do $t; done
-# 6/6 模块, 36/36 用例
+# 7/7 模块, 50/50 用例
+
+# HNSW 召回率基准（手动运行，不纳入 ctest）
+cmake --build build --target recall_bench
+./build/tests/recall_bench scripts/datasets/synthetic.jsonl model/model_int8.onnx model/vocab.txt
 ```
 
 ## 实测性能
 
-> 测试环境：Ubuntu 24.04, 2GB VPS, 1 vCPU, GCC 13.3 (-O2 -mavx2 -mfma)
-> 后端：DeepSeek v4-flash, Embedding：ONNX bge-small-zh-v1.5 INT8 (512d)
-> 测试数据：94 条中文用户消息 × 2 轮回放（10 语义簇）
+> 测试环境：本机 2 vCPU / 2GB 内存（**压测端与被测服务同机环回**，服务 `taskset -c 0`、压测端 `taskset -c 1`）
+> 后端：DeepSeek v4-flash（公网 API）；Embedding：ONNX bge-small-zh-v1.5 INT8 (512d)，进程内推理
+> 数据集：`scripts/datasets/synthetic.jsonl` 320 条（15 语义簇 × 20 条同义改写 + 20 条独立问题）、`scripts/datasets/real.jsonl` 92 条（真实提问），各 2 轮
+> 原始输出：`results/replay_synthetic.json`、`results/replay_real.json`
 
-| 指标 | 数值 | 说明 |
-|------|------|------|
-| 缓存命中率 | 89.9% | R1 84/94 + R2 85/94 (169/188) |
-| 命中延迟 | ~241ms | C++ ONNX 推理 + HNSW 检索 |
-| 未命中延迟 | ~1.3s | LLM API 端到端 |
-| 加速比 | 5.4x | 命中 vs 未命中 |
-| 费用节省 | ¥0.0378 | 430 请求累计节省 |
-| 二进制大小 | ~2.2MB | release build |
-| 网关 RSS | ~40MB | 含 INT8 ONNX 模型 (23MB) |
-| 代理延迟 | < 1ms | 不含 LLM/Embedding |
+| 指标 | 合成集 | 真实集 | 说明 |
+|------|--------|--------|------|
+| 命中率 R1 / R2 | 14.7% / 48.4% | 1.1% / 5.5% | 两轮合计 31.6% / 3.3% |
+| 命中延迟 p50 / p95 | 13ms / 16ms | 30ms / 44ms | 本地 ONNX 推理 + 图检索 |
+| 未命中延迟 p50 / p95 | 766ms / 1006ms | 674ms / 902ms | 含公网 LLM API 往返 |
+| 网关自身处理延迟 | < 1ms | < 1ms | 不含 LLM 与 Embedding |
+
+**命中率瓶颈定位**：`tests/recall_bench` 实测自研 HNSW 在 320 向量规模下
+**自检索 top-1 成功率仅 30.9%、top-3 召回率 31.7%**（相对暴力余弦检索的加速比也只有 1.42x）。
+第二轮使用与第一轮**字面完全相同**的消息，命中率仍只有 48.4%，与召回率同一量级——
+说明未命中主因是**图索引检索不到已缓存的向量**，而非缓存策略本身。
+改进方向：修复图构建（邻居选择与剪枝），或在万级规模以下直接使用暴力检索。
 
