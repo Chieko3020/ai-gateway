@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <format>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -185,32 +186,49 @@ static std::string handle_request(const std::string& request_body,
   }
 
   // 4c. 请求合并（singleflight）
+  // 本请求作为 leader 占用的槽位（insert 的返回值）；只有它有权 complete/cancel，
+  // 这样"等待超时后被新 leader 顶替"的旧 leader 不会误写别人的 promise
+  std::shared_ptr<std::promise<std::string>> sf_slot;
   if (!user_msg.empty() && !cached_embedding.empty()) {
     auto fut = sf->try_merge(ns_key, cached_embedding);
     if (fut.has_value()) {
       auto status = fut->wait_for(
           std::chrono::seconds(cfg.backend.timeout_seconds));
       if (status == std::future_status::ready) {
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t0);
-        stats->record_cache_hit(elapsed.count());
-        LOG_INFO("singleflight: merged key={}", ns_key);
-        return annotate_cache_status(fut->get(), "hit");
+        // 主请求失败/被取消时等待者会拿到 SingleflightCancelled（而不是
+        // broken_promise 触发的 std::future_error）：此时不共享结果、自己回源
+        std::string merged;
+        bool merged_ok = false;
+        try {
+          merged = fut->get();
+          merged_ok = true;
+        } catch (const std::exception& e) {
+          LOG_WARN("singleflight: leader failed ({}), fallback to upstream",
+                   e.what());
+        }
+        if (merged_ok) {
+          auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - t0);
+          stats->record_cache_hit(elapsed.count());
+          LOG_INFO("singleflight: merged key={}", ns_key);
+          return annotate_cache_status(merged, "hit");
+        }
+      } else {
+        LOG_DEBUG("singleflight: wait timeout for key={}", ns_key);
       }
-      LOG_DEBUG("singleflight: wait timeout for key={}", ns_key);
     }
-    sf->insert(ns_key, cached_embedding);
+    sf_slot = sf->insert(ns_key, cached_embedding);
   }
 
   // 4d. 缓存未命中 转发 LLM
   auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
                          request_body, cfg.backend.timeout_seconds);
 
-  // 4e. singleflight 完成/取消
+  // 4e. singleflight 完成/取消（仅当本请求仍是该 key 的 leader）
   bool ok = (result.status_code >= 200 && result.status_code < 300);
-  if (!ns_key.empty()) {
-    if (ok) sf->complete(ns_key, result.body);
-    else sf->cancel(ns_key);
+  if (sf_slot) {
+    if (ok) sf->complete(ns_key, result.body, sf_slot);
+    else sf->cancel(ns_key, sf_slot);
   }
 
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -348,8 +366,18 @@ int main(int argc, char* argv[]) {
 
   Singleflight flight_merge;
   server.set_handler([&](const std::string& body) {
-    return handle_request(body, cfg, filter.get(), engine.get(),
-                          &flight_merge, stats.get());
+    // 兜底：线程池 worker 里逃出的异常会直接 std::terminate 整个进程，
+    // 因此任何异常都必须在这里被拦住并转成一个普通错误响应
+    try {
+      return handle_request(body, cfg, filter.get(), engine.get(),
+                            &flight_merge, stats.get());
+    } catch (const std::exception& e) {
+      LOG_ERROR("request handler threw: {}", e.what());
+      return std::string(R"({"error":"Internal error"})");
+    } catch (...) {
+      LOG_ERROR("request handler threw non-std exception");
+      return std::string(R"({"error":"Internal error"})");
+    }
   });
 
   // ---- 5. 启动 ----
