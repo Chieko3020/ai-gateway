@@ -72,13 +72,24 @@ static std::string extract_user_message(const std::string& request_body) {
   return "";
 }
 
-// 判断请求是否属于"不可缓存流量"：带工具调用定义/结果的请求，或流式请求。
-// 这类请求与上下文强相关——缓存会丢失 tool_calls、或返回不适用答案，必须直接透传。
-static bool is_uncacheable_request(const std::string& request_body) {
+// 请求分类：旁路（tool 类）与拒绝（stream）是两件事，必须分开判定。
+// 旧实现把二者合并成一个 is_uncacheable_request()，于是 stream:true 也走
+// "转发给上游再把整段缓冲的 SSE 文本塞进 JSON 信封"的伪透传路径。
+static bool wants_stream(const std::string& request_body) {
+  try {
+    auto req = json::parse(request_body);
+    return req.contains("stream") && req.value("stream", false);
+  } catch (...) {}
+  return false;
+}
+
+// 工具调用类请求（tools/functions 定义、tool/function 角色的消息、tool_calls）：
+// 与上下文强相关，缓存会丢失 tool_calls 或返回不适用答案，因此不缓存、不参与合并，
+// 但仍然走输入/输出过滤并按上游状态码透传。
+static bool is_tool_request(const std::string& request_body) {
   try {
     auto req = json::parse(request_body);
     if (req.contains("tools") || req.contains("functions")) return true;
-    if (req.contains("stream") && req.value("stream", false)) return true;
     auto& msgs = req.at("messages");
     for (const auto& m : msgs) {
       auto role = m.value("role", "");
@@ -88,6 +99,22 @@ static bool is_uncacheable_request(const std::string& request_body) {
   } catch (...) {}
   return false;
 }
+
+// stream:true 明确拒绝，而不是"转发后当 JSON 回包"。
+//
+// 背景：真正的 SSE 透传需要 llm_client 增量回调、response 去掉 Content-Length
+// 并逐块下发、输出过滤按 SSE 事件边界判定（当前 llm_client 用 curl_easy_perform
+// 整段缓冲，response.cpp 恒发 Content-Length + Connection: close）。在透传落地
+// 之前，把 SSE 文本塞进 application/json 信封是"伪支持"：客户端解析失败且无法
+// 增量渲染。因此这里返回 400，把不可用变成可诊断。
+//
+// 这也是 DSH 的 LLM 层无法用本网关做 provider 的原因：@earendil-works/pi-ai 在
+// openai-completions API 里硬编码 stream: true
+// （~/.dsh/profiles/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js:587），
+// 于是它的每个请求都会命中这个分支。真透传是后续待办，
+// 见 research/personal/ai-gateway-backlog.md 第 1 节。
+static constexpr const char* kStreamUnsupported =
+    R"({"error":"streaming (stream=true) is not supported yet"})";
 
 // 在 OpenAI 响应体中注入缓存状态字段，供压测脚本精确判定是否命中；
 // 额外字段不影响下游对标准字段的解析。
@@ -103,7 +130,8 @@ static std::string annotate_cache_status(const std::string& body,
   }
 }
 
-// 网关自身生成的 JSON 响应（默认 200；拒绝类响应沿用既有口径，不改变状态码）
+// 网关自身生成的 JSON 响应（默认 200；拒绝类响应给出语义正确的状态码：
+// 输入被拒 400、上游内容被拦 502，见 handle_request）
 static HttpReply json_reply(std::string body, int status_code = 200) {
   return HttpReply{status_code, "application/json", std::move(body)};
 }
@@ -153,8 +181,15 @@ static HttpReply handle_request(const std::string& request_body,
       user_msg = f_result.sanitized;
   }
 
-  // 2. 不可缓存流量：带工具调用或流式的请求直接转发（不查缓存、不写缓存、不参与请求合并）
-  if (is_uncacheable_request(request_body)) {
+  // 2. stream:true：明确拒绝（不转发到上游）。
+  //    放在输入过滤之后，保证被拒请求同样经过安全过滤器。
+  if (wants_stream(request_body)) {
+    LOG_WARN("cache: reject (stream) stream=true not supported yet");
+    return json_reply(kStreamUnsupported, 400);
+  }
+
+  // 3. 工具调用类流量：不查缓存、不写缓存、不参与请求合并，但仍走双向过滤与状态码透传
+  if (is_tool_request(request_body)) {
     auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
                            request_body, cfg.backend.timeout_seconds);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -169,7 +204,7 @@ static HttpReply handle_request(const std::string& request_body,
       } catch (...) {}
     }
     stats->record_bypass(elapsed.count(), pt, ct);
-    LOG_INFO("cache: bypass (tool/stream) status={} {}ms",
+    LOG_INFO("cache: bypass (tool) status={} {}ms",
              result.status_code, elapsed.count());
 
     auto out_result = filter->check_output(result.body);
@@ -184,7 +219,7 @@ static HttpReply handle_request(const std::string& request_body,
   // 缓存命中检查时带回的 embedding（避免 cache_reply 重复计算）
   std::vector<float> cached_embedding;
 
-  // 3. 语义缓存
+  // 4. 语义缓存
   std::string ns;
   std::string ns_key;
   if (cfg.cache.enabled && !user_msg.empty()) {
@@ -207,7 +242,7 @@ static HttpReply handle_request(const std::string& request_body,
     cached_embedding = std::move(hit.embedding);
   }
 
-  // 4. 请求合并（singleflight）
+  // 5. 请求合并（singleflight）
   // 本请求作为 leader 占用的槽位（insert 的返回值）；只有它有权 complete/cancel，
   // 这样"等待超时后被新 leader 顶替"的旧 leader 不会误写别人的 promise
   std::shared_ptr<std::promise<std::string>> sf_slot;
@@ -242,11 +277,11 @@ static HttpReply handle_request(const std::string& request_body,
     sf_slot = sf->insert(ns_key, cached_embedding);
   }
 
-  // 5. 缓存未命中 转发 LLM
+  // 6. 缓存未命中 转发 LLM
   auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
                          request_body, cfg.backend.timeout_seconds);
 
-  // 6. singleflight 完成/取消（仅当本请求仍是该 key 的 leader）
+  // 7. singleflight 完成/取消（仅当本请求仍是该 key 的 leader）
   bool ok = (result.status_code >= 200 && result.status_code < 300);
   if (sf_slot) {
     if (ok) sf->complete(ns_key, result.body, sf_slot);
@@ -256,7 +291,7 @@ static HttpReply handle_request(const std::string& request_body,
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t0);
 
-  // 7. 解析 token 用量
+  // 8. 解析 token 用量
   int prompt_tokens = 0, completion_tokens = 0;
   if (result.status_code >= 200 && result.status_code < 300) {
     try {
@@ -267,12 +302,12 @@ static HttpReply handle_request(const std::string& request_body,
     } catch (...) {}
   }
 
-  // 8. 写入缓存
+  // 9. 写入缓存
   if (ok && cfg.cache.enabled && !user_msg.empty())
     engine->cache_reply(user_msg, result.body, cached_embedding,
                         extract_namespace(request_body));
 
-  // 9. 统计
+  // 10. 统计
   stats->record_api_call(elapsed.count(), prompt_tokens, completion_tokens);
 
   if (ok)
@@ -281,7 +316,7 @@ static HttpReply handle_request(const std::string& request_body,
     LOG_WARN("{} {} {}ms", result.status_code,
              result.body.size() > 0 ? result.body : "(empty)", elapsed.count());
 
-  // 10. 输出过滤
+  // 11. 输出过滤
   auto out_result = filter->check_output(result.body);
   if (out_result.action == FilterAction::kReject) {
     LOG_WARN("filter: rejected output containing URL");

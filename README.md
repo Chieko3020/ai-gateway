@@ -21,6 +21,16 @@
 - **命名空间隔离**: 不同 system prompt 缓存自动隔离，防止不同对话交叉污染
 - **定时持久化**: 每 60 秒自动保存缓存到磁盘，意外宕机不丢数据
 
+### 请求能力的边界
+
+- **流式（`stream: true`）暂不支持**：网关返回 `400` + `{"error":"streaming (stream=true) is not supported yet"}`，不转发到上游。
+  上游 SSE 需要增量下发与按事件边界的输出过滤，而当前 `llm_client` 用 `curl_easy_perform` 整段缓冲、响应侧恒发
+  `Content-Length` + `Connection: close`；在透传实现落地前把 SSE 文本装进 `application/json` 信封属于"伪支持"
+  （客户端既解析不出 choices、也无法增量渲染）。因此改为显式拒绝。使用 `stream: true` 的客户端（例如 DSH 的
+  `pi-ai` 层在 openai-completions 里硬编码 `stream: true`）在透传实现前无法把本网关当作 provider。
+- **工具调用类请求（`tools` / `functions` / `tool` 角色 / `tool_calls` / `function_call`）走旁路**：不查缓存、
+  不写缓存、不参与请求合并，但**仍执行输入/输出安全过滤**，并按上游状态码原样透传。
+
 ### 技术特性
 - **并发模型**: 单 Reactor + 线程池，主线程管理连接，线程池处理缓存和 LLM 转发
 - **向量检索**: 按论文实现 HNSW 图索引（分层结构、几何分布层数、启发式邻居选择、邻居满时收缩重选）。实测（见 `tests/recall_bench`）：320 向量下自检索 top-1 **99.4%**、top-3 召回率 99.7%；1000 / 5000 / 10000 向量下自检索 top-1 均为 **100%**，top-3 召回率 99.7% / 93.8% / 81.7%（`ef_search=50` 固定时规模增大导致束搜索覆盖不足，属 HNSW 固有特性；缓存只需 top-1，故不影响命中），相对暴力检索加速比 1.16x / 2.74x / 4.75x
