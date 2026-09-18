@@ -2,6 +2,8 @@
 #include "stats/stats.h"
 
 #include <algorithm>
+#include <array>
+#include <vector>
 
 #include "common/logger.h"
 
@@ -10,6 +12,7 @@ namespace ai_gateway {
 void Stats::record_api_call(int64_t latency_ms,
                              int prompt_tokens, int completion_tokens) {
   std::lock_guard lock(mutex_);
+  push_latency(latency_ms);
   ++total_;
   ++misses_;
   total_prompt_tokens_ += prompt_tokens;
@@ -23,6 +26,7 @@ void Stats::record_api_call(int64_t latency_ms,
 
 void Stats::record_cache_hit(int64_t latency_ms) {
   std::lock_guard lock(mutex_);
+  push_latency(latency_ms);
   ++total_;
   ++hits_;
 
@@ -40,11 +44,29 @@ void Stats::record_cache_hit(int64_t latency_ms) {
 void Stats::record_bypass(int64_t latency_ms,
                           int prompt_tokens, int completion_tokens) {
   std::lock_guard lock(mutex_);
+  push_latency(latency_ms);
   // 刻意不增加 total_：旁路流量不参与命中率计算
   ++bypassed_;
   total_prompt_tokens_ += prompt_tokens;
   total_completion_tokens_ += completion_tokens;
   bypass_latency_us_ += latency_ms * 1000;
+}
+
+void Stats::push_latency(int64_t ms) {
+  latency_ring_[ring_pos_] = ms;
+  ring_pos_ = (ring_pos_ + 1) % kLatencyWindow;
+  if (ring_count_ < kLatencyWindow) ++ring_count_;
+}
+
+int64_t Stats::percentile(double p) const {
+  if (ring_count_ == 0) return 0;
+  std::vector<int64_t> xs(latency_ring_.begin(),
+                          latency_ring_.begin() + static_cast<long>(ring_count_));
+  std::sort(xs.begin(), xs.end());
+  double idx = (p / 100.0) * static_cast<double>(xs.size() - 1);
+  size_t i = static_cast<size_t>(idx < 0 ? 0 : idx);
+  if (i >= xs.size()) i = xs.size() - 1;
+  return xs[i];
 }
 
 void Stats::report() const {
@@ -54,13 +76,15 @@ void Stats::report() const {
   double saved = estimated_saved();
   LOG_INFO("[STATS] requests={} hits={} misses={} hit_rate={:.1f}% bypassed={} "
            "tokens={} saved={} cost=¥{:.4f} saved=¥{:.4f} "
-           "avg={}ms min={}ms max={}ms bypass_avg={}ms",
+           "avg={}ms min={}ms max={}ms p50={}ms p95={}ms p99={}ms "
+           "bypass_avg={}ms samples={}",
            total_, hits_, misses_, hit_rate() * 100, bypassed_,
            total_prompt_tokens_ + total_completion_tokens_,
            tokens_saved_,
            estimated_cost(), saved,
            avg_latency_ms(), min_latency_, max_latency_,
-           avg_bypass_latency_ms());
+           percentile(50), percentile(95), percentile(99),
+           avg_bypass_latency_ms(), ring_count_);
 }
 
 double Stats::hit_rate() const {

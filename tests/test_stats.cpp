@@ -42,6 +42,17 @@ int main() {
     ok++;
   }
 
-  std::cout << "test_stats: " << ok << "/12 passed\n";
+  // 延迟分位数：环形窗口（延迟样本 1..100ms）
+  {
+    Stats q;
+    for (int i = 1; i <= 100; ++i) q.record_api_call(i, 0, 0);
+    assert(q.latency_samples() == 100); ok++;
+    assert(q.percentile(0) == 1); ok++;
+    assert(q.percentile(50) >= 49 && q.percentile(50) <= 51); ok++;
+    assert(q.percentile(95) >= 94 && q.percentile(95) <= 96); ok++;
+    assert(q.percentile(100) == 100); ok++;
+  }
+
+  std::cout << "test_stats: " << ok << "/17 passed\n";
   return 0;
 }

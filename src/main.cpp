@@ -104,10 +104,16 @@ static std::string annotate_cache_status(const std::string& body,
 
 // 线程安全的关闭标志与后台线程唤醒机制
 static std::atomic<bool> g_shutdown{false};
+static std::atomic<bool> g_dump_stats{false};  // SIGUSR1 置位，由后台线程输出统计
 static std::mutex g_bg_mutex;
 static std::condition_variable g_bg_cv;
 
-void handle_signal(int /*sig*/) {
+void handle_signal(int sig) {
+  if (sig == SIGUSR1) {
+    // 按需导出统计：信号处理器里只置标志（report() 会加锁+写日志，不是 async-signal-safe）
+    g_dump_stats.store(true, std::memory_order_release);
+    return;
+  }
   g_shutdown.store(true, std::memory_order_release);
 }
 
@@ -302,6 +308,8 @@ int main(int argc, char* argv[]) {
   sa.sa_flags = SA_RESTART;
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
+  // SIGUSR1：按需导出统计到日志（`kill -USR1 <pid>`，最迟 60s 由后台线程输出）
+  sigaction(SIGUSR1, &sa, nullptr);
 
   // ---- 3. 启动定期统计 + 定时持久化线程 ----
   std::thread bg_thread([stats, lru, idx, engine, &cfg] {
@@ -312,6 +320,8 @@ int main(int argc, char* argv[]) {
                          [] { return g_shutdown.load(std::memory_order_acquire); });
       }
       if (g_shutdown.load(std::memory_order_acquire)) break;
+      if (g_dump_stats.exchange(false, std::memory_order_acq_rel))
+        LOG_INFO("stats dump requested by SIGUSR1");
       stats->report();
       if (cfg.cache.enabled) engine->try_rebuild_if_ghosty();
       // 主动清理过期条目：避免失效条目长期占用内存，并让落盘内容只含有效条目

@@ -1,6 +1,7 @@
 // 请求统计：缓存命中率、token 消耗、费用估算
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -53,7 +54,16 @@ class Stats {
   int64_t max_latency_ms() const;
   int64_t avg_bypass_latency_ms() const;
 
+  // 延迟分位数（p 取 0~100），基于最近 kLatencyWindow 次请求的样本窗口
+  // 不加锁：与 avg_latency_ms() 一致，仅供已持锁的 report() 调用
+  int64_t percentile(double p) const;
+  size_t latency_samples() const { std::shared_lock lock(mutex_); return ring_count_; }
+
  private:
+  // 延迟样本环形缓冲：内存占用固定，分位数反映"最近 N 次请求"而非全历史
+  static constexpr size_t kLatencyWindow = 1024;
+  void push_latency(int64_t ms);  // 调用者需持锁
+
   mutable std::shared_mutex mutex_;
   size_t total_ = 0;
   size_t hits_ = 0;
@@ -68,6 +78,10 @@ class Stats {
   int64_t bypass_latency_us_ = 0;
   int64_t max_latency_ = 0;
   int64_t min_latency_ = INT64_MAX;
+
+  std::array<int64_t, kLatencyWindow> latency_ring_{};
+  size_t ring_pos_ = 0;
+  size_t ring_count_ = 0;
 };
 
 }  // namespace ai_gateway
