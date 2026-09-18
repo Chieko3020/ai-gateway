@@ -49,6 +49,20 @@ class OnnxEmbedding {
   bool ready() const { return session_ != nullptr; }
   std::vector<float> encode(std::string_view text);
 
+  // 构造失败的原因：调用方据此决定"降级继续"还是"启动即失败"
+  enum class LoadError {
+    kNone = 0,           // 就绪
+    kUnavailable,        // 模型/词表不存在或 ORT 失败 -> 可降级为精确匹配
+    kDimensionMismatch,  // 模型可加载但输出维度 != 配置 -> 配置错误，启动即失败
+  };
+  LoadError load_error() const { return load_error_; }
+
+  // 模型的真实输出维度（构造期探测得到；未就绪时为 0）。
+  // 与构造参数 dims 不符时构造失败（ready()==false），不静默截断
+  int output_dim() const { return output_dim_; }
+  // 配置里期望的维度
+  int dims() const { return dims_; }
+
  private:
   static const OrtApi* g_api_;  // 进程级单例
   OrtSession* session_ = nullptr;
@@ -56,6 +70,8 @@ class OnnxEmbedding {
   OrtMemoryInfo* mem_info_ = nullptr;
   GreedyTokenizer tokenizer_;
   int dims_ = 512;
+  int output_dim_ = 0;  // 模型实际输出维度（探测得到）
+  LoadError load_error_ = LoadError::kNone;
 };
 
 }  // namespace ai_gateway

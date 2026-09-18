@@ -76,6 +76,7 @@ OnnxEmbedding::OnnxEmbedding(const std::string& model_path,
   // 加载 Tokenizer
   if (!tokenizer_.load(vocab_path)) {
     LOG_ERROR("onnx: tokenizer load failed: {}", vocab_path);
+    load_error_ = LoadError::kUnavailable;
     return;
   }
   LOG_INFO("onnx: tokenizer loaded, vocab={}", tokenizer_.size());
@@ -87,6 +88,7 @@ OnnxEmbedding::OnnxEmbedding(const std::string& model_path,
   });
   if (!g_api_) {
     LOG_ERROR("onnx: OrtGetApiBase failed");
+    load_error_ = LoadError::kUnavailable;
     return;
   }
 
@@ -95,6 +97,7 @@ OnnxEmbedding::OnnxEmbedding(const std::string& model_path,
   if (status) {
     LOG_ERROR("onnx: CreateEnv: {}", g_api_->GetErrorMessage(status));
     g_api_->ReleaseStatus(status);
+    load_error_ = LoadError::kUnavailable;
     return;
   }
 
@@ -112,6 +115,7 @@ OnnxEmbedding::OnnxEmbedding(const std::string& model_path,
     LOG_ERROR("onnx: CreateSession: {}", g_api_->GetErrorMessage(status));
     g_api_->ReleaseStatus(status);
     session_ = nullptr;
+    load_error_ = LoadError::kUnavailable;
     return;
   }
 
@@ -119,9 +123,37 @@ OnnxEmbedding::OnnxEmbedding(const std::string& model_path,
   if (status) {
     LOG_ERROR("onnx: CreateCpuMemoryInfo: {}", g_api_->GetErrorMessage(status));
     g_api_->ReleaseStatus(status);
+    load_error_ = LoadError::kUnavailable;
     return;
   }
-  LOG_INFO("onnx: model loaded dims={}", dims_);
+  // 用一次探测推理拿到模型的**真实**输出维度。
+  // 关键：探测时把 dims_ 临时放到"不可能被截断"的极大值，否则 encode() 里的
+  // min(dims_, out_dim) 会让"配置 256 的模型输出 512"被截成 256，探测结果就变成
+  // 配置值本身（自证式校验，什么也验证不了——这正是旧日志"dims=512"的由来）
+  // 旧行为：不符时静默截断，日志还照打配置值（报告 M15）
+  const int saved_dims = dims_;
+  dims_ = 1 << 20;
+  auto probe = encode("dimension probe");
+  dims_ = saved_dims;
+  if (probe.empty()) {
+    LOG_ERROR("onnx: probe encode failed, refusing to use {}", model_path);
+    g_api_->ReleaseSession(session_);
+    session_ = nullptr;
+    load_error_ = LoadError::kUnavailable;
+    return;
+  }
+  output_dim_ = static_cast<int>(probe.size());
+  LOG_INFO("onnx: model loaded configured_dim={} model_output_dim={}",
+           dims_, output_dim_);
+  if (output_dim_ != dims_) {
+    LOG_ERROR("onnx: model output dim {} != configured embedding.dim {}, "
+              "refusing to load (the index would silently drop every vector)",
+              output_dim_, dims_);
+    g_api_->ReleaseSession(session_);
+    session_ = nullptr;
+    load_error_ = LoadError::kDimensionMismatch;
+    return;
+  }
 }
 
 OnnxEmbedding::~OnnxEmbedding() {
@@ -229,7 +261,8 @@ std::vector<float> OnnxEmbedding::encode(std::string_view text) {
     return {};
   }
 
-  // 沿序列长度做均值池化，维度取 min(dims_, out_dim) 对齐实际模型输出
+  // 沿序列长度做均值池化。构造期已保证 dims_ == 模型实际输出维度，
+  // 因此这里的 min() 不会真的截断（保留以防御性处理异常模型）
   int effective_dim = std::min(dims_, out_dim);
   std::vector<float> result(effective_dim, 0.0f);
   for (int64_t t = 0; t < seq_len; ++t) {

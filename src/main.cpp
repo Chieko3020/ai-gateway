@@ -441,17 +441,17 @@ int main(int argc, char* argv[]) {
   auto onnx_embed = std::make_shared<OnnxEmbedding>(
       cfg.embedding.model_path, cfg.embedding.vocab_path, cfg.embedding.dim);
 
-  // 维度不符必须启动即失败：OnnxEmbedding 内部对超出模型输出的维度会做
-  // min(dims, out_dim) 截断，静默截断会让索引维度与配置声明不一致
-  if (onnx_embed->ready()) {
-    auto probe = onnx_embed->encode("dimension probe");
-    if (static_cast<int>(probe.size()) != cfg.embedding.dim) {
-      LOG_ERROR("embedding.dim={} does not match model output dim={} "
-                "({})", cfg.embedding.dim, probe.size(),
-                cfg.embedding.model_path);
-      return static_cast<int>(ErrorCode::kConfigError);
-    }
-  } else {
+  // 维度不符属配置错误：启动即失败（旧实现按 min(dims, out_dim) 静默截断，
+  // 索引维度与配置声明不一致且没有任何告警，报告 M15）。
+  // 模型文件缺失等不可用情形仍降级为精确匹配，避免"没有模型就不能跑"
+  if (onnx_embed->load_error() ==
+      OnnxEmbedding::LoadError::kDimensionMismatch) {
+    LOG_ERROR("embedding.dim={} does not match {} (model output dim={}), "
+              "fix config or model", cfg.embedding.dim,
+              cfg.embedding.model_path, onnx_embed->output_dim());
+    return static_cast<int>(ErrorCode::kConfigError);
+  }
+  if (!onnx_embed->ready()) {
     LOG_WARN("onnx embedding unavailable ({}), semantic cache degrades to "
              "exact match", cfg.embedding.model_path);
   }
