@@ -116,6 +116,27 @@ size_t LruStore::size() const {
   return lru_.size();
 }
 
+size_t LruStore::purge_expired() {
+  std::lock_guard lock(mutex_);
+  if (ttl_seconds_ <= 0) return 0;  // 0 表示永不过期
+
+  auto now = Clock::now();
+  size_t purged = 0;
+  for (auto it = lru_.begin(); it != lru_.end();) {
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+        now - it->ctime).count();
+    if (age >= ttl_seconds_) {
+      iter_map_.erase(it->key);
+      it = lru_.erase(it);
+      ++purged;
+      ++expired_count_;
+    } else {
+      ++it;
+    }
+  }
+  return purged;
+}
+
 void LruStore::expire_one(const std::string& key) {
   // 调用者已持有 mutex 不需要重复上锁
   auto it = iter_map_.find(key);

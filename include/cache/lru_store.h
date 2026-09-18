@@ -51,6 +51,11 @@ class LruStore {
       const std::function<void(const std::string&,
                                const std::vector<float>&)>& fn) const;
 
+  // 主动清理所有过期条目，返回清理数量
+  // 用途：定时维护与持久化前调用——避免失效条目长期占用内存，
+  //       并让 size() 与落盘文件只反映仍然有效的条目
+  size_t purge_expired();
+
   // 持久化：保存到 JSON 文件
   bool save(const std::string& path) const;
 

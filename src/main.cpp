@@ -224,9 +224,19 @@ int main(int argc, char* argv[]) {
   // 从磁盘恢复缓存
   if (cfg.cache.enabled) {
     lru->load("cache/lru_store.json");
+    // 加载后立即清理过期条目：落盘时仍有效、此后超过 TTL 的条目不应继续占用内存与索引
+    size_t purged_on_load = lru->purge_expired();
     // 索引由 LruStore 重建，无需独立加载;
     engine->rebuild_index();
-    LOG_INFO("cache restored: {} entries, {} vectors", lru->size(), idx->size());
+    if (lru->size() == 0) {
+      LOG_INFO("cache restored: 0 entries (缓存为空或条目均已超过 ttl_days={})",
+               cfg.cache.ttl_days);
+    } else {
+      LOG_INFO("cache restored: {} entries, {} vectors{}", lru->size(), idx->size(),
+               purged_on_load > 0
+                   ? std::format(", {} expired purged", purged_on_load)
+                   : "");
+    }
   }
 
   struct sigaction sa{};
@@ -246,6 +256,16 @@ int main(int argc, char* argv[]) {
       if (g_shutdown.load(std::memory_order_acquire)) break;
       stats->report();
       if (cfg.cache.enabled) engine->try_rebuild_if_ghosty();
+      // 主动清理过期条目：避免失效条目长期占用内存，并让落盘内容只含有效条目
+      if (cfg.cache.enabled) {
+        size_t purged = lru->purge_expired();
+        if (purged > 0) {
+          // HNSW 无删除接口：清理后重建索引，保持索引与 LruStore 一致
+          engine->rebuild_index();
+          LOG_INFO("cache: purged {} expired entries, {} remaining", purged,
+                   lru->size());
+        }
+      }
       // 定期持久化缓存，避免宕机丢了cache
       if (cfg.cache.enabled && lru->size() > 0) {
         lru->save("cache/lru_store.json");
@@ -274,9 +294,11 @@ int main(int argc, char* argv[]) {
   if (bg_thread.joinable()) bg_thread.join();
   stats->report();
   if (cfg.cache.enabled) {
+    size_t purged = lru->purge_expired();
     lru->save("cache/lru_store.json");
     // 持久化空桩（HNSW 索引通过 LruStore 重建）;
-    LOG_INFO("cache persisted: {} entries, {} vectors", lru->size(), idx->size());
+    LOG_INFO("cache persisted: {} entries, {} vectors{}", lru->size(), idx->size(),
+             purged > 0 ? std::format(", {} expired purged", purged) : "");
   }
   LOG_INFO("cache hits={} misses={} hit_rate={:.1f}%",
            stats->cache_hits(), stats->cache_misses(),

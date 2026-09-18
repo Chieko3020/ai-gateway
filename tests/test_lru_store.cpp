@@ -28,6 +28,30 @@ int main() {
     assert(s.hit_count() >= 1); ok++;
     assert(s.evict_count() >= 1); ok++;
 
-    std::cout << "test_lru_store: " << ok << "/5 passed\n";
+    // purge_expired：主动清理过期条目，且未过期时不误删
+    {
+        LruStore p(10, 1);  // 10条, 1s TTL
+        p.put("k1", "v1");
+        p.put("k2", "v2");
+        assert(p.size() == 2);
+        assert(p.purge_expired() == 0); ok++;  // 未过期：不清理
+
+        auto dl = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < dl && p.purge_expired() == 0) {
+            std::this_thread::sleep_for(200ms);
+        }
+        assert(p.size() == 0); ok++;             // 过期后全部清理
+        assert(p.expired_count() >= 2); ok++;    // 计入过期统计
+    }
+
+    // purge_expired：ttl=0（永不过期）时不清任何条目
+    {
+        LruStore q(10, 0);
+        q.put("k", "v");
+        assert(q.purge_expired() == 0); ok++;
+        assert(q.size() == 1); ok++;
+    }
+
+    std::cout << "test_lru_store: " << ok << "/10 passed\n";
     return 0;
 }
