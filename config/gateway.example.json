@@ -3,7 +3,7 @@
     "port": 9000,
     "max_body_bytes": 20971520,
     "max_connections": 256,
-    "idle_timeout_seconds": 10
+    "idle_timeout_seconds": 30
   },
   "backend": {
     "url": "https://api.deepseek.com/v1/chat/completions",

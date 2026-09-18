@@ -46,7 +46,7 @@ int main() {
         GatewayConfig def;
         CHECK(def.filter.max_output_chars == 0); ok++;
         CHECK(def.server.max_connections == 256); ok++;
-        CHECK(def.server.idle_timeout_seconds == 10); ok++;
+        CHECK(def.server.idle_timeout_seconds == 30); ok++;
         CHECK(def.embedding.dim == 512); ok++;
         CHECK(def.log.sample_every == 1); ok++;
     }

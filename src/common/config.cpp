@@ -49,7 +49,7 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       out.server.port = s.value("port", 9000);
       out.server.max_body_bytes = s.value("max_body_bytes", 20 * 1024 * 1024ull);
       out.server.max_connections = s.value("max_connections", size_t{256});
-      out.server.idle_timeout_seconds = s.value("idle_timeout_seconds", 10);
+      out.server.idle_timeout_seconds = s.value("idle_timeout_seconds", 30);
       out.server.max_header_bytes = s.value("max_header_bytes", size_t{65536});
     }
 

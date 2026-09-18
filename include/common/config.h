@@ -14,8 +14,10 @@ struct ServerConfig {
   // 并发连接上限：超出时对新连接直接回 503 并关闭，避免 fd 被耗尽后 accept 全面失败
   size_t max_connections = 256;
   // 单连接空闲超时（秒）：超时未收到任何新字节即关闭。
-  // 没有这个上限时，"只发一半请求就半关闭写端"的连接会永久驻留 fd 与缓冲区（报告 H5）
-  int idle_timeout_seconds = 10;
+  // 没有这个上限时，"只发一半请求就半关闭写端"的连接会永久驻留 fd 与缓冲区（报告 H5）。
+  // 取 30s：真实客户端的首字节与慢速上传都可能停顿数秒，默认值过小会误杀正常请求
+  // （半关闭与已收齐的请求不依赖它——分别在 EOF 与提交时立刻处理）
+  int idle_timeout_seconds = 30;
   // 头部区段最大字节数（slowloris 防护）
   size_t max_header_bytes = 65536;
 };

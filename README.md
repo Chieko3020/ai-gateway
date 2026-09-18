@@ -230,7 +230,7 @@ sudo systemctl enable --now ai-gateway
 | `filter.max_output_chars` | 0 | 输出最大字符（0 = 不截断） |
 | `filter.block_urls` | true | 拦截 URL |
 | `server.max_connections` | 256 | 并发连接上限（超出回 503） |
-| `server.idle_timeout_seconds` | 10 | 连接空闲超时（秒） |
+| `server.idle_timeout_seconds` | 30 | 连接空闲超时（秒） |
 | `log.sample_every` | 1 | 每请求 INFO 采样率（1 = 全量，N = 每 N 条留 1 条） |
 
 API Key 通过 `config/gateway.env`（systemd `EnvironmentFile`）或环境变量 `LLM_API_KEY` 注入。
