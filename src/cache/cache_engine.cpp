@@ -1,12 +1,38 @@
 // 缓存协调器实现
 #include "cache/cache_engine.h"
 
+#include <algorithm>
 #include <cmath>
 #include <format>
+#include <string_view>
 
 #include "common/logger.h"
 
 namespace ai_gateway {
+
+namespace {
+
+// 从缓存键 "[ns:]msg:N" 中解析出编号 N。
+// 解析失败返回 false（调用方按"没有编号"处理，不会因此回退 next_id_）
+bool parse_msg_id(const std::string& key, int64_t& out) {
+  constexpr std::string_view kTag = "msg:";
+  auto pos = key.rfind(kTag);
+  if (pos == std::string::npos) return false;
+  // 前缀必须是空串或形如 "<ns>:"，避免把用户消息自带的 "msg:" 误当成缓存键编号
+  if (pos != 0 && key[pos - 1] != ':') return false;
+  auto digits = key.substr(pos + kTag.size());
+  if (digits.empty()) return false;
+  int64_t value = 0;
+  for (char c : digits) {
+    if (c < '0' || c > '9') return false;
+    if (value > (int64_t{1} << 40)) return false;  // 异常长的数字：放弃解析
+    value = value * 10 + (c - '0');
+  }
+  out = value;
+  return true;
+}
+
+}  // namespace
 
 CacheEngine::CacheEngine(const EmbeddingConfig& emb_cfg,
                          const CacheConfig& cache_cfg,
@@ -106,24 +132,32 @@ void CacheEngine::rebuild_index() {
   //    整个过程持 mutex_ 会让检索与写入全部阻塞，因此先构建、再交换。
   auto new_index_ptr = std::make_shared<HnswIndex>();
   auto& new_idx = *new_index_ptr;
-  int64_t new_id = 1;
 
+  // next_id_ 不能由"存活条目数 + 1"派生：TTL 是逐条过期的，存活键的空间里存在空洞，
+  // 退回的编号会让新条目复用仍然存活的键 msg:N（旧索引节点仍指向该键，于是用旧问题
+  // 的向量检索会命中旧节点、却取回新问题的答案）。这里取"存活键里 max(N) + 1"，
+  // 保证新编号只前进、不与任何存活键冲突。
+  int64_t max_id = 0;
   store_->for_each_embedding(
       [&](const std::string& key, const std::vector<float>& emb) {
-        new_idx.add(new_id, key, emb);
-        ++new_id;
+        int64_t id = 0;
+        if (parse_msg_id(key, id) && id > max_id) max_id = id;
+        new_idx.add(static_cast<int>(id), key, emb);
       });
 
   // 2. 短临界区交换：与 try_hit 的取副本、cache_reply 的 add 互斥
+  //    （日志用的两个值都在临界区内取出，避免锁外读 next_id_ 的竞争）
   size_t vectors = 0;
+  int64_t next_id = 0;
   {
     std::lock_guard lock(mutex_);
     index_ = std::move(new_index_ptr);
-    next_id_ = new_id;
+    next_id_ = std::max(next_id_, max_id + 1);  // 单调不回退
     vectors = index_->size();
+    next_id = next_id_;
   }
 
-  LOG_INFO("cache: index rebuilt, {} vectors", vectors);
+  LOG_INFO("cache: index rebuilt, {} vectors, next_id={}", vectors, next_id);
 }
 
 std::pair<int, size_t> CacheEngine::ghost_stats() const {
