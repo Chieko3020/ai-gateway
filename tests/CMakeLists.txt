@@ -21,6 +21,10 @@ target_link_libraries(test_router ai_gateway_server ai_gateway_common)
 add_executable(test_lru_store test_lru_store.cpp)
 target_link_libraries(test_lru_store ai_gateway_cache ai_gateway_common)
 
+# HNSW 召回率基准（手动运行，不纳入 ctest）
+add_executable(recall_bench recall_bench.cpp)
+target_link_libraries(recall_bench ai_gateway_cache ai_gateway_common nlohmann_json::nlohmann_json)
+
 
 # Module 4: stats
 add_executable(test_stats test_stats.cpp)
