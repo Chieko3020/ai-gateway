@@ -239,18 +239,22 @@ cmake --build build --target recall_bench
 > 测试环境：本机 2 vCPU / 2GB 内存（**压测端与被测服务同机环回**，服务 `taskset -c 0`、压测端 `taskset -c 1`）
 > 后端：DeepSeek v4-flash（公网 API）；Embedding：ONNX bge-small-zh-v1.5 INT8 (512d)，进程内推理
 > 数据集：`scripts/datasets/synthetic.jsonl` 320 条（15 语义簇 × 20 条同义改写 + 20 条独立问题）、`scripts/datasets/real.jsonl` 92 条（真实提问），各 2 轮
-> 原始输出：`results/replay_synthetic.json`、`results/replay_real.json`
+> 原始输出：`results/replay_synthetic_fixed.json`、`results/replay_real_fixed.json`（HNSW 修复前：`replay_synthetic.json`、`replay_real.json`）
 
 | 指标 | 合成集 | 真实集 | 说明 |
 |------|--------|--------|------|
-| 命中率 R1 / R2 | 14.7% / 48.4% | 1.1% / 5.5% | 两轮合计 31.6% / 3.3% |
-| 命中延迟 p50 / p95 | 13ms / 16ms | 30ms / 44ms | 本地 ONNX 推理 + 图检索 |
-| 未命中延迟 p50 / p95 | 766ms / 1006ms | 674ms / 902ms | 含公网 LLM API 往返 |
+| 命中率 R1 / R2 | 25.6% / **100.0%** | 15.4% / **100.0%** | 两轮合计 62.8% / 57.7% |
+| 命中延迟 p50 / p95 | 13ms / 18ms | 22ms / 51ms | 本地 ONNX 推理 + 图检索 |
+| 未命中延迟 p50 | 808ms | 731ms | 含公网 LLM API 往返 |
 | 网关自身处理延迟 | < 1ms | < 1ms | 不含 LLM 与 Embedding |
 
-**命中率瓶颈定位**：`tests/recall_bench` 实测自研 HNSW 在 320 向量规模下
-**自检索 top-1 成功率仅 30.9%、top-3 召回率 31.7%**（相对暴力余弦检索的加速比也只有 1.42x）。
-第二轮使用与第一轮**字面完全相同**的消息，命中率仍只有 48.4%，与召回率同一量级——
-说明未命中主因是**图索引检索不到已缓存的向量**，而非缓存策略本身。
-改进方向：修复图构建（邻居选择与剪枝），或在万级规模以下直接使用暴力检索。
+**读法**：R1 是"首次提问"——每个语义簇的首条必然未命中，同义改写还要跨过
+`similarity_threshold`（默认 0.8）才算命中，因此 R1 反映的是**语义匹配的严格程度**；
+R2 是"重复提问"，命中率 100% 说明**缓存写入与检索链路完全正常**。
+
+**HNSW 召回修复（本次重测的主要产出）**：修复前 `tests/recall_bench` 实测自研 HNSW 在 320 向量规模下
+**自检索 top-1 仅 30.9%、top-3 召回率 31.7%**，导致 R2 命中率被压在 48.4%（字面完全相同的消息也检索不回来）。
+根因是**邻居饱和时直接放弃反向连接**，使大量节点没有入边、在图中不可达（缺失论文的启发式剪枝）。
+补上 `SELECT-NEIGHBORS-HEURISTIC`（多样性筛选）与**满时收缩重选**后：
+**自检索 top-1 30.9% → 99.4%、top-3 召回率 31.7% → 99.6%**，R2 命中率随之升到 100%。
 
