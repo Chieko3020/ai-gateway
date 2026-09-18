@@ -344,7 +344,8 @@ int main(int argc, char* argv[]) {
 
   // ---- 5. 启动 ----
   LOG_INFO("ai-gateway starting on :{}, backend={}", cfg.server.port, cfg.backend.url);
-  server.run();
+  // 传入关闭标志：否则 SIGTERM/SIGINT 只置位而无人检查，优雅退出（保存缓存）永不执行
+  server.run(&g_shutdown);
 
   // ---- 6. 清理：保存缓存 + 统计 ----
   g_shutdown.store(true, std::memory_order_release);
