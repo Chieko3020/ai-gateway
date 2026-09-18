@@ -71,6 +71,23 @@ static std::string extract_user_message(const std::string& request_body) {
   return "";
 }
 
+// 判断请求是否属于"不可缓存流量"：带工具调用定义/结果的请求，或流式请求。
+// 这类请求与上下文强相关——缓存会丢失 tool_calls、或返回不适用答案，必须直接透传。
+static bool is_uncacheable_request(const std::string& request_body) {
+  try {
+    auto req = json::parse(request_body);
+    if (req.contains("tools") || req.contains("functions")) return true;
+    if (req.contains("stream") && req.value("stream", false)) return true;
+    auto& msgs = req.at("messages");
+    for (const auto& m : msgs) {
+      auto role = m.value("role", "");
+      if (role == "tool" || role == "function") return true;
+      if (m.contains("tool_calls") || m.contains("function_call")) return true;
+    }
+  } catch (...) {}
+  return false;
+}
+
 // 线程安全的关闭标志与后台线程唤醒机制
 static std::atomic<bool> g_shutdown{false};
 static std::mutex g_bg_mutex;
@@ -88,6 +105,33 @@ static std::string handle_request(const std::string& request_body,
                                    Singleflight* sf,
                                    Stats* stats) {
   auto t0 = std::chrono::steady_clock::now();
+
+  // 0. 不可缓存流量：带工具调用或流式的请求直接透传（不查缓存、不写缓存、不参与请求合并）
+  if (is_uncacheable_request(request_body)) {
+    auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
+                           request_body, cfg.backend.timeout_seconds);
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+    int pt = 0, ct = 0;
+    if (result.status_code >= 200 && result.status_code < 300) {
+      try {
+        auto resp = json::parse(result.body);
+        auto& usage = resp.at("usage");
+        pt = usage.value("prompt_tokens", 0);
+        ct = usage.value("completion_tokens", 0);
+      } catch (...) {}
+    }
+    stats->record_bypass(elapsed.count(), pt, ct);
+    LOG_INFO("cache: bypass (tool/stream) status={} {}ms",
+             result.status_code, elapsed.count());
+
+    auto out_result = filter->check_output(result.body);
+    if (out_result.action == FilterAction::kReject) {
+      LOG_WARN("filter: rejected output containing URL");
+      return R"({"error":"Response filtered"})";
+    }
+    return out_result.sanitized;
+  }
 
   // 缓存命中检查时带回的 embedding（避免 cache_reply 重复计算）
   std::vector<float> cached_embedding;
