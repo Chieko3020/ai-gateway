@@ -33,6 +33,15 @@ int main() {
     assert(b.avg_latency_ms() == 15); ok++;        // (10+20)/2，旁路不掺入
   }
 
-  std::cout << "test_stats: " << ok << "/11 passed\n";
+  // 回归：report() 内部会调用 avg_bypass_latency_ms()，那里不可再加锁（否则 EDEADLK 终止进程）
+  {
+    Stats r;
+    r.record_cache_hit(5);
+    r.record_bypass(7, 10, 20);
+    r.report();  // 若死锁，此调用会 abort
+    ok++;
+  }
+
+  std::cout << "test_stats: " << ok << "/12 passed\n";
   return 0;
 }

@@ -96,7 +96,8 @@ int64_t Stats::total_tokens_saved() const {
 }
 
 int64_t Stats::avg_bypass_latency_ms() const {
-  std::shared_lock lock(mutex_);
+  // 不在此加锁：与 avg_latency_ms() 一致——report() 已持锁后调用它，
+  // 若这里再加 shared_lock 会造成同一线程重复加锁（EDEADLK / Resource deadlock avoided）。
   return bypassed_ > 0
              ? (bypass_latency_us_ / 1000) / static_cast<int64_t>(bypassed_)
              : 0;
