@@ -9,7 +9,7 @@ add_library(ai_gateway_common STATIC
 target_include_directories(ai_gateway_common PUBLIC ${INCLUDE_ROOT})
 target_link_libraries(ai_gateway_common PUBLIC nlohmann_json::nlohmann_json)
 
-# Server (http_server, request, response, filter, router, connection_handler)
+# Server (http_server, request, response, filter, router, connection_handler, metrics)
 add_library(ai_gateway_server STATIC
     server/http_server.cpp
     server/request.cpp
@@ -17,9 +17,11 @@ add_library(ai_gateway_server STATIC
     server/filter.cpp
     server/router.cpp
     server/connection_handler.cpp
+    server/metrics.cpp
 )
 target_include_directories(ai_gateway_server PUBLIC ${INCLUDE_ROOT})
-target_link_libraries(ai_gateway_server PUBLIC ai_gateway_common)
+# metrics.cpp 渲染 Stats 快照（ai_gateway_stats 在下方定义，CMake 在生成期解析）
+target_link_libraries(ai_gateway_server PUBLIC ai_gateway_common ai_gateway_stats)
 
 # Backend (llm_client)
 add_library(ai_gateway_backend STATIC

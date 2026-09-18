@@ -55,6 +55,11 @@ void HttpServer::add_route(std::string_view path, RequestHandler handler) {
   router_.add("POST", path, std::move(handler));
 }
 
+void HttpServer::add_route(std::string_view method, std::string_view path,
+                           RequestHandler handler) {
+  router_.add(method, path, std::move(handler));
+}
+
 void HttpServer::set_nonblocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0) return;

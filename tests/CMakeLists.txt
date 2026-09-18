@@ -63,6 +63,11 @@ target_link_libraries(test_stats ai_gateway_stats ai_gateway_common ai_gateway_t
 add_executable(test_log_rotation test_log_rotation.cpp)
 target_link_libraries(test_log_rotation ai_gateway_common ai_gateway_test_check)
 
+# /metrics 端点（报告 8.7 第 4 条）：Prometheus 文本 + GET 路由不破坏 POST
+add_executable(test_metrics test_metrics.cpp)
+target_link_libraries(test_metrics ai_gateway_server ai_gateway_stats
+    ai_gateway_common ai_gateway_test_check)
+
 add_test(NAME filter COMMAND test_filter)
 add_test(NAME request COMMAND test_request)
 add_test(NAME response COMMAND test_response)
@@ -74,6 +79,7 @@ add_test(NAME singleflight COMMAND test_singleflight)
 add_test(NAME cache_engine COMMAND test_cache_engine)
 add_test(NAME http_server COMMAND test_http_server)
 add_test(NAME log_rotation COMMAND test_log_rotation)
+add_test(NAME metrics COMMAND test_metrics)
 
 # HNSW 自检索召回率断言（合成向量 + 固定种子，确定性）
 add_test(NAME hnsw_recall

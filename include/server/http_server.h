@@ -49,8 +49,13 @@ class HttpServer {
   // 注册路由处理器（默认注册到 POST /v1/chat/completions）
   void set_handler(RequestHandler handler);
 
-  // 注册自定义路由
+  // 注册自定义路由（默认 POST）
   void add_route(std::string_view path, RequestHandler handler);
+
+  // 注册指定 method 的自定义路由（例如 GET /metrics）。
+  // 路由 key 是 "METHOD /path"，因此新增 GET 端点不会影响既有的 POST 路由
+  void add_route(std::string_view method, std::string_view path,
+                 RequestHandler handler);
 
   // 启动服务（阻塞当前线程直到 stop() 被调用）
   // external_shutdown: 可选的原子标志，信号处理器等外部代码可通过它触发优雅关闭
@@ -70,6 +75,13 @@ class HttpServer {
   // 当前登记中的连接数（用于观测与测试：确认半关闭/超时连接确实被回收）。
   // 该表由 reactor 线程独占，因此只在 reactor 停下后调用才有确定语义
   size_t active_connections() const { return conns_.size(); }
+
+  // 线程池观测（/metrics 用）：两者都由 ThreadPool 的互斥量保护，可从任意线程调用。
+  // 注意**不要**在 worker 里读 active_connections()——conns_ 由 reactor 独占，
+  // 那是数据竞争
+  size_t pending_tasks() const { return pool_.pending(); }
+  size_t active_tasks() const { return pool_.active(); }
+  size_t worker_threads() const { return pool_.size(); }
 
  private:
   // 创建非阻塞监听 socket

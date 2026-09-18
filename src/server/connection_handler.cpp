@@ -17,15 +17,19 @@ ConnectionResult ConnectionHandler::process(const char* raw_data,
     return result;
   }
 
-  // 2. 仅允许 POST
-  if (req.method != "POST") {
+  // 2. 路由查找：按 "METHOD /path" 精确匹配。
+  //    不能再用"非 POST 一律 405"——那样 GET /metrics 也会被拒（报告 8.7 第 4 条），
+  //    而 Prometheus 抓取端点是 GET。既有语义要保住：
+  //      请求的 method 没有对应路由 且 不是 POST  -> 405（与旧行为一致）
+  //      POST 但路径不存在                        -> 404（与旧行为一致）
+  auto* handler = router_.find(req.method, req.path);
+  if (!handler && req.method != "POST") {
     result.response = make_response(405, "application/json",
                                     R"({"error":"Method not allowed"})");
     return result;
   }
 
-  // 3. 路由查找
-  auto* handler = router_.find("POST", req.path);
+  // 3. 路径不存在
   if (!handler) {
     result.response =
         make_response(404, "application/json", R"({"error":"Not found"})");

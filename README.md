@@ -232,8 +232,40 @@ sudo systemctl enable --now ai-gateway
 | `server.max_connections` | 256 | 并发连接上限（超出回 503） |
 | `server.idle_timeout_seconds` | 30 | 连接空闲超时（秒） |
 | `log.sample_every` | 1 | 每请求 INFO 采样率（1 = 全量，N = 每 N 条留 1 条） |
+| `log.max_bytes` | 10485760 | 单文件日志上限（字节），达到后切分；0 = 关闭轮转 |
+| `log.keep_files` | 5 | 日志历史保留份数（不含当前文件） |
+| `cost.input_per_1k` | 0.001 | 输入单价（元/1K tokens），用于费用估算 |
+| `cost.output_per_1k` | 0.001 | 输出单价（元/1K tokens）；缺省与旧口径一致（统一 0.001） |
 
 API Key 通过 `config/gateway.env`（systemd `EnvironmentFile`）或环境变量 `LLM_API_KEY` 注入。
+
+### 可观测性
+
+**`GET /metrics`** — Prometheus 文本格式（`text/plain; version=0.0.4`），与
+`POST /v1/chat/completions` 是两条独立路由，新增该端点不改变既有 POST 行为：
+
+```bash
+curl -s http://127.0.0.1:3003/metrics
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: ai-gateway
+    static_configs:
+      - targets: ["127.0.0.1:3003"]
+```
+
+暴露 `ai_gateway_requests_total`（可缓存流量，不含旁路与合并）、`ai_gateway_cache_hits_total`
+/ `_misses_total`、`ai_gateway_cache_hit_ratio`、`ai_gateway_cache_bypassed_total`、
+`ai_gateway_cache_merged_total`、`ai_gateway_tokens_{prompt,completion,saved}_total`、
+`ai_gateway_cost_yuan_total` / `ai_gateway_cost_saved_yuan_total`、延迟分位数
+`ai_gateway_latency_milliseconds{quantile="0.5|0.95|0.99"}`、旁路延迟与线程池队列深度。
+口径与日志里的 `[STATS]` 摘要一致，且只含聚合数值，不含任何请求内容或键哈希。
+
+**日志轮转** — `gateway.log` 达到 `log.max_bytes` 后改名为 `gateway.log.1`，旧的依次
+后移，最老一份删除，共保留 `log.keep_files` 份；进程启动时若发现当前文件已超限会先归档。
+设 `log.max_bytes: 0` 可退回"单文件一直追加"。轮转出的文件与当前文件同为 `0600`。
 
 ## 测试
 

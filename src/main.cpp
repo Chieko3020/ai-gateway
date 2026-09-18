@@ -25,6 +25,7 @@
 #include "common/types.h"
 #include "server/filter.h"
 #include "server/http_server.h"
+#include "server/metrics.h"
 #include "stats/stats.h"
 
 using namespace ai_gateway;
@@ -561,6 +562,25 @@ int main(int argc, char* argv[]) {
       LOG_ERROR("request handler threw non-std exception");
       return json_reply(R"({"error":"Internal error"})", 500);
     }
+  });
+
+  // GET /metrics：Prometheus 文本格式抓取端点。
+  //   - 与 POST /v1/chat/completions 是两条独立路由（key = "METHOD /path"），
+  //     新增它不改变既有行为（连接处理器只对"没有对应 method 路由的非 POST"
+  //     返回 405，见 connection_handler.cpp）
+  //   - 只暴露聚合计数与分位数，不含任何请求内容／哈希，脱敏口径与日志一致
+  //   - 不读 active_connections()：conns_ 由 reactor 线程独占，worker 里读是数据竞争
+  const auto process_start = std::chrono::steady_clock::now();
+  server.add_route("GET", "/metrics", [stats, &server, process_start](
+                                           const std::string&) {
+    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+                      std::chrono::steady_clock::now() - process_start)
+                      .count();
+    auto body = render_metrics(
+        *stats, uptime, static_cast<int64_t>(server.pending_tasks()),
+        static_cast<int64_t>(server.active_tasks()),
+        static_cast<int64_t>(server.worker_threads()));
+    return HttpReply{200, kMetricsContentType, std::move(body)};
   });
 
   // ---- 5. 启动 ----
