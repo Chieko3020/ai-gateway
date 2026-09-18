@@ -79,9 +79,22 @@ class Stats {
   //                    写出去。对流式体验而言这才是用户感知的延迟
   //   total_ms      —— 整段完成时间（最后一个 token 写到客户端为止），
   //                    随回答长度增长，与"网关快不快"无关
+  //   prompt_tokens / completion_tokens —— 从 SSE 事件的 usage 字段解析得到
+  //                    （见 server/sse_usage.h）。上游未给 usage 时传 0，
+  //                    并用 record_stream_no_usage() 把"缺 usage"的次数单列出来
   // 进旁路样本池（不进命中率分母，也不与缓冲式响应混进同一个 avg/min/max）
   void record_stream(int64_t first_byte_ms, int64_t total_ms,
                      int prompt_tokens, int completion_tokens);
+
+  // 流式请求正常结束、但上游事件里**没有** usage 字段（未带
+  // stream_options.include_usage，或上游不是标准 OpenAI 实现）。
+  // 单列计数是为了让报表能区分"网关没解析"与"上游没给"——两者都表现为
+  // token 计 0，但处置完全不同（前者是缺陷，后者是上游能力边界）
+  void record_stream_no_usage();
+  size_t streams_without_usage() const {
+    std::shared_lock lock(mutex_);
+    return streams_without_usage_;
+  }
 
   // 流式请求提前结束的次数（客户端断开 / 写死线到点 / 上游中断）。
   // 这类请求不进延迟样本池，只单列计数——否则它们会把 avg/min 拉成
@@ -148,6 +161,7 @@ class Stats {
   size_t merged_ = 0;    // 请求合并命中（不计入 total_/hits_）
   size_t streams_ = 0;   // 流式请求完成数（首字节/总时长已入旁路样本池）
   size_t streams_aborted_ = 0;  // 流式请求提前结束数（不进延迟样本池）
+  size_t streams_without_usage_ = 0;  // 正常结束但上游未给 usage 的流式请求数
 
   int64_t total_prompt_tokens_ = 0;
   int64_t total_completion_tokens_ = 0;

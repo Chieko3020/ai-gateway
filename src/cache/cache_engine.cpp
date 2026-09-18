@@ -6,6 +6,7 @@
 #include <format>
 #include <string_view>
 
+#include "cache/entity_tokens.h"
 #include "common/logger.h"
 
 namespace ai_gateway {
@@ -41,6 +42,7 @@ CacheEngine::CacheEngine(const EmbeddingConfig& emb_cfg,
                          EmbedFn embed_fn)
     : emb_cfg_(emb_cfg),
       threshold_(cache_cfg.similarity_threshold),
+      entity_veto_(cache_cfg.entity_veto),
       hnsw_cfg_(index ? index->config() : HnswConfig{}),
       store_(std::move(store)),
       index_(std::move(index)),
@@ -78,12 +80,51 @@ CacheEngine::HitResult CacheEngine::try_hit(
   }
   std::vector<HnswResult> results = idx->search(vec, top_k_);
 
-  // 3. 遍历结果，检查是否命中（相似度 ≥ 阈值，且命名空间匹配）
+  // 3. 遍历结果，检查是否命中（相似度 ≥ 阈值，命名空间匹配，实体一致）
   std::string ns_prefix = ns.empty() ? "" : ns + ":";
   total_search_.fetch_add(1, std::memory_order_relaxed);
+  // 查询侧的实体标记只提取一次（候选侧每条条目各提一次）
+  const EntityTokens query_entities =
+      entity_veto_ ? extract_entity_tokens(user_message) : EntityTokens{};
   for (auto& r : results) {
     if (r.similarity >= threshold_) {
       if (!ns.empty() && !r.key.starts_with(ns_prefix)) continue;
+
+      // 实体一致性否决：相似度只反映"整体语义接近"，对"只差一个数字/缩略语"的
+      // 句子几乎没有判别力（`继续下一题` ↔ `继续12题` 余弦 0.885；
+      // `什么是DMA` ↔ `什么是DNS` 旧配置下 1.0000）。这里用硬约束补上：
+      // 只要两边的数字/大写缩略语/混合标识符存在不对称差集，就否决这次命中，
+      // 继续看下一条候选（而不是直接判未命中——Top-K 里后面可能有一条实体一致的）。
+      //
+      // 候选侧文本取条目的 source（= "namespace:原始用户消息"），这是**当初
+      // 产生这个向量和这条回复的那段文本**；拿它比对才是同一条缓存记录的自洽比较。
+      // 注意必须查过 source 再比对：若 source 缺失（旧格式文件/未记录），
+      // 就退回"只按相似度判定"，即不做否决（不能凭缺失的文本判定不一致）
+      //
+      // 这里**不要求查询侧有实体**：查询没实体而候选有实体，恰恰是最危险的一类
+      // （`继续下一题` 命中 `继续12题` 的缓存——那条记录的向量与回答都是针对
+      // 另一个题号的）。代价是"问句里多一个数字的同义改写"会被判未命中，
+      // 该取舍在 LCQMC 3000 对上的量化见简报
+      if (entity_veto_) {
+        auto source = store_->source_of(r.key);
+        if (source.has_value()) {
+          // source 形如 "ns<hash>:<原始消息>"，剥掉命名空间前缀再提实体，
+          // 否则 ns 十六进制前缀自身会被当成"混合标识符"，让每条候选都被误否决
+          std::string_view text = *source;
+          if (!ns.empty()) {
+            const std::string prefix = ns + ":";
+            if (text.starts_with(prefix)) text.remove_prefix(prefix.size());
+          }
+          if (entity_mismatch(query_entities, extract_entity_tokens(text))) {
+            entity_veto_count_.fetch_add(1, std::memory_order_relaxed);
+            LOG_INFO_SAMPLED(
+                "cache: VETO by entity mismatch key={} sim={:.3f} ns={}",
+                r.key, r.similarity, ns.empty() ? "default" : ns);
+            continue;
+          }
+        }
+      }
+
       auto cached = store_->get(r.key);
       if (cached.has_value()) {
         LOG_INFO_SAMPLED("cache: HIT key={} sim={:.3f} ns={}", r.key,

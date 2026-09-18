@@ -17,6 +17,8 @@
 
 #include <onnxruntime_c_api.h>
 
+#include "common/config.h"  // PoolingMode（向量池化方式）
+
 namespace ai_gateway {
 // BERT WordPiece 分词器（bge-small-zh-v1.5 / bert-base-chinese 词表）
 //
@@ -24,8 +26,10 @@ namespace ai_gateway {
 // 逐条规则见 .cpp 与 scripts/tokenizer_reference.py：
 //   1. clean_text：控制字符丢弃、空白统一成空格
 //   2. tokenize_chinese_chars：每个 CJK 字符两侧补空格（汉字因此逐个成词）
-//   3. 大小写：官方 tokenizer_config.json 对本词表是 do_lower_case=false，
-//      因此**默认不做**小写化（开关 set_do_lower_case，打开后与 do_lower_case=true 对齐）
+//   3. 大小写：模型目录 sentence_bert_config.json 是 `do_lower_case: true`，
+//      因此**默认做**小写化（开关 set_do_lower_case，可退回 do_lower_case=false）。
+//      这不是风格偏好：本词表只有小写英文，false 会让 `DMA`/`DNS` 都整词回退成
+//      [UNK]、两条文本 token 序列完全相同（余弦 1.0），信息在分词层就丢了
 //   4. 按空白与标点切分（ASCII 段 + Unicode 类别 P*，与官方 _is_punctuation 一致）
 //   5. WordPiece：从词首开始最长匹配，续接子词带 "##" 前缀；
 //      单词长度 > 100 或任一位置无法匹配 → 整词一个 [UNK]（不逐字符回退）
@@ -54,7 +58,7 @@ class BertWordPieceTokenizer {
   bool load(const std::string& vocab_path);
   size_t size() const { return vocab_.size(); }
 
-  // 是否做小写化。默认 false = 与官方 tokenizer_config.json 一致
+  // 是否做小写化。默认 true = 官方 sentence_bert_config.json 的取值
   void set_do_lower_case(bool on) { do_lower_case_ = on; }
   bool do_lower_case() const { return do_lower_case_; }
 
@@ -71,7 +75,9 @@ class BertWordPieceTokenizer {
   int id_of(std::string_view piece, std::string& scratch) const;
 
   std::unordered_map<std::string, int> vocab_;
-  bool do_lower_case_ = false;
+  // 默认 true：官方 sentence_bert_config.json 对 bge-small-zh-v1.5 就是 true。
+  // 不是可随意翻转的开关——false 会让大写英文缩略语整词回退成 [UNK]（见类注释 3）
+  bool do_lower_case_ = true;
 };
 
 // ONNX Runtime 嵌入推理
@@ -87,6 +93,14 @@ class OnnxEmbedding {
 
   bool ready() const { return session_ != nullptr; }
   std::vector<float> encode(std::string_view text);
+
+  // 分词器开关：必须在第一次 encode() 之前设置（指纹计算也依赖它，
+  // 否则"落盘向量是用哪种分词产生的"这件事无法还原）
+  void set_do_lower_case(bool on) { tokenizer_.set_do_lower_case(on); }
+  bool do_lower_case() const { return tokenizer_.do_lower_case(); }
+
+  void set_pooling(PoolingMode mode) { pooling_ = mode; }
+  PoolingMode pooling() const { return pooling_; }
 
   // 构造失败的原因：调用方据此决定"降级继续"还是"启动即失败"
   enum class LoadError {
@@ -110,6 +124,8 @@ class OnnxEmbedding {
   BertWordPieceTokenizer tokenizer_;
   int dims_ = 512;
   int output_dim_ = 0;  // 模型实际输出维度（探测得到）
+  // 池化方式决定向量的语义，改了它旧向量就失效（由 embedding 指纹兜住）
+  PoolingMode pooling_ = PoolingMode::kCls;
   LoadError load_error_ = LoadError::kNone;
 };
 

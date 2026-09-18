@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <format>
 #include <memory>
@@ -53,10 +54,11 @@ CurlClient& thread_local_pool() {
 // 流式路径
 // ===========================================================================
 
-// 上游"连上了但不再发字节"最多容忍多久（秒）。CURLOPT_TIMEOUT 是整条流的总
-// 时限，对僵死的长连接没有约束力，必须另设低速中断，否则一个早夭流会把 worker
-// 一直占住（见简报的生命周期一节）。
-constexpr long kStreamStallSeconds = 30;
+// 上游"连上了但不再发字节"最多容忍多久（秒）的**上限**。
+// 实际取值 = min(backend.timeout_seconds, kStreamStallCapSeconds)：
+// 停滞容忍度超过整条请求的总时限没有意义，而总时限是可配置的。
+// 历史：这里曾是硬编码的 constexpr long kStreamStallSeconds = 30;
+constexpr long kStreamStallCapSeconds = 120;
 
 std::string to_lower(std::string_view s) {
   std::string out;
@@ -88,6 +90,11 @@ struct StreamCtx {
   std::string buffer;       // 非流式路径的响应体
   StreamAbortReason abort = StreamAbortReason::kNone;
   bool header_done = false;
+  // 上游空闲检测：write 回调只在**有数据**时被调用，因此"上游不发数据"这件事
+  // 得靠进度回调发现（见 stream_progress_cb）。last_data 由 write 回调刷新。
+  std::chrono::steady_clock::time_point last_data =
+      std::chrono::steady_clock::now();
+  int idle_ms = 0;  // <=0 表示不检查空闲
 };
 
 size_t stream_header_cb(char* buffer, size_t size, size_t nitems,
@@ -133,6 +140,8 @@ size_t stream_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
   auto* ctx = static_cast<StreamCtx*>(userdata);
   const size_t len = size * nmemb;
   if (!ctx) return len;
+  // 上游有新字节：刷新空闲计时（从"收到第一块数据"起算，不把建连耗时算进去）
+  ctx->last_data = std::chrono::steady_clock::now();
 
   // 首次拿到响应体时决定走哪条路：
   //   - 2xx 且 Content-Type 是 text/event-stream -> 逐块透传给下游
@@ -160,6 +169,28 @@ size_t stream_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return 0;
   }
   return len;
+}
+
+// 上游空闲检测：write 回调只在**有数据**时被调用，所以"上游不发数据"必须在
+// 别的钩子里发现。libcurl 的进度回调（XFERINFOFUNCTION）在传输期间会被周期性
+// 调用（即使没有任何字节流动），用它比较"距上次收到数据的间隔"即可。
+//
+// 为什么不能只用 CURLOPT_LOW_SPEED_LIMIT/TIME：它判的是**平均速率**——先有一个
+// 突发再长期静默时，平均速率要很久才降到 1 B/s；集成测试 C 段实测静默 10s 也未
+// 触发。这里改成严格的"两次数据之间的间隔"。
+int stream_progress_cb(void* userdata, curl_off_t, curl_off_t, curl_off_t,
+                       curl_off_t) {
+  auto* ctx = static_cast<StreamCtx*>(userdata);
+  if (!ctx || ctx->idle_ms <= 0) return 0;
+  const auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - ctx->last_data)
+                        .count();
+  if (idle > ctx->idle_ms) {
+    if (ctx->abort == StreamAbortReason::kNone)
+      ctx->abort = StreamAbortReason::kUpstreamIdle;
+    return 1;  // 非 0 = 中止传输（curl 侧表现为 CURLE_ABORTED_BY_CALLBACK）
+  }
+  return 0;
 }
 
 }  // namespace
@@ -207,6 +238,7 @@ StreamCallResult call_llm_stream(const std::string& url,
                                  const std::string& api_key,
                                  const std::string& request_body,
                                  int timeout_seconds,
+                                 int stream_idle_ms,
                                  LlmStreamSink* sink) {
   StreamCallResult out;
   auto& curl = thread_local_pool();
@@ -243,10 +275,26 @@ StreamCallResult call_llm_stream(const std::string& url,
   curl_easy_setopt(h, CURLOPT_HEADERDATA, &ctx);
   curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, stream_write_cb);
   curl_easy_setopt(h, CURLOPT_WRITEDATA, &ctx);
-  // 低速中断：连续 kStreamStallSeconds 秒速率低于 1 字节/秒即中止。
-  // 与 CURLOPT_TIMEOUT 的总时限互补，专治"连上了却不发数据"的僵死流
+  // 低速中断：连续 stall_seconds 秒速率低于 1 字节/秒即中止。
+  // 与 CURLOPT_TIMEOUT 的总时限互补，专治"连上了却不发数据"的僵死流。
+  // 取值与 backend.timeout_seconds 挂钩（上限 120s）：硬编码 30s 时，
+  // "首包 5s + 思考 40s才吐第一个 token"的正常慢上游会被误杀
+  long stall_seconds = std::min<long>(timeout_seconds > 0 ? timeout_seconds : 60,
+                                      kStreamStallCapSeconds);
+  if (stall_seconds < 5) stall_seconds = 5;  // 下限：别把正常思考停顿当停滞
+  // 保底：极慢速（平均 < 1 B/s）也会被 libcurl 中止。真正的"空闲"判定交给进度
+  // 回调（见 stream_progress_cb）——平均速率对"突发后长期静默"这种形状无效。
   curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
-  curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, kStreamStallSeconds);
+  curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, stall_seconds);
+
+  // 上游空闲死线：两次数据之间的间隔超过 stream_idle_ms 即中止（<=0 表示关闭）。
+  // 这是"上游不发数据"这一侧的唯一防线——写死线（ResponseWriter）只在
+  // "有数据要写但写不动"时生效，覆盖不到上游静默。
+  ctx.idle_ms = stream_idle_ms;
+  ctx.last_data = std::chrono::steady_clock::now();
+  curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, stream_progress_cb);
+  curl_easy_setopt(h, CURLOPT_XFERINFODATA, &ctx);
 
   long http_code = 0;
   CURLcode res = curl.perform_raw(&http_code);

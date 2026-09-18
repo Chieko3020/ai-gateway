@@ -33,8 +33,9 @@ LlmResponse call_llm(const std::string& url,
 //   kNullSink   —— 前端根本没人接（编程错误，落日志）
 enum class StreamAbortReason {
   kNone = 0,
-  kClientGone,
-  kDeadline,
+  kClientGone,    // 下游写不进去了（客户端断开 / 写死线）
+  kDeadline,      // 整条响应的总死线或上游超时
+  kUpstreamIdle,  // 上游两次数据之间的间隔超过 stream_idle_ms
   kNullSink,
 };
 
@@ -76,13 +77,20 @@ struct StreamCallResult {
 // 流式转发：上游字节到达即交给 sink->on_chunk，不再整段缓冲。
 // 复用 call_llm 的句柄模型与超时配置：
 //   - 每线程一个 CURL*（thread_local），无锁，多 worker 真并发
-//   - CURLOPT_TIMEOUT = timeout_seconds 作为**整条流的总时限**兜底；
-//     真正防止早夭流长期挂住 worker 的是内部设置的低速中断
-//     （连续 stall_seconds 秒速率低于 1 字节/秒即中止，默认 30s）
+//   - CURLOPT_TIMEOUT = timeout_seconds 作为**整条流的总时限兜底**（默认 60s，
+//     由 backend.timeout_seconds 配置；预期长回答会超过它就该把这个值调大）
+//   - stream_idle_ms（server.stream_idle_timeout_seconds）作为**上游空闲死线**：
+//     由 CURLOPT_XFERINFOFUNCTION 的进度回调检查"两次数据之间的间隔"，超时即中止
+//     并把 abort_reason 置为 kUpstreamIdle。这是"上游不发数据"这一侧的唯一防线
+//     ——下游写死线只在**写客户端**时被检查，管得住"客户端不读"，管不住"上游不发"
+//     （集成测试 C 段实测过这个缺口）
+//   - CURLOPT_LOW_SPEED_TIME 只作极慢速兜底：它判的是**平均速率**，对"突发一次
+//     再长期静默"无效（实测静默 10s 仍未触发），因此不再承担空闲判定
 StreamCallResult call_llm_stream(const std::string& url,
                                  const std::string& api_key,
                                  const std::string& request_body,
                                  int timeout_seconds,
+                                 int stream_idle_ms,
                                  LlmStreamSink* sink);
 
 }  // namespace ai_gateway

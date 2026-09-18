@@ -18,6 +18,7 @@ add_library(ai_gateway_server STATIC
     server/router.cpp
     server/connection_handler.cpp
     server/metrics.cpp
+    server/sse_usage.cpp
 )
 target_include_directories(ai_gateway_server PUBLIC ${INCLUDE_ROOT})
 # metrics.cpp 渲染 Stats 快照（ai_gateway_stats 在下方定义，CMake 在生成期解析）
@@ -30,12 +31,13 @@ add_library(ai_gateway_backend STATIC
 target_include_directories(ai_gateway_backend PUBLIC ${INCLUDE_ROOT})
 target_link_libraries(ai_gateway_backend PUBLIC ai_gateway_common CURL::libcurl)
 
-# Cache (lru_store, cache_engine, onnx_embedding)
+# Cache (lru_store, cache_engine, onnx_embedding, entity_tokens)
 add_library(ai_gateway_cache STATIC
     cache/lru_store.cpp
     cache/cache_engine.cpp
     cache/onnx_embedding.cpp
     cache/embedding_fingerprint.cpp
+    cache/entity_tokens.cpp
 )
 target_include_directories(ai_gateway_cache PUBLIC ${INCLUDE_ROOT})
 target_link_libraries(ai_gateway_cache PUBLIC ai_gateway_common CURL::libcurl nlohmann_json::nlohmann_json

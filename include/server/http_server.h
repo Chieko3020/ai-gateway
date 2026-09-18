@@ -87,16 +87,31 @@ enum class WriteStatus {
 enum class AbortReason {
   kNone = 0,
   kClientGone,
-  kDeadline,
+  kDeadline,  // 响应的**总死线**到点（只可能出现在缓冲式响应上）
+  kIdle,      // 流式响应的**空闲死线**到点：两次成功写入之间太久没有进展
 };
 
 // 非阻塞 fd 上"写到底"：遇 EAGAIN 用 poll(POLLOUT) 等可写再续发，直到写完 /
 // 超过死线 / 出现真实错误。
 //   write_deadline_ms —— 单次调用的写死线（相对值）
-//   total_deadline    —— 整条响应的绝对死线：把 N 次调用累计起来仍然受限，
-//                        否则流式响应可以被"每次都刚好没超时"的慢客户端无限拉长。
-//                        默认 time_point::max() = 不设总时限（保持旧调用方语义）
+//   total_deadline    —— **整条响应**的绝对死线（绝对 time_point）。
+//                        对流式响应必须传 time_point::max()：流式响应的时长由
+//                        回答长度决定（输出几千 token 就是几十秒到几分钟），
+//                        任何总时限都等于给回答长度设上限。流式靠"写入之间的
+//                        空闲超时"（ResponseWriter 内部续期）防住慢客户端。
+//                        缓冲式响应则需要它：把 N 次 send 累计起来仍受限，否则
+//                        一个"每次只读一点点"的客户端能让这条连接无限期占用 worker
+//   idle_deadline     —— 单次停顿允许的最长等待时间（绝对 time_point）。
+//                        poll 等到可写后循环从头再试，因此这是"一次停顿"的上限
+//                        而不是整条响应的上限——即"空闲超时"。默认 max()
 // 自由函数以便脱离 HTTP 服务单测（socketpair，见 test_http_server 第 6 段）
+WriteStatus send_all_with_deadline_until(
+    int client_fd, const char* data, size_t len, int write_deadline_ms,
+    std::atomic<uint64_t>* eagain_count,
+    std::chrono::steady_clock::time_point total_deadline,
+    std::chrono::steady_clock::time_point idle_deadline);
+
+// 兼容入口（缓冲式调用方）：idle_deadline 缺省 = total_deadline
 WriteStatus send_all_with_deadline(
     int client_fd, const char* data, size_t len, int write_deadline_ms,
     std::atomic<uint64_t>* eagain_count,
@@ -106,14 +121,22 @@ WriteStatus send_all_with_deadline(
 // 增量响应写出器：按顺序把"响应头 + 若干块正文"写到客户端。
 // 两种长度语义：Content-Length（普通响应）与 chunked（流式响应）。
 // 失败后自身进入 error 状态，后续 write_* 全部直接返回失败（不再怼 socket）。
+//
+// 两种死线语义（这是"长流不被切断"的关键）：
+//   缓冲式（write_head）：整条响应受 total_deadline_ 约束
+//   流式（write_stream_head）：**不设总死线**，改为"两次成功写入之间的空闲超时"
+//     stream_idle_ms_ —— 每次成功写出数据后把空闲死线推到 now + 空闲值。
+//     只要客户端在跟读，流要多长都行；客户端卡住不读超过空闲值就中停上游
 class ResponseWriter {
  public:
   ResponseWriter(int client_fd, int write_deadline_ms,
                  std::chrono::steady_clock::time_point total_deadline,
-                 std::atomic<uint64_t>* eagain_count)
+                 std::atomic<uint64_t>* eagain_count,
+                 int stream_idle_ms = 0)
       : fd_(client_fd),
         write_deadline_ms_(write_deadline_ms),
         total_deadline_(total_deadline),
+        stream_idle_ms_(stream_idle_ms > 0 ? stream_idle_ms : write_deadline_ms),
         eagain_count_(eagain_count) {}
 
   // 写响应头（含 Content-Length）。keep_alive 只影响 Connection 头的声明，
@@ -137,11 +160,19 @@ class ResponseWriter {
   uint64_t bytes_sent() const { return bytes_sent_; }
 
  private:
+  // 发送 data：按当前模式选取死线（流式 = 空闲死线，缓冲式 = 总死线）。
+  // 成功且是流式时把空闲死线推到 now + stream_idle_ms_（这就是"续期"）
   bool send_raw(std::string_view data);
+  std::chrono::steady_clock::time_point current_total_deadline() const;
+  std::chrono::steady_clock::time_point current_idle_deadline() const;
 
   int fd_;
   int write_deadline_ms_;
   std::chrono::steady_clock::time_point total_deadline_;
+  int stream_idle_ms_;
+  // 流式（chunked）模式下的空闲死线：**绝对时刻**，每次成功写出后向前推。
+  // 只有 chunked_ 为真时才有意义
+  std::chrono::steady_clock::time_point stream_idle_deadline_{};
   std::atomic<uint64_t>* eagain_count_;
 
   std::string out_;  // 未发完的待发缓冲

@@ -29,29 +29,32 @@ constexpr int kMaxAcceptBatch = 512;  // 单次 epoll 事件内最多 accept 的
 // ===========================================================================
 // 写路径：非阻塞 fd 上"写到底"
 // ===========================================================================
-WriteStatus send_all_with_deadline(
+WriteStatus send_all_with_deadline_until(
     int client_fd, const char* data, size_t len, int write_deadline_ms,
     std::atomic<uint64_t>* eagain_count,
-    std::chrono::steady_clock::time_point total_deadline) {
+    std::chrono::steady_clock::time_point total_deadline,
+    std::chrono::steady_clock::time_point idle_deadline) {
   // 旧实现在这里 `if (sent <= 0) break`：非阻塞 fd 上 send() 返回 EAGAIN 时
   // 会把剩余字节直接丢掉，慢客户端读大响应只会拿到前半截（报告 8.7 第 3 条）。
   //
   // 这里改成"等到能写为止"：EAGAIN 时用 poll(POLLOUT) 阻塞等待可写再续发，
-  // 并用**总 deadline**（不是每次 poll 各自计时）兜住慢客户端，
-  // 避免一个连接把 worker 永久占住。
+  // 避免一个连接把 worker 永久占住靠的是两条死线：
+  //   total_deadline —— **整条响应**的绝对上限（缓冲式响应用它）
+  //   idle_deadline  —— 单次停顿的上限（流式响应用它）。
+  //     语义差别是本质的：total 把"回答有多长"也框住了，idle 只框"客户端是否还在读"。
+  //     流式长回答必须用后者，否则输出超过 total 的流会被拦腰切断
   //
   // 为什么不做 EPOLLOUT 写缓冲：那需要把未发完的数据从 worker 交还给 reactor
   // （跨线程写队列 + eventfd 唤醒 + 重新注册 EPOLLOUT + 所有权转移），
   // 在本项目"worker 独占 fd 直到写完"的架构下改动面大、竞态风险高；
   // poll 方案只影响单个 worker 且行为可测（见 test_http_server 的慢客户端用例）。
-  //
-  // total_deadline 是**整条响应**的绝对上限：流式响应对同一个连接会调用本函数
-  // 很多次，只有每次都算相对死线的话，一个"每次读一点点"的慢客户端可以让一条流
-  // 无限期占着 worker
   const auto now = std::chrono::steady_clock::now();
   auto call_deadline =
       now + std::chrono::milliseconds(write_deadline_ms > 0 ? write_deadline_ms : 0);
+  // 单次写调用的上限 = min(单次写死线, 整条响应的总死线)
   const auto deadline = std::min(call_deadline, total_deadline);
+  // 一次停顿的上限再取一次 min（idle 通常就是总死线本身；流式下 total 是 max）
+  const auto pause_deadline = std::min(deadline, idle_deadline);
 
   size_t offset = 0;
   while (offset < len) {
@@ -66,7 +69,7 @@ WriteStatus send_all_with_deadline(
       if (eagain_count)
         eagain_count->fetch_add(1, std::memory_order_relaxed);
       const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            deadline - std::chrono::steady_clock::now())
+                            pause_deadline - std::chrono::steady_clock::now())
                             .count();
       if (left <= 0) {
         LOG_WARN("send: write deadline exceeded, {} of {} bytes unsent",
@@ -98,6 +101,29 @@ WriteStatus send_all_with_deadline(
 // ===========================================================================
 // ResponseWriter
 // ===========================================================================
+WriteStatus send_all_with_deadline(
+    int client_fd, const char* data, size_t len, int write_deadline_ms,
+    std::atomic<uint64_t>* eagain_count,
+    std::chrono::steady_clock::time_point total_deadline) {
+  return send_all_with_deadline_until(client_fd, data, len, write_deadline_ms,
+                                      eagain_count, total_deadline,
+                                      total_deadline);
+}
+
+std::chrono::steady_clock::time_point ResponseWriter::current_total_deadline()
+    const {
+  // 流式响应**没有**总死线：时长由上游回答长度决定（输出 4K token 就是几十秒到
+  // 几分钟），给它一个总时限等于"回答超过 X 秒就被切断"——正是本轮要修的缺陷。
+  // 防慢客户端改由空闲死线负责（见 current_idle_deadline）
+  return chunked_ ? std::chrono::steady_clock::time_point::max()
+                  : total_deadline_;
+}
+
+std::chrono::steady_clock::time_point ResponseWriter::current_idle_deadline()
+    const {
+  return chunked_ ? stream_idle_deadline_ : total_deadline_;
+}
+
 bool ResponseWriter::send_raw(std::string_view data) {
   if (failed_) return false;
   if (data.empty()) return true;
@@ -106,21 +132,23 @@ bool ResponseWriter::send_raw(std::string_view data) {
   // 缓冲拷贝。写不完的部分再进缓冲（后续 flush 续发）。
   WriteStatus st = WriteStatus::kOk;
   if (out_.empty()) {
-    st = send_all_with_deadline(fd_, data.data(), data.size(),
-                               write_deadline_ms_, eagain_count_,
-                               total_deadline_);
+    st = send_all_with_deadline_until(
+        fd_, data.data(), data.size(), write_deadline_ms_, eagain_count_,
+        current_total_deadline(), current_idle_deadline());
     if (st == WriteStatus::kOk) {
       bytes_sent_ += data.size();
+      // 流式：写出去了就说明客户端在跟读，把空闲死线向前推（这就是"续期"）
+      if (chunked_)
+        stream_idle_deadline_ = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(stream_idle_ms_);
       return true;
     }
-    if (st == WriteStatus::kDeadline) {
-      // 死线到：剩下的字节不再保留，直接标记失败
-      failed_ = true;
-      abort_ = AbortReason::kDeadline;
-      return false;
-    }
     failed_ = true;
-    abort_ = AbortReason::kClientGone;
+    // 总死线与空闲死线要分开报：前者是"这条响应整体写太久了"（缓冲式才可能），
+    // 后者是"客户端在流中途不读了"。排查时两者的处置完全不同
+    abort_ = (st == WriteStatus::kDeadline)
+                 ? (chunked_ ? AbortReason::kIdle : AbortReason::kDeadline)
+                 : AbortReason::kClientGone;
     return false;
   }
 
@@ -133,21 +161,21 @@ bool ResponseWriter::flush() {
   if (failed_) return false;
   if (out_.empty()) return true;
   const size_t n = out_.size();
-  WriteStatus st = send_all_with_deadline(fd_, out_.data(), n,
-                                         write_deadline_ms_, eagain_count_,
-                                         total_deadline_);
+  WriteStatus st = send_all_with_deadline_until(
+      fd_, out_.data(), n, write_deadline_ms_, eagain_count_,
+      current_total_deadline(), current_idle_deadline());
   if (st == WriteStatus::kOk) {
     bytes_sent_ += n;
     out_.clear();
+    if (chunked_)
+      stream_idle_deadline_ = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(stream_idle_ms_);
     return true;
   }
-  if (st == WriteStatus::kDeadline) {
-    failed_ = true;
-    abort_ = AbortReason::kDeadline;
-    return false;
-  }
   failed_ = true;
-  abort_ = AbortReason::kClientGone;
+  abort_ = (st == WriteStatus::kDeadline)
+               ? (chunked_ ? AbortReason::kIdle : AbortReason::kDeadline)
+               : AbortReason::kClientGone;
   return false;
 }
 
@@ -177,6 +205,12 @@ bool ResponseWriter::write_stream_head(int status_code,
   h.content_length = kChunkedLength;
   h.chunked = true;
   h.keep_alive = keep_alive;
+  // 起点：空闲死线从"响应头发出去"这一刻开始算。之后每次 write_body 成功都会
+  // 把它推到 now + 空闲值。上游迟迟不吐第一个 token（"首包很慢"）这段时间
+  // 也受同一个空闲值约束——否则一个连上就不发数据的上游能把 worker 挂死
+  stream_idle_deadline_ =
+      std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(stream_idle_ms_);
   // 流式响应头必须**立刻**发出去：客户端（curl -N / SSE 解析器）要看到 200 +
   // text/event-stream 才开始处理后续事件。缓冲到第一次 body 再发会让"上游迟迟
   // 不吐第一个 token"的场景表现为网关不响应
@@ -793,13 +827,19 @@ bool HttpServer::handle_buffer(int client_fd, bool peer_closed) {
 
     bool keep_alive = false;
     try {
-      // 整条响应的绝对写死线：单次 send 的死线由 send_all 内部按调用计时，
-      // 但对流式响应会调用很多次，必须有一个总上限兜住慢客户端
-      auto total_deadline =
-          std::chrono::steady_clock::now() +
-          std::chrono::seconds(config_.write_timeout_seconds);
+      // 写死线的两种口径（见 http_server.h 的 ResponseWriter 说明）：
+      //   缓冲式：write_timeout_seconds 是**整条响应**的总死线
+      //   流式  ：不设总死线（时长由回答长度决定），改用"两次写入之间的空闲超时"
+      // 是否流式由连接处理器扫请求体得到的 may_stream 预判（不解析 JSON）；
+      // 真正的流式判定仍在 handle_request 里由 wants_stream() 做
+      const bool may_stream = req.find("\"stream\"") != std::string::npos;
+      const auto total_deadline =
+          may_stream ? std::chrono::steady_clock::time_point::max()
+                     : std::chrono::steady_clock::now() +
+                           std::chrono::seconds(config_.write_timeout_seconds);
       ResponseWriter writer(client_fd, config_.write_timeout_seconds * 1000,
-                            total_deadline, &send_eagain_count_);
+                            total_deadline, &send_eagain_count_,
+                            config_.stream_idle_timeout_seconds * 1000);
       auto result = conn_handler_.process(req.data(), req.size(), writer);
       if (!result.response.empty()) {
         // 缓冲式响应：一次性写到底（大响应 + 慢客户端走 send_all 的等待路径）

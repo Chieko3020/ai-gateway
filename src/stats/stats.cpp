@@ -101,6 +101,11 @@ void Stats::record_stream_aborted() {
   ++streams_aborted_;
 }
 
+void Stats::record_stream_no_usage() {
+  std::lock_guard lock(mutex_);
+  ++streams_without_usage_;
+}
+
 void Stats::push_latency(int64_t ms) {
   latency_ring_[ring_pos_] = ms;
   ring_pos_ = (ring_pos_ + 1) % kLatencyWindow;
@@ -147,13 +152,14 @@ void Stats::report() const {
   //   cost/saved = 按输入/输出分档单价估算（默认 0.001/0.001 = 旧口径）；
   //                同时打印所用单价，避免"金额变了却查不出换没换价"
   LOG_INFO("[STATS] requests={} hits={} misses={} hit_rate={:.1f}% merged={} "
-           "bypassed={} streams={} streams_abort={} tokens={} saved={} "
+           "bypassed={} streams={} streams_abort={} streams_no_usage={} "
+           "tokens={} saved={} "
            "cost=¥{:.4f} saved=¥{:.4f} "
            "price_in=¥{}/1K price_out=¥{}/1K "
            "avg={}ms min={}ms max={}ms p50={}ms p95={}ms p99={}ms samples={} "
            "bypass_avg={}ms bypass_p50={}ms bypass_p95={}ms bypass_samples={}",
            total_, hits_, misses_, hit_rate() * 100, merged_, bypassed_,
-           streams_, streams_aborted_,
+           streams_, streams_aborted_, streams_without_usage_,
            total_prompt_tokens_ + total_completion_tokens_,
            tokens_saved_,
            estimated_cost(), saved,

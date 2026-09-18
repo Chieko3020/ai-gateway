@@ -135,6 +135,21 @@ void LruStore::set_source(const std::string& key, std::string source) {
   it->second->source = std::move(source);
 }
 
+std::optional<std::string> LruStore::source_of(const std::string& key) const {
+  std::lock_guard lock(mutex_);
+  auto it = iter_map_.find(key);
+  if (it == iter_map_.end()) return std::nullopt;
+  // 过期条目按不存在处理（与 get() 的口径一致，只是这里不真删——
+  // 只读方法不该改容器；真正清理由 get()/purge_expired() 负责）
+  if (ttl_seconds_ > 0) {
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+        Clock::now() - it->second->ctime).count();
+    if (age >= ttl_seconds_) return std::nullopt;
+  }
+  if (it->second->source.empty()) return std::nullopt;
+  return it->second->source;
+}
+
 std::optional<std::string> LruStore::get_exact(const std::string& lookup_key) {
   std::lock_guard lock(mutex_);
   auto now = Clock::now();

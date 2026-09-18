@@ -28,6 +28,7 @@
 #include "server/http_server.h"
 #include "server/metrics.h"
 #include "server/response.h"
+#include "server/sse_usage.h"
 #include "stats/stats.h"
 
 using namespace ai_gateway;
@@ -52,6 +53,19 @@ static uint64_t fnv1a_64(const std::string& s) {
 // （本项目 2026-09 刚补过 Bert WordPiece 的 lowercase/## 续接规则，正属此类）。
 // 历史值：v1 = 贪心 10 字符窗口（与官方不一致率 58.7%）；v2 = 对齐官方 WordPiece
 static constexpr const char* kTokenizerId = "bert-wordpiece@v2";
+
+// 向量产生方式的完整标识（进 embedding 指纹）：
+//   分词器实现 + 是否小写化 + 池化方式
+// 这三者任何一个改变，**同一段文本产生的向量就不同**，旧落盘向量与新查询向量
+// 不在同一个空间里，余弦相似度失去意义且不会报错。把它们拼进指纹，加载时会
+// 判定不一致 → 丢弃旧向量、保留文本条目、按新配置重建索引。
+// 本轮（v2-case-mean → v2-lower-cls）正是一次这样的变更：do_lower_case 默认
+// 由 false 改为 true、池化由 mean 改为 cls，因此**所有旧向量必然失效**。
+static std::string embedding_variant_id(const EmbeddingConfig& emb) {
+  return std::format("{}|lower={}|pooling={}", kTokenizerId,
+                     emb.do_lower_case ? "1" : "0",
+                     emb.pooling == PoolingMode::kCls ? "cls" : "mean");
+}
 
 // 把一条 message 的 content 拍平成纯文本：
 //   content 为 string       → 原样
@@ -141,6 +155,21 @@ static bool wants_stream(const std::string& request_body) {
   try {
     auto req = json::parse(request_body);
     return req.contains("stream") && req.value("stream", false);
+  } catch (...) {}
+  return false;
+}
+
+// 流式请求是否要求上游在最后一个事件里带上 usage。
+// OpenAI 兼容实现（含 DeepSeek）只在 `stream_options.include_usage: true` 时才发
+// usage 事件；客户端没要，网关就拿不到 token 数。
+// 网关**不会**擅自改写客户端请求去补这个字段（透明代理不能悄悄改变上游看到的
+// 请求），这种情况按"上游未提供 usage"处理并在报表里单列计数
+static bool stream_includes_usage(const std::string& request_body) {
+  try {
+    auto req = json::parse(request_body);
+    auto it = req.find("stream_options");
+    if (it == req.end() || !it->is_object()) return false;
+    return it->value("include_usage", false);
   } catch (...) {}
   return false;
 }
@@ -288,6 +317,10 @@ class SsePassthroughSink : public LlmStreamSink {
     }
     bytes_in_ += len;
     scan_for_done(data, len);
+    // 旁路观察一份 usage（不改动透传的字节）：token 用量只在最后一个 SSE 事件里，
+    // 客户端要求了 stream_options.include_usage 才存在。解析是有界窗口的
+    // 增量扫描，见 server/sse_usage.h
+    usage_.feed(data, len);
 
     std::string out =
         filter_->sse_feed(filter_state_, std::string_view(data, len),
@@ -326,6 +359,7 @@ class SsePassthroughSink : public LlmStreamSink {
   AbortReason abort_reason() const { return abort_; }
   int64_t first_byte_ms() const { return first_byte_ms_; }
   size_t bytes_in() const { return bytes_in_; }
+  const StreamUsage& usage() const { return usage_.usage(); }
   const std::string& rejected_event() const {
     return filter_state_.rejected_event;
   }
@@ -348,6 +382,7 @@ class SsePassthroughSink : public LlmStreamSink {
   bool keep_alive_ = true;
   bool head_sent_ = false;
   MessageFilter::SseFilterState filter_state_;
+  SseUsageParser usage_;  // 旁路观察 token 用量，不参与透传
   std::string tail_;
   bool done_seen_ = false;
   bool filter_rejected_ = false;
@@ -369,9 +404,15 @@ static HandleOutcome handle_stream_request(
   // 写 keep-alive 会把它挂死在"等下一个响应"上）；真正是否复用由连接处理器
   // 用同一份意愿决定
   const bool head_keep_alive = kStreamKeepAlive && client_wants_keep_alive;
+  const bool request_includes_usage = stream_includes_usage(request_body);
   SsePassthroughSink sink(filter, &writer, t0, head_keep_alive);
+  // 上游空闲死线：server.stream_idle_timeout_seconds（秒）-> 毫秒。
+  // 这是"上游不发数据"那一侧的防线——写死线只在**写客户端**时被检查，
+  // 上游静默时根本没有写调用发生（集成测试 C 段实测过这个缺口）
+  const int stream_idle_ms = cfg.server.stream_idle_timeout_seconds * 1000;
   auto result = call_llm_stream(cfg.backend.url, cfg.backend.api_key,
-                                request_body, cfg.backend.timeout_seconds, &sink);
+                                request_body, cfg.backend.timeout_seconds,
+                                stream_idle_ms, &sink);
 
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t0);
@@ -399,20 +440,32 @@ static HandleOutcome handle_stream_request(
       stats->record_stream_aborted();
       LOG_WARN("stream: aborted after {} bytes ({}), keep_alive={}",
                sink.bytes_in(),
-               sink.abort_reason() == AbortReason::kDeadline ? "write deadline"
-                                                             : "client gone",
+               sink.abort_reason() == AbortReason::kIdle
+                   ? "write idle timeout"
+                   : (sink.abort_reason() == AbortReason::kDeadline
+                          ? "write deadline"
+                          : "client gone"),
                keep_alive ? "yes" : "no");
     } else {
-      // usage 在 SSE 的最后一个事件里；透传路径要拿到它必须解析事件流，
-      // 本轮**不解析**（token 计数因此为 0，见简报"未修/需决策"）。
+      // token 统计：usage 在最后一个 SSE 事件里（且只在客户端带了
+      // stream_options.include_usage 时上游才会发）。SseUsageParser 旁路解析这份
+      // 用量，透传的字节一个都没动。上游没给 usage 时**优雅退化为 0**，
+      // 并用 streams_no_usage 单列计数——"网关没解析"与"上游没给"在报表里可区分
+      const StreamUsage usage = sink.usage();
+      if (!usage.seen) stats->record_stream_no_usage();
       // 延迟口径：进样本池的是首字节延迟 TTFT，total 只进日志
-      stats->record_stream(sink.first_byte_ms(), elapsed.count(), 0, 0);
+      stats->record_stream(sink.first_byte_ms(), elapsed.count(),
+                           static_cast<int>(usage.prompt_tokens),
+                           static_cast<int>(usage.completion_tokens));
       LOG_INFO_SAMPLED(
           "stream: done ttft={}ms total={}ms bytes={} done_event={} "
-          "filter_rejected={} keep_alive={}",
+          "filter_rejected={} keep_alive={} tokens_in={} tokens_out={} "
+          "usage_seen={} include_usage={}",
           sink.first_byte_ms(), elapsed.count(), sink.bytes_in(),
           sink.done_seen() ? "yes" : "no", sink.filter_rejected() ? "yes" : "no",
-          keep_alive ? "yes" : "no");
+          keep_alive ? "yes" : "no", usage.prompt_tokens,
+          usage.completion_tokens, usage.seen ? "yes" : "no",
+          request_includes_usage ? "yes" : "no");
     }
     if (sink.filter_rejected())
       LOG_WARN("filter: rejected SSE event ({} bytes, contains URL)",
@@ -690,6 +743,11 @@ int main(int argc, char* argv[]) {
   // 否则示例里的模型名永远不会生效，报告 M15）
   auto onnx_embed = std::make_shared<OnnxEmbedding>(
       cfg.embedding.model_path, cfg.embedding.vocab_path, cfg.embedding.dim);
+  // 分词大小写与池化方式必须在**任何 encode() 之前**设置：
+  // 构造期做的那次"维度探测"推理也会用到它们，更关键的是随后计算指纹时
+  // 要如实反映"这批向量是怎么产生的"（见 embedding_variant_id）
+  onnx_embed->set_do_lower_case(cfg.embedding.do_lower_case);
+  onnx_embed->set_pooling(cfg.embedding.pooling);
 
   // 维度不符属配置错误：启动即失败（旧实现按 min(dims, out_dim) 静默截断，
   // 索引维度与配置声明不一致且没有任何告警，报告 M15）。
@@ -730,9 +788,11 @@ int main(int argc, char* argv[]) {
   // 因此落盘时记录指纹、加载时比对；不一致就丢弃向量（保留文本）并按新模型重建。
   EmbeddingFingerprint fp;
   if (cfg.cache.enabled && onnx_embed->ready()) {
+    const std::string variant = embedding_variant_id(cfg.embedding);
     fp = make_embedding_fingerprint(cfg.embedding.model_path,
                                     cfg.embedding.vocab_path, cfg.embedding.dim,
-                                    kTokenizerId);
+                                    variant);
+    LOG_INFO("cache: embedding variant {}", variant);
     if (!fp.valid()) {
       // 模型能加载却算不出文件哈希（权限/IO 异常）：不能把空指纹当成"匹配"
       LOG_WARN("cache: embedding fingerprint unavailable "

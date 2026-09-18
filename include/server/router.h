@@ -15,6 +15,11 @@ namespace ai_gateway {
 // 目前只有一项：客户端的连接复用意愿（由版本 + Connection 头决定）。
 // 为什么必须传给 handler：流式响应由 handler 自己写响应头，Connection 头必须
 // 如实反映这个意愿，否则客户端会被挂死在"等下一个响应"上
+//
+// 注：写死线的口径（流式用空闲超时 / 缓冲式用总死线）**不在这里**传递——
+// 它由 worker 层（http_server.cpp）从请求体里直接预判 `"stream"` 子串得到。
+// 理由：那是连接层写路径自己的参数，路由 handler 从不需要读它；为省一次子串
+// 扫描而把它做成跨层字段，只会让"谁决定死线口径"分散在两处
 struct HttpRequestInfo {
   bool keep_alive = false;
 };

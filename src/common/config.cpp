@@ -1,6 +1,7 @@
 // 配置加载实现：nlohmann/json 解析 + 环境变量读取
 #include "common/config.h"
 
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -51,9 +52,13 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       out.server.max_connections = s.value("max_connections", size_t{256});
       out.server.idle_timeout_seconds = s.value("idle_timeout_seconds", 30);
       out.server.max_header_bytes = s.value("max_header_bytes", size_t{65536});
-      out.server.write_timeout_seconds = s.value("write_timeout_seconds", 10);
+      out.server.write_timeout_seconds = s.value("write_timeout_seconds", 60);
       // 0/负数会让"写超时"退化成立刻放弃（等价于旧的截断行为），夹到最小值 1
       if (out.server.write_timeout_seconds < 1) out.server.write_timeout_seconds = 1;
+      out.server.stream_idle_timeout_seconds =
+          s.value("stream_idle_timeout_seconds", 60);
+      if (out.server.stream_idle_timeout_seconds < 1)
+        out.server.stream_idle_timeout_seconds = 1;
     }
 
     // --- backend ---
@@ -75,6 +80,29 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
         LOG_ERROR("embedding.dim={} must be > 0", out.embedding.dim);
         return 1;
       }
+      // 默认 true = 官方 sentence_bert_config.json 的取值（见 config.h 的说明）
+      out.embedding.do_lower_case = e.value("do_lower_case", true);
+      // 池化：只接受 "cls" / "mean"（大小写不敏感）。拼错时**启动即失败**，
+      // 不静默退回默认值——池化方式决定了向量的语义，配错了只会表现为
+      // "命中率变差"这种没有任何报错的慢性问题
+      if (e.contains("pooling")) {
+        if (!e["pooling"].is_string()) {
+          LOG_ERROR("embedding.pooling must be a string (\"cls\" or \"mean\")");
+          return 1;
+        }
+        std::string mode = e["pooling"].get<std::string>();
+        for (char& c : mode)
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (mode == "cls") {
+          out.embedding.pooling = PoolingMode::kCls;
+        } else if (mode == "mean") {
+          out.embedding.pooling = PoolingMode::kMean;
+        } else {
+          LOG_ERROR("embedding.pooling=\"{}\" is not one of \"cls\"/\"mean\"",
+                    e["pooling"].get<std::string>());
+          return 1;
+        }
+      }
     }
 
     // --- cache ---
@@ -82,6 +110,7 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       auto& c = root["cache"];
       out.cache.enabled = c.value("enabled", true);
       out.cache.similarity_threshold = c.value("similarity_threshold", 0.85f);
+      out.cache.entity_veto = c.value("entity_veto", true);
       out.cache.max_entries = c.value("max_entries", 10000);
       out.cache.ttl_days = c.value("ttl_days", 7);
     }
@@ -132,6 +161,15 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
              out.server.max_connections, out.server.idle_timeout_seconds,
              out.log.max_bytes, out.log.keep_files,
              out.cost.input_per_1k, out.cost.output_per_1k);
+    // 影响向量的三个开关单独落一行：它们决定"旧向量还能不能用"，
+    // 出问题时这一行是唯一能还原现场的证据
+    LOG_INFO("embedding: pooling={} do_lower_case={} dim={} | cache threshold={:.3f} "
+             "entity_veto={} | write_deadline={}s stream_idle={}s",
+             out.embedding.pooling == PoolingMode::kCls ? "cls" : "mean",
+             out.embedding.do_lower_case ? "true" : "false", out.embedding.dim,
+             out.cache.similarity_threshold, out.cache.entity_veto ? "on" : "off",
+             out.server.write_timeout_seconds,
+             out.server.stream_idle_timeout_seconds);
     return 0;
   } catch (const std::exception& e) {
     LOG_ERROR("config parse error: {}", e.what());

@@ -451,8 +451,11 @@ OnnxEmbedding::OnnxEmbedding(const std::string& model_path,
     return;
   }
   output_dim_ = static_cast<int>(probe.size());
-  LOG_INFO("onnx: model loaded configured_dim={} model_output_dim={}",
-           dims_, output_dim_);
+  LOG_INFO("onnx: model loaded configured_dim={} model_output_dim={} "
+           "pooling={} do_lower_case={}",
+           dims_, output_dim_,
+           pooling_ == PoolingMode::kCls ? "cls" : "mean",
+           tokenizer_.do_lower_case() ? "true" : "false");
   if (output_dim_ != dims_) {
     LOG_ERROR("onnx: model output dim {} != configured embedding.dim {}, "
               "refusing to load (the index would silently drop every vector)",
@@ -569,18 +572,38 @@ std::vector<float> OnnxEmbedding::encode(std::string_view text) {
     return {};
   }
 
-  // 沿序列长度做均值池化。构造期已保证 dims_ == 模型实际输出维度，
-  // 因此这里的 min() 不会真的截断（保留以防御性处理异常模型）
+  // 池化：把 [1, seq_len, out_dim] 的 last_hidden_state 压成 [out_dim] 句向量。
+  //   官方 bge-small-zh-v1.5 的 1_Pooling/config.json 是 pooling_mode_cls_token=true、
+  //   pooling_mode_mean_tokens=false，模型卡写 "select the last hidden state of the
+  //   first token ([CLS])"，因此默认走 CLS。
+  //   构造期已保证 dims_ == 模型实际输出维度，因此这里的 min() 不会真的截断
+  //   （保留以防御性处理异常模型）
   int effective_dim = std::min(dims_, out_dim);
   std::vector<float> result(effective_dim, 0.0f);
-  for (int64_t t = 0; t < seq_len; ++t) {
-    for (int d = 0; d < effective_dim; ++d) {
-      result[d] += out_data[t * out_dim + d];
+  if (pooling_ == PoolingMode::kCls) {
+    // last_hidden_state[:, 0, :]：[CLS] 位已经过整个序列的自注意力，
+    // 是 BERT 类模型训练时约定的句表示（不做 mask 加权——[CLS] 恒在 mask 内）
+    for (int d = 0; d < effective_dim; ++d) result[d] = out_data[d];
+  } else {
+    // 按 attention_mask 加权的均值。本实现的 input_ids 里 [PAD] 只在 max_len
+    // 截断时出现（单条文本、无 padding），mask 因此全为 1 —— 加权与不加权结果相同，
+    // 这里仍按加权写，是为了与官方 mean 池化的定义逐字对应，不依赖"恰好没有 pad"
+    int64_t mask_sum = 0;
+    for (int64_t t = 0; t < seq_len; ++t) mask_sum += mask[static_cast<size_t>(t)];
+    if (mask_sum <= 0) mask_sum = 1;
+    for (int64_t t = 0; t < seq_len; ++t) {
+      if (mask[static_cast<size_t>(t)] == 0) continue;
+      for (int d = 0; d < effective_dim; ++d) {
+        result[d] += out_data[t * out_dim + d];
+      }
     }
+    for (int d = 0; d < effective_dim; ++d)
+      result[d] /= static_cast<float>(mask_sum);
   }
-  for (int d = 0; d < effective_dim; ++d) result[d] /= static_cast<float>(seq_len);
 
-  // L2 normalize（bge 需要归一化向量用于余弦相似度）
+  // L2 normalize（bge 需要归一化向量用于余弦相似度；两种池化都在归一化之前）
+  // 注：归一化对 CLS 与 mean 都必要——余弦相似度在下面的 HNSW 检索里按点积算，
+  // 没有这一步"向量长度"会混进相似度
   float norm = 0.0f;
   for (float v : result) norm += v * v;
   norm = std::sqrt(norm) + 1e-12f;

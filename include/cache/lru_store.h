@@ -51,6 +51,12 @@ class LruStore {
   // 因此把来源键挂在同一条目上（旧实现为此额外存了一份完整回复，见报告 M4）
   void set_source(const std::string& key, std::string source);
 
+  // 读取条目的来源文本（**只读**，不移动 LRU 位置、不计 hit/miss）。
+  // 为什么不能复用 get()：实体一致性否决只需要看"产生这条向量的是哪段文本"，
+  // 用 get() 会把一次否决记成一次命中（污染 hit_rate），还会把未被采用的候选
+  // 顶到 LRU 头部（改变淘汰顺序）
+  std::optional<std::string> source_of(const std::string& key) const;
+
   // 精确匹配：key 命中或条目的 source 命中，返回第一条未过期条目的回复。
   // 用于 embedding 不可用时的降级路径（旧实现靠"再存一份 ns_key"实现）
   std::optional<std::string> get_exact(const std::string& lookup_key);

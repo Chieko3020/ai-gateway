@@ -69,6 +69,15 @@ class CacheEngine {
   // 配置访问
   float threshold() const { return threshold_; }
   int top_k() const { return top_k_; }
+  bool entity_veto_enabled() const { return entity_veto_; }
+
+  // 实体一致性否决的观测计数：命中候选的相似度过了阈值、但因为实体不一致
+  // （数字/大写缩略语/混合标识符对不上）被否决的次数。
+  // 单列计数器而不是只落日志：这个数字直接回答"否决规则有没有在工作、
+  // 会不会把正常流量也拦掉"（阈值调优时它是主要输入）
+  size_t entity_veto_count() const {
+    return entity_veto_count_.load(std::memory_order_relaxed);
+  }
 
   // 幽灵向量观测：返回"搜到但取不到"的比例，用于判断是否需要 rebuild_index
   std::pair<int, size_t> ghost_stats() const;
@@ -91,6 +100,9 @@ class CacheEngine {
 
   EmbedFn embed_fn_;
   float threshold_ = 0.0f;  // 由 CacheConfig 注入
+  // 实体一致性否决开关（CacheConfig::entity_veto）。关闭时退回"纯阈值"判定，
+  // 便于把"否决规则带来的收益/损失"做成 A/B 对照（评测脚本按这个口径跑）
+  bool entity_veto_ = true;
   int top_k_ = 3;
   int64_t next_id_ = 1;
 
@@ -101,6 +113,8 @@ class CacheEngine {
   // 与 ghost_stats()/try_rebuild_if_ghosty() 的读取构成数据竞争），故用原子量
   std::atomic<size_t> ghost_count_{0};
   std::atomic<size_t> total_search_{0};
+  // 实体否决计数：同样是锁外自增的热路径计数器，用原子量
+  std::atomic<size_t> entity_veto_count_{0};
 };
 
 }  // namespace ai_gateway
