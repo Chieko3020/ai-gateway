@@ -127,7 +127,21 @@ static std::string handle_request(const std::string& request_body,
                                    Stats* stats) {
   auto t0 = std::chrono::steady_clock::now();
 
-  // 0. 不可缓存流量：带工具调用或流式的请求直接透传（不查缓存、不写缓存、不参与请求合并）
+  // 1. 输入过滤（所有路径都必须执行）
+  //    旁路（工具调用/流式）只应跳过缓存与请求合并，不能跳过安全过滤：
+  //    否则客户端加一个 "stream": true 就能绕过注入检测、URL 拦截、屏蔽词与长度截断
+  std::string user_msg = extract_user_message(request_body);
+  if (!user_msg.empty()) {
+    auto f_result = filter->check_input(user_msg);
+    if (f_result.action == FilterAction::kReject) {
+      LOG_WARN("filter: rejected input: {}", f_result.reject_msg);
+      return R"({"error":"Request rejected"})";
+    }
+    if (f_result.action == FilterAction::kTruncate)
+      user_msg = f_result.sanitized;
+  }
+
+  // 2. 不可缓存流量：带工具调用或流式的请求直接转发（不查缓存、不写缓存、不参与请求合并）
   if (is_uncacheable_request(request_body)) {
     auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
                            request_body, cfg.backend.timeout_seconds);
@@ -157,19 +171,7 @@ static std::string handle_request(const std::string& request_body,
   // 缓存命中检查时带回的 embedding（避免 cache_reply 重复计算）
   std::vector<float> cached_embedding;
 
-  // 4a. 输入过滤
-  std::string user_msg = extract_user_message(request_body);
-  if (!user_msg.empty()) {
-    auto f_result = filter->check_input(user_msg);
-    if (f_result.action == FilterAction::kReject) {
-      LOG_WARN("filter: rejected input: {}", f_result.reject_msg);
-      return R"({"error":"Request rejected"})";
-    }
-    if (f_result.action == FilterAction::kTruncate)
-      user_msg = f_result.sanitized;
-  }
-
-  // 4b. 语义缓存
+  // 3. 语义缓存
   std::string ns;
   std::string ns_key;
   if (cfg.cache.enabled && !user_msg.empty()) {
@@ -185,7 +187,7 @@ static std::string handle_request(const std::string& request_body,
     cached_embedding = std::move(hit.embedding);
   }
 
-  // 4c. 请求合并（singleflight）
+  // 4. 请求合并（singleflight）
   // 本请求作为 leader 占用的槽位（insert 的返回值）；只有它有权 complete/cancel，
   // 这样"等待超时后被新 leader 顶替"的旧 leader 不会误写别人的 promise
   std::shared_ptr<std::promise<std::string>> sf_slot;
@@ -220,11 +222,11 @@ static std::string handle_request(const std::string& request_body,
     sf_slot = sf->insert(ns_key, cached_embedding);
   }
 
-  // 4d. 缓存未命中 转发 LLM
+  // 5. 缓存未命中 转发 LLM
   auto result = call_llm(cfg.backend.url, cfg.backend.api_key,
                          request_body, cfg.backend.timeout_seconds);
 
-  // 4e. singleflight 完成/取消（仅当本请求仍是该 key 的 leader）
+  // 6. singleflight 完成/取消（仅当本请求仍是该 key 的 leader）
   bool ok = (result.status_code >= 200 && result.status_code < 300);
   if (sf_slot) {
     if (ok) sf->complete(ns_key, result.body, sf_slot);
@@ -234,7 +236,7 @@ static std::string handle_request(const std::string& request_body,
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t0);
 
-  // 4f. 解析 token 用量
+  // 7. 解析 token 用量
   int prompt_tokens = 0, completion_tokens = 0;
   if (result.status_code >= 200 && result.status_code < 300) {
     try {
@@ -245,12 +247,12 @@ static std::string handle_request(const std::string& request_body,
     } catch (...) {}
   }
 
-  // 4g. 写入缓存
+  // 8. 写入缓存
   if (ok && cfg.cache.enabled && !user_msg.empty())
     engine->cache_reply(user_msg, result.body, cached_embedding,
                         extract_namespace(request_body));
 
-  // 4h. 统计
+  // 9. 统计
   stats->record_api_call(elapsed.count(), prompt_tokens, completion_tokens);
 
   if (ok)
@@ -259,7 +261,7 @@ static std::string handle_request(const std::string& request_body,
     LOG_WARN("{} {} {}ms", result.status_code,
              result.body.size() > 0 ? result.body : "(empty)", elapsed.count());
 
-  // 输出过滤
+  // 10. 输出过滤
   auto out_result = filter->check_output(result.body);
   if (out_result.action == FilterAction::kReject) {
     LOG_WARN("filter: rejected output containing URL");
