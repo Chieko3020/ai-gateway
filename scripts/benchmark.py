@@ -2,10 +2,17 @@
 """AI Gateway 压测脚本 — 命中判定基于网关返回的 `_cache` 字段
 （旧版用"延迟 < 800ms"猜测命中，阈值一旦失准命中率就整体偏移）
 
+目标地址：默认 http://127.0.0.1:4100/v1/chat/completions，即本地测试实例。
+指向线上实例（监听 4000）之前必须显式传 --url 并确认影响：压测流量会真实写进
+线上缓存（污染命中率与缓存内容），并消耗真实上游 token 与费用。
+历史事故：默认值曾写成 4000，一次压测把流量打进了线上缓存。
+
 用法:
   python3 scripts/benchmark.py --level 2 --dataset scripts/datasets/synthetic.jsonl
   python3 scripts/benchmark.py --level 2 --dataset scripts/datasets/real.jsonl --out results/replay_real.json
   python3 scripts/benchmark.py --level 3 --concurrency 4
+  # 只有在明确要打线上时才显式指定（端口 4000）：
+  python3 scripts/benchmark.py --level 2 --url http://127.0.0.1:4000/v1/chat/completions
 """
 
 import argparse
@@ -16,7 +23,8 @@ import sys
 import threading
 import time
 
-DEFAULT_URL = "http://127.0.0.1:4000/v1/chat/completions"
+# 默认打本地测试实例（测试实例端口 4100；线上实例是 4000，不要用它当默认值）
+DEFAULT_URL = "http://127.0.0.1:4100/v1/chat/completions"
 MODEL = "deepseek-v4-flash"
 
 
@@ -165,9 +173,22 @@ def level_concurrent(url, msgs, concurrency=4, rounds_per_thread=3):
     }
 
 
+def warn_if_not_local(url):
+    """非本机目标（尤其线上部署实例）时给出显式警告：这类压测会真实写缓存、烧 token"""
+    from urllib.parse import urlparse
+    host = urlparse(url).hostname or ""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return
+    print(f"⚠️  目标 {url} 不是本机（host={host}）：压测流量会写入该实例的缓存并"
+          f"消耗真实上游 token/费用；若不是有意为之，请改回 "
+          f"--url {DEFAULT_URL}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default=DEFAULT_URL)
+    ap.add_argument("--url", default=DEFAULT_URL,
+                    help=f"网关地址（默认 {DEFAULT_URL}，本地测试实例；"
+                         f"指向线上实例前请确认影响）")
     ap.add_argument("--dataset", default="scripts/datasets/synthetic.jsonl")
     ap.add_argument("--level", type=int, choices=[1, 2, 3], default=2)
     ap.add_argument("--rounds", type=int, default=2)
@@ -182,6 +203,7 @@ def main():
         print(f"❌ 数据集为空: {args.dataset}", file=sys.stderr)
         return 1
 
+    warn_if_not_local(args.url)
     print(f"{'='*64}\n数据集: {args.dataset} ({len(msgs)} 条) | 目标: {args.url}\n{'='*64}")
 
     report = {"url": args.url, "dataset": args.dataset, "n": len(msgs)}
