@@ -41,6 +41,7 @@ CacheEngine::CacheEngine(const EmbeddingConfig& emb_cfg,
                          EmbedFn embed_fn)
     : emb_cfg_(emb_cfg),
       threshold_(cache_cfg.similarity_threshold),
+      hnsw_cfg_(index ? index->config() : HnswConfig{}),
       store_(std::move(store)),
       index_(std::move(index)),
       embed_fn_(std::move(embed_fn)) {}
@@ -130,7 +131,7 @@ void CacheEngine::rebuild_index() {
 
   // 1. 锁外构建新索引：建图要对每个条目跑一次 O(ef_construction) 搜索，
   //    整个过程持 mutex_ 会让检索与写入全部阻塞，因此先构建、再交换。
-  auto new_index_ptr = std::make_shared<HnswIndex>();
+  auto new_index_ptr = std::make_shared<HnswIndex>(hnsw_cfg_);
   auto& new_idx = *new_index_ptr;
 
   // next_id_ 不能由"存活条目数 + 1"派生：TTL 是逐条过期的，存活键的空间里存在空洞，

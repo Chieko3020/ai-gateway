@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "common/logger.h"
+
 namespace ai_gateway {
 
     // add(vec):   随机层级 逐层找到最近邻 建双向边
@@ -61,7 +63,12 @@ class HnswIndex {
 
   void add(int id, const std::string& key, const std::vector<float>& embedding) {
     std::lock_guard lock(mutex_);
-    if (static_cast<int>(embedding.size()) != cfg_.dim) return;
+    if (static_cast<int>(embedding.size()) != cfg_.dim) {
+      // 原来静默 return：维度不符时索引会悄悄变空、缓存退化为永不命中且无任何线索
+      LOG_WARN("hnsw: skip vector dim={} (index dim={}), key={}",
+               embedding.size(), cfg_.dim, key);
+      return;
+    }
 
     // 层数按论文的几何分布：level = floor(-ln(U) * mL)，mL = 1/ln(M)
     // 使 P(level >= 1) ≈ 1/M（M=16 时约 6.25%），保持高层稀疏、专司粗导航。
@@ -153,6 +160,9 @@ class HnswIndex {
     std::shared_lock lock(mutex_);
     return nodes_.size();
   }
+
+  // 构建参数：供持有者（CacheEngine）在重建索引时沿用同一套配置
+  const HnswConfig& config() const { return cfg_; }
 
   // 持久化：索引由 LruStore 管理（for_each_embedding 重建），不需要独立 save/load
   void save(const std::string&) const {}

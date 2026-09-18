@@ -78,6 +78,9 @@ class CacheEngine {
 
  private:
   EmbeddingConfig emb_cfg_;
+  // 构造时传入的索引构建参数：rebuild_index() 用它重建，
+  // 避免重建出来的索引悄悄退回 HnswConfig 的默认值（与首个索引不一致）
+  HnswConfig hnsw_cfg_;
   std::shared_ptr<LruStore> store_;
 
   // 索引由本引擎独占持有（调用方不应继续持有同一个 shared_ptr 用于观察）。
