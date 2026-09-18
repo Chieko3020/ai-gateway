@@ -48,6 +48,8 @@ int main() {
     // 日志轮转参数来自配置（示例配置显式给出 10MB / 5 份）
     CHECK(cfg.log.max_bytes == 10 * 1024 * 1024); ok++;
     CHECK(cfg.log.keep_files == 5); ok++;
+    // 报告 8.7 第 3 条：写超时可配置（大响应 + 慢客户端时 worker 的等待上限）
+    CHECK(cfg.server.write_timeout_seconds >= 1); ok++;
 
     // 默认值兜底：空配置（不存在的键）时的默认必须自洽
     {
@@ -63,6 +65,8 @@ int main() {
         // 单价缺省 = 旧的统一口径，保证不配置时报表金额与修复前完全一致
         CHECK(def.cost.input_per_1k == 0.001); ok++;
         CHECK(def.cost.output_per_1k == 0.001); ok++;
+        // 写超时默认 10s（0/负值会被夹到 1）：保证"等到写完"不会无限期
+        CHECK(def.server.write_timeout_seconds == 10); ok++;
     }
 
     return test_check::finish("test_config", ok);
