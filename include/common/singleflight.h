@@ -4,6 +4,8 @@
 //   1. 精确字符串匹配 O(1)：key = namespace:user_message
 //   2. 向量语义匹配 O(N)：cosine(embedding, in_flight.embedding) >= 0.95
 //      **并且**（entity_veto 打开时）与在途 leader 的实体标记一致
+//      **并且** 与在途 leader 处于同一个 namespace（无 system prompt 时同样是
+//      "无 namespace"这一档，不与非空 namespace 的候选合并）
 //
 // 为什么合并也要做实体一致性校验（第六轮修复）：
 //   余弦只反映"整体语义接近"，对"同一模板、只差一个编号"的句子没有判别力。
@@ -14,6 +16,19 @@
 //   合并路径此前只比余弦，`cache.entity_veto` 只挂在缓存命中路径上，是个缺口。
 //   复用同一套规则（cache/entity_tokens.h）后两条路径口径一致：数字/大写缩略语/
 //   混合标识符存在不对称差集就不许合并。
+//
+// 为什么合并还要做 namespace 隔离（本轮修复，报告 H2）：
+//   第六轮只补了"实体"这一个维度，namespace 维度仍缺：第二层语义匹配拿到了
+//   候选 key（`for (auto& [k, entry] : inflight_)`）却**不看它**，于是缓存命中
+//   路径的隔离（system prompt 的 FNV-1a 哈希 + 前缀二次过滤，见
+//   cache_engine.cpp 的 r.key.starts_with(ns_prefix)）在合并路径被整体绕过。
+//   实测：两个 system prompt 不同的对话、user message 相同、间隔 0.25s 并发 →
+//   B 拿到 `_cache:"merged"` 且内容是 **A 对话的答案**。user message 相同时
+//   余弦恒为 1.0，因此不需要任何"近似"条件就必然触发。
+//
+//   无 system prompt（namespace 为空）的请求必须**对称地**只与同样无 namespace
+//   的条目合并，而不是"空 ns 表示不做限制"：后者会把无 system 的请求与任意
+//   带 system 的对话合并到同一份答案上，等于把上面那个洞从另一侧敞开。
 //
 // 失败不共享：LLM 返回错误时以 SingleflightCancelled 异常结束该 promise，
 // 等待者 get() 抛出该异常后各自回源重试（不能靠"销毁 promise 让等待者超时"：
@@ -48,6 +63,12 @@ class Singleflight {
  public:
   // 尝试合并到已有进行中请求。返回 shared_future 供等待，nullopt 表示无匹配
   //
+  // key / key_prefix：key 是本次请求的完整合并键（ns_key = "ns<hash>:" + user_msg
+  // 或裸 user_msg）；key_prefix 是**它自己的 namespace 前缀**（"ns<hash>:" 或空串）。
+  // 第二层语义匹配时用它过滤候选：只有同 namespace 的在途条目才允许合并
+  // （前缀为空 = 只与同样无 namespace 的条目合并，见文件头说明）。
+  // 精确匹配层用完整 key 查表，天然带 namespace，无需再校验。
+  //
   // query_entities / entity_veto：与缓存命中路径同一套实体一致性硬约束
   // （CacheConfig::entity_veto）。veto 打开时，候选 leader 的数字/大写缩略语/
   // 混合标识符与查询存在不对称差集就跳过它（**跳过而不是整体放弃**：在途表里可能
@@ -58,7 +79,8 @@ class Singleflight {
   // 会把语义相反的两种情况混成一种。
   std::optional<std::shared_future<std::string>> try_merge(
       const std::string& key, const std::vector<float>& embedding,
-      const EntityTokens& query_entities, bool entity_veto);
+      const std::string& key_prefix, const EntityTokens& query_entities,
+      bool entity_veto);
 
   // 插入新的进行中请求（try_merge 返回 nullopt 后调用）
   // entities 为该 leader 自己那段用户消息的实体标记，供后续 try_merge 比对方
@@ -88,6 +110,12 @@ class Singleflight {
  private:
   static float cosine(const std::vector<float>& a, const std::vector<float>& b);
 
+  // 候选 key 是否与本次请求处于同一个 namespace。
+  // prefix 为空（请求自身没有 system prompt）时：只接受同样**不带** ns 前缀的
+  // 候选 key。ns 前缀的形状由本文件的使用方约定：main/pipeline 里是
+  // "ns" + 16 位十六进制（FNV-1a 64 位）+ ":"，见 extract_namespace()
+  static bool same_namespace(const std::string& candidate, const std::string& prefix);
+
   struct Entry {
     std::vector<float> embedding;
     // leader 自己那段用户消息的实体标记（在 insert 时提取一次；try_merge 每次比
@@ -116,9 +144,29 @@ inline float Singleflight::cosine(const std::vector<float>& a,
   return std::clamp(sim, -1.0f, 1.0f);
 }
 
+// ns 前缀的形状："ns" + 16 位十六进制 + ":"（extract_namespace() 的产物）。
+// 判定"无 ns"时按这个形状识别，而不是简单地"看有没有冒号"——用户消息本身完全
+// 可能含冒号（"http://..."、"key:value"），那些都不该被当成命名空间
+inline bool Singleflight::same_namespace(const std::string& candidate,
+                                         const std::string& prefix) {
+  if (!prefix.empty()) return candidate.starts_with(prefix);
+  // 本次请求没有 system prompt：只有当候选也不带 ns 前缀时才允许合并
+  constexpr size_t kNSPrefixLen = 19;  // "ns" + 16 hex + ":"
+  if (candidate.size() < kNSPrefixLen) return true;
+  if (candidate.compare(0, 2, "ns") != 0) return true;
+  if (candidate[18] != ':') return true;
+  for (size_t i = 2; i < 18; ++i) {
+    const char c = candidate[i];
+    const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    if (!hex) return true;  // 不是 ns 前缀形状
+  }
+  return false;  // 候选带 ns 前缀，而本次请求没有 → 不许合并
+}
+
 inline std::optional<std::shared_future<std::string>> Singleflight::try_merge(
     const std::string& key, const std::vector<float>& embedding,
-    const EntityTokens& query_entities, bool entity_veto) {
+    const std::string& key_prefix, const EntityTokens& query_entities,
+    bool entity_veto) {
   std::lock_guard lock(mutex_);
 
   // 第一层：精确字符串匹配。key 相同 ⇒ namespace 与（截断后的）用户消息原文都
@@ -126,8 +174,11 @@ inline std::optional<std::shared_future<std::string>> Singleflight::try_merge(
   auto it = inflight_.find(key);
   if (it != inflight_.end()) return it->second.future;
 
-  // 第二层：向量语义匹配（阈值 0.95，比缓存命中更严格）+ 实体一致性
+  // 第二层：向量语义匹配（阈值 0.95，比缓存命中更严格）
+  //   + namespace 一致（报告 H2：跨对话串答案，缓存命中有这道闸、合并路径此前没有）
+  //   + 实体一致性
   for (auto& [k, entry] : inflight_) {
+    if (!same_namespace(k, key_prefix)) continue;
     if (cosine(embedding, entry.embedding) < 0.95f) continue;
     // 语义接近但实体不同：跳过这条候选（不能把"编号1234"的答案发给"编号5678"）；
     // 与 cache_engine 的命中路径同款判定，见 cache/entity_tokens.h 的规则说明
