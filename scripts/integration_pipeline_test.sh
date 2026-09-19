@@ -385,6 +385,52 @@ PY
 }
 
 echo
+# ═══════════════════════════════════════════════════════════════════════
+echo
+echo "== E. L1: 正常关闭空闲 keep-alive 连接不得打成 WARN =="
+# ═══════════════════════════════════════════════════════════════════════
+# 旧实现在 handle_buffer 里把"缓冲区为空 + 对端 FIN"（= 客户端的正常关闭）也打成
+# `incomplete header (0 bytes, eof=true), closing`：压测里这类 WARN 占 27%，
+# ops-incident-log 8.10 的崩溃现场最后两行正是它（曾被当成线索排查）。
+# 这里用"连上就关"确定性地走那条分支：修复前每条连接都会产出一条 WARN
+# （实测 3 条连接 → 3 条 WARN；修复后 0 条）。
+{
+  UP_PORT_E="$(pick_port)"
+  python3 "$PROBE" upstream --port "$UP_PORT_E" >"$UP_LOG" 2>&1 &
+  UP_PID=$!
+  for _ in $(seq 1 60); do
+    grep -q "LISTENING" "$UP_LOG" 2>/dev/null && break
+    sleep 0.1
+  done
+  start_gateway "$UP_PORT_E" "E" || { kill "$UP_PID" 2>/dev/null; exit 2; }
+
+  python3 -c "
+import socket
+for _ in range(3):
+    s = socket.create_connection(('127.0.0.1', ${GW_PORT}), timeout=5)
+    s.close()
+"
+  sleep 0.8
+  # 用 python 计数：grep -c 在多文件/二进制输入下的输出格式不稳定（实测给出
+  # "0\n0" 这种两行结果，把下面的判断带偏）
+  N_WARN="$(python3 -c "
+import sys
+try:
+    data = open(sys.argv[1], 'rb').read().decode('utf-8', 'replace')
+except OSError:
+    print(0); raise SystemExit
+print(sum(1 for line in data.splitlines() if 'incomplete header' in line))
+" "$GW_LOG")"
+  if [[ "${N_WARN:-1}" == "0" ]]; then
+    ok "正常关闭空闲连接没有产生 incomplete header WARN"
+  else
+    bad "出现了 ${N_WARN} 条 incomplete header WARN（正常关闭被误报）"
+  fi
+  kill_pid_file "$GW_PIDFILE"
+  kill "$UP_PID" 2>/dev/null || true
+  UP_PID=""
+}
+
 echo "=============================================================="
 echo "集成验证结果：PASS=${PASS} FAIL=${FAIL}"
 echo "workdir 保留在 ${WORK}（gateway.log / upstream.log 可查现场）"
