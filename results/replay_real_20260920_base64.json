@@ -1,0 +1,61 @@
+{
+  "url": "http://127.0.0.1:4100/v1/chat/completions",
+  "dataset": "scripts/datasets/real.jsonl",
+  "n": 92,
+  "replay": [
+    {
+      "round": 1,
+      "n": 92,
+      "hit": 5,
+      "miss": 87,
+      "bypass": 0,
+      "merged": 0,
+      "unknown": 0,
+      "hit_rate": 5.4,
+      "latency_hit": {
+        "n": 5,
+        "min": 13,
+        "p50": 16,
+        "p95": 19,
+        "max": 19,
+        "avg": 16.0
+      },
+      "latency_miss": {
+        "n": 87,
+        "min": 327,
+        "p50": 608,
+        "p95": 767,
+        "max": 1057,
+        "avg": 594.5
+      }
+    },
+    {
+      "round": 2,
+      "n": 92,
+      "hit": 92,
+      "miss": 0,
+      "bypass": 0,
+      "merged": 0,
+      "unknown": 0,
+      "hit_rate": 100.0,
+      "latency_hit": {
+        "n": 92,
+        "min": 11,
+        "p50": 22,
+        "p95": 47,
+        "max": 53,
+        "avg": 24.6
+      },
+      "latency_miss": {}
+    }
+  ],
+  "combined": {
+    "rounds": 2,
+    "total_requests": 184,
+    "hit": 97,
+    "miss": 87,
+    "bypass": 0,
+    "merged": 0,
+    "hit_rate": 52.7
+  }
+}
