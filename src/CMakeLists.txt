@@ -50,9 +50,25 @@ add_library(ai_gateway_stats STATIC
 target_include_directories(ai_gateway_stats PUBLIC ${INCLUDE_ROOT})
 target_link_libraries(ai_gateway_stats PUBLIC ai_gateway_common)
 
+# 请求管道（生产路径）：从 main.cpp 拆出，使 tests/ 能链接到**同一份**请求处理
+# 代码。此前管道只编译进可执行文件，tests/ 里没有任何目标能覆盖它（对抗性审查
+# 报告 T2：drain/合并 ns/keep_alive 三处缺陷都在零覆盖层）。
+add_library(ai_gateway_pipeline STATIC
+    gateway/pipeline.cpp
+)
+target_include_directories(ai_gateway_pipeline PUBLIC ${INCLUDE_ROOT})
+target_link_libraries(ai_gateway_pipeline PUBLIC
+    ai_gateway_common
+    ai_gateway_server
+    ai_gateway_backend
+    ai_gateway_cache
+    ai_gateway_stats
+)
+
 # Main executable
 add_executable(ai-gateway main.cpp)
 target_link_libraries(ai-gateway PRIVATE
+    ai_gateway_pipeline
     ai_gateway_common
     ai_gateway_server
     ai_gateway_backend

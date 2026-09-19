@@ -42,6 +42,8 @@
 #include <unordered_set>
 #include <vector>
 
+#pragma once
+
 #include "common/config.h"
 #include "server/connection_handler.h"
 #include "server/router.h"
