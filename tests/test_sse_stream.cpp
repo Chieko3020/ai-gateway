@@ -231,6 +231,44 @@ int main() {
     }
   }
 
+    // 1.7 分级滑窗：URL 被 delta 边界劈开时必须被拦（逐事件判定会漏）。
+    //     判别力：去掉 sse_feed 里的滑窗分支 → 这一条会漏（st.rejected 为 false）；
+    //     把窗口改成拼原始 SSE 字节而不是提取文本 → 同样漏（JSON 包装打断了连续性）
+    {
+      FilterConfig fc;
+      fc.block_urls = true;
+      MessageFilter f(fc);
+      MessageFilter::SseFilterState st;
+      // 前半段单独看**不构成 URL**（正则要求 https:// 连续）
+      std::string e1 = sse_event(R"({"choices":[{"delta":{"content":"见 https:/"}}]})");
+      std::string e2 = sse_event(R"({"choices":[{"delta":{"content":"/evil.example/x"}}]})");
+      std::string out1 = f.sse_feed(st, e1, false);
+      CHECK(!st.rejected);   // 单独看没问题
+      ok++;
+      CHECK(out1 == e1);     // 照常放行（不做无谓拦截）
+      ok++;
+      std::string out2 = f.sse_feed(st, e2, false);
+      CHECK(st.rejected);    // ★ 拼上窗口后构成完整 URL → 拦
+      ok++;
+      CHECK(out2.empty());
+      ok++;
+    }
+
+    // 1.8 分级：不含可疑前缀的正常文本不受滑窗影响（逐字节透传不变）
+    {
+      FilterConfig fc;
+      fc.block_urls = true;
+      MessageFilter f(fc);
+      MessageFilter::SseFilterState st;
+      std::string in = sse_event(R"({"choices":[{"delta":{"content":"这是一段普通回答"}}]})") +
+                       sse_event(R"({"choices":[{"delta":{"content":"，继续第二句"}}]})");
+      std::string out = f.sse_feed(st, in, true);
+      CHECK(!st.rejected);
+      ok++;
+      CHECK(out == in);
+      ok++;
+    }
+
   // ── 2. ResponseWriter 的流式分帧 ─────────────────────────────────────
   {
     int sp[2] = {-1, -1};

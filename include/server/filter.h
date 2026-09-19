@@ -21,6 +21,11 @@ struct FilterResult {
   std::string reject_msg;  // 拒绝原因
 };
 
+// 分级滑窗保留的字节上限：约 2–3 个 delta（URL 通常只跨 1 个）。
+// 窗口越大判定越准，但"被拦时已经发出去的内容"也越多——流式不可撤回，
+// 这是协议决定的，不是实现取舍
+inline constexpr size_t kSseWindowBytes = 512;
+
 // 截断一条 SSE 流时补发的终止事件。
 // 与上游自己发的终止事件同名同形：客户端（含 OpenAI 兼容 SDK）只认这一个流结束
 // 标志，截断若只把后续字节丢掉而不补它，客户端会一直等下去（keep-alive 下连接
@@ -50,6 +55,11 @@ class MessageFilter {
   //   st.feed({}, true);                        // 上游结束时冲刷尾部
   struct SseFilterState {
     std::string pending;        // 尚未构成完整事件（无空行结尾）的字节
+    // 最近若干事件的拼接：违规串可能被 SSE 事件边界劈开（`https://evil.` 与
+    // `example.com/x` 分属两个 delta），逐事件判定必然漏检。这里保留一小段近期
+    // 内容，只在"看起来可能出现 URL"时才拿它一起判定（分级滑窗）——
+    // 否则把跨事件判定摊到每个事件上，正常文本也要多付一次正则
+    std::string window;
     // 已放行的事件原文。**只在启用输出截断（max_output_chars > 0）时维护**：
     // 旧实现无条件累积，而默认配置 max_output_chars = 0（不截断），于是整条流的
     // 每个事件都会被完整留到最后——纯占内存，且没有任何读端（SsePassthroughSink

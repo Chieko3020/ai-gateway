@@ -306,8 +306,15 @@ class SsePassthroughSink : public LlmStreamSink {
       return false;
     }
     if (filter_state_.rejected) {
-      // 命中屏蔽规则：停止继续放行（上游同样被中断，不再为被拦内容付费）
+      // 命中屏蔽规则：停止继续放行（上游同样被中断，不再为被拦内容付费）。
+      // 但**不要**直接断流——那样客户端 SSE 解析器看到的是"连接异常中断"。
+      // 发一个协议内的错误事件 + 终止事件，让它正常收尾。提示里不回显违规内容
+      // （那是二次泄漏）
       filter_rejected_ = true;
+      const std::string tail =
+          std::format("data: {{\"error\":\"response filtered\"}}\n\n{}",
+                      kSseDoneEvent);
+      (void)writer_->write_body(tail);
       return false;
     }
     return true;
@@ -436,12 +443,30 @@ std::string stream_abort_detail(const SsePassthroughSink& sink) {
 // 为什么回放字节而不是"把文本重新合成为事件"：流式响应没有可以改写的 JSON 容器，
 // 合成一条流要自己造 finish_reason、usage 与事件切分，产出的只是"看起来像流"；
 // 回放原始字节则与上游输出同源（data: 前缀、多事件结构、usage、[DONE] 全都在）。
-HandleOutcome serve_stream_cache_hit(const GatewayConfig& /*cfg*/, Stats* stats,
+HandleOutcome serve_stream_cache_hit(const GatewayConfig& /*cfg*/,
+                                     MessageFilter* filter, Stats* stats,
                                      ResponseWriter& writer,
                                      std::chrono::steady_clock::time_point t0,
                                      bool head_keep_alive,
                                      const std::string& key, float similarity,
                                      const std::string& sse) {
+  // 命中回放同样要过输出过滤，而且判定口径与写入侧**完全一致**：把缓存的字节
+  // 当作"一条待过滤的流"整体跑一遍 sse_feed（按事件边界逐条判定，与写入时同一套）。
+  //
+  // 为什么不能省这一步：缓存里存的是**上游原文**（流式路径的 captured_ 是在
+  // sse_feed 过滤之前拷走的），非流式命中也是每次重新过滤——否则"先让含 URL 的
+  // 答案入缓存、再命中"就能绕过输出过滤。此前流式命中漏了这一步（两条路径口径
+  // 不一致），这里补齐。
+  MessageFilter::SseFilterState check_state;
+  std::string payload = filter->sse_feed(check_state, sse, /*final_chunk=*/true);
+  if (check_state.rejected) {
+    // 与非流式命中被拦时的处理保持一致：整条拒绝，且**在写响应头之前**判定，
+    // 所以客户端看到的是一个干净的 502，而不是"已经被污染的半截流"
+    LOG_WARN("stream: cached payload rejected by output filter ({} bytes)",
+             sse.size());
+    return {HttpReply{502, "application/json", R"({"error":"Response filtered"})"},
+            false};
+  }
   // 流式响应头由网关自己构造（此刻并不存在上游），因此可以带上缓存探针头。
   // 头必须立刻发：客户端要看到 200 + text/event-stream 才开始处理事件
   if (!writer.write_stream_head(
@@ -454,7 +479,7 @@ HandleOutcome serve_stream_cache_hit(const GatewayConfig& /*cfg*/, Stats* stats,
   // SSE 注释行：规范允许、客户端默认忽略 —— 让 `curl -N` 这种"看得见的流"里
   // 也能一眼看出命中，不必去翻响应头或 /metrics
   std::string body = std::format(": cache {}\n\n", kCacheStatusHit);
-  body += sse;
+  body += payload;  // 过滤后的字节（可能丢弃了命中规则的事件）
   // 缓存字节里理应含 [DONE]（只有正常流完的流才会回填）；万一没有（人为构造的
   // 缓存文件、旧格式），补一个，否则客户端等不到流结束标志
   if (!sse_has_done(body)) body += std::string(kSseDoneEvent);
@@ -498,8 +523,9 @@ HandleOutcome handle_stream_request(
     if (hit.hit) {
       auto payload = engine->sse_of(hit.key);
       if (payload.has_value() && !payload->empty())
-        return serve_stream_cache_hit(cfg, stats, writer, t0, head_keep_alive,
-                                      hit.key, hit.similarity, *payload);
+        return serve_stream_cache_hit(cfg, filter, stats, writer, t0,
+                                      head_keep_alive, hit.key, hit.similarity,
+                                      *payload);
       // 命中但没有 SSE 字节（早于本功能写入的条目 / 非流式路径写入的条目）：
       // 不能把非流式 JSON 当流发出去，按未命中回源，回源后再补一条带字节的
       LOG_INFO_SAMPLED(

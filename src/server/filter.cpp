@@ -1,6 +1,8 @@
 // 安全过滤器实现
 #include "server/filter.h"
 
+#include "server/sse_capture.h"
+
 #include <algorithm>
 #include <regex>
 
@@ -71,6 +73,17 @@ FilterResult MessageFilter::check_output(std::string_view message) const {
   return result;
 }
 
+namespace {
+// 分级滑窗的"可疑"判据：只对可能构成 URL 的片段启用跨事件判定。
+// 关键词规则仍是逐事件判——关键词一般短，跨事件被劈开的概率远低于 URL 的
+// `https://` + 域名两段结构
+bool sse_looks_suspicious(std::string_view text) {
+  return text.find("http") != std::string_view::npos ||
+         text.find("www.") != std::string_view::npos ||
+         text.find("ftp") != std::string_view::npos;
+}
+}  // namespace
+
 std::string MessageFilter::sse_feed(SseFilterState& st, std::string_view chunk,
                                     bool final_chunk) const {
   std::string out;
@@ -126,6 +139,25 @@ std::string MessageFilter::sse_feed(SseFilterState& st, std::string_view chunk,
       st.rejected_event = std::move(event);
       return out;  // 不返回任何未交付的字节？——已放行的部分照常返回
     }
+    // 分级滑窗：当前事件**单独看没问题**、但拼上近期窗口后命中规则 → 判拒绝。
+    // 触发场景是"违规串被 delta 边界劈开"（URL 前半在本事件、后半在上一个事件）。
+    // 以"单独 OK"为前提天然避免了重复报：同一段不会在后续事件里被反复触发。
+    //
+    // 关键细节：窗口里存的是**从事件里提取出的纯文本**，不是原始 SSE 字节。
+    // 因为每个事件是独立的 JSON，被劈开的两半中间必然插着 `"}\n\ndata: {"delta":"`
+    // 这类结构——直接拼字节永远构不成连续的 `https://`，滑窗就成了摆设。
+    std::string text = extract_sse_content(event);
+    if (sse_looks_suspicious(text) || sse_looks_suspicious(st.window)) {
+      if (check_output(st.window + text).action == FilterAction::kReject) {
+        st.rejected = true;
+        st.rejected_event = st.window + text;
+        return out;
+      }
+    }
+    // 维护窗口（按字节上限截断，保留最近的一段文本）
+    st.window += text;
+    if (st.window.size() > kSseWindowBytes)
+      st.window.erase(0, st.window.size() - kSseWindowBytes);
     accumulate_accepted(st, st.pending, 0, next_start);
     st.accepted_bytes += next_start;
     out.append(st.pending, 0, next_start);

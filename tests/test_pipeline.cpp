@@ -322,6 +322,9 @@ RunResult run_pipeline(PipelineFixture& fx, const std::string& body,
 struct StreamRun {
   std::string raw;  // 客户端侧收到的完整字节（响应头 + chunked 分帧 + 事件）
   bool committed = false;
+  // 管道返回值：流式真透传路径下它不会再被发送（响应头已写出），
+  // 但**被拦/被拒**这类走缓冲式返回的分支只有它能反映（不会写到 socket）
+  HandleOutcome outcome{HttpReply{}, false};
 };
 
 StreamRun run_stream_pipeline(PipelineFixture& fx, const std::string& body) {
@@ -331,8 +334,9 @@ StreamRun run_stream_pipeline(PipelineFixture& fx, const std::string& body) {
                         nullptr, 1000);
   StreamRun r;
   std::thread t([&] {
-    handle_request(body, fx.cfg, fx.filter.get(), fx.engine.get(), &fx.sf,
-                   fx.stats.get(), writer, /*client_wants_keep_alive=*/true);
+    r.outcome = handle_request(body, fx.cfg, fx.filter.get(), fx.engine.get(),
+                               &fx.sf, fx.stats.get(), writer,
+                               /*client_wants_keep_alive=*/true);
     r.committed = writer.committed();
     ::shutdown(sp[0], SHUT_WR);  // 让读端看到 EOF，否则 recv 一直等
   });
@@ -628,6 +632,35 @@ int main() {
     CHECK(fx.stats->streams_aborted() == 1);
     ok++;
     CHECK(fx.stats->cache_writes() == 0);  // ★ 半截答案不进缓存
+    ok++;
+  }
+
+  std::fprintf(stderr, "[progress] start stream cache filter\n");
+  // ── 流式命中回放也要过输出过滤（与非流式命中口径一致）──────────────────
+  // 缓存里存的是**上游原文**，命中时必须重新过滤——否则"先让含 URL 的答案入缓存、
+  // 再命中"就能绕过输出过滤。此前流式命中漏了这一步。
+  // 判别力：去掉 serve_stream_cache_hit() 里的 sse_feed 判定 → 违规内容会被回放，
+  // 下面三条断言全红。
+  {
+    PipelineFixture fx;
+    const std::string user = "含链接的缓存问题";
+    const std::string evil = "见 https://evil.example/x";
+    const std::string sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"" + evil +
+        "\"}}]}\n\ndata: [DONE]\n\n";
+    // 直接把"含违规内容的流式应答"塞进缓存（模拟写入时漏检的情形）
+    fx.engine->cache_reply(user, evil, PipelineFixture::fake_embed(user, 5), "", sse);
+
+    auto r = run_stream_pipeline(fx, chat_body(user, "", /*stream=*/true));
+    // 被拦走的是**缓冲式**返回（由连接处理器发送），所以这里断言返回值而不是
+    // socket 字节：流式路径上一个字节都不该写出去
+    CHECK(r.outcome.first.status_code == 502);               // 整条拒绝
+    ok++;
+    CHECK(!r.committed);                                     // 连响应头都没写
+    ok++;
+    CHECK(r.raw.find("evil.example") == std::string::npos);  // 违规内容一个字节都没出去
+    ok++;
+    CHECK(fx.upstream.request_count() == 0);                 // 命中路径没打上游
     ok++;
   }
 
