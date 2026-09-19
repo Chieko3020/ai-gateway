@@ -1,0 +1,16 @@
+# 延迟重测（base64 落盘格式，2026-09-20 03:30）
+# 环境: 2 vCPU / 1968MB，同机环回，keep-alive 复用连接，缓存 10000 条
+# 脚本: scripts/latency_bench.py（n=150）、内联脚本（建图窗口对照，n=50）
+
+【建图窗口内】 ready=0 building=1 vectors=0
+  命中延迟: n=50 p50=14.8ms p95=19.5ms _cache=hit   ← 走 LruStore::scan_topk 暴力扫描
+【建图完成后】 ready=1 building=0 vectors=10000 degraded=50
+  命中延迟: n=50 p50=7.2ms  p95=9.0ms  _cache=hit   ← 走 HNSW 检索
+降级代价 ≈ 7.6ms，同期若放弃语义检索则全部回源（真实上游未命中 p50 669ms + token）
+
+【mock 上游，完整路径】
+  命中（同一问题）:    n=150 min=6.4 p50=6.9 p95=7.7 p99=9.3 max=9.4 avg=7.0 (ms)
+  未命中（互不相同）: n=150 min=6.7 p50=8.0 p95=48.8 p99=50.5 max=50.8 avg=17.9 (ms)
+
+# 与改动前（JSON 数字数组、无降级扫描）对比：7.0 / 7.9ms → 6.9 / 8.0ms，
+# 差异在测量噪声内 ⇒ base64 落盘不影响检索与延迟路径。
