@@ -13,6 +13,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "common/logger.h"
+
 namespace ai_gateway {
 
 // 落盘文件里承载元数据的保留键。用 "__" 前后缀是为了不与业务键冲突：
@@ -71,8 +73,11 @@ void LruStore::put_with_embedding(std::string key,
     return;
   }
 
-  // LRU淘汰 超出限制时淘汰尾部（最久未用）
-  if (max_entries_ > 0 && lru_.size() >= max_entries_) {
+  // LRU淘汰 超出限制时淘汰尾部（最久未用）。
+  // 用 while 而不是 if：正常插入时最多只会多出 1 条，但加载路径（load）可能带进来
+  // 任意多条超限条目（旧文件 / 调小 max_entries 之后），那时单条淘汰不足以收敛。
+  // 防御成循环后，"任何来源的超限"都能在一次写入内被压回上限（报告 M2）
+  while (max_entries_ > 0 && lru_.size() >= max_entries_ && !lru_.empty()) {
     auto& back = lru_.back();
     iter_map_.erase(back.key);
     lru_.pop_back();
@@ -365,6 +370,38 @@ bool LruStore::load(const std::string& path) {
       node.ctime = Clock::time_point(std::chrono::seconds(secs));
       lru_.push_back(std::move(node));
       iter_map_[lru_.back().key] = --lru_.end();
+    }
+
+    // ---- 4. 按 max_entries 裁剪（报告 M2） ----
+    //
+    // 先把顺序说清楚（这里曾经被我改错过一次，写下来防止再犯）：
+    //   save() 按 lru_.begin() → back() 的顺序写文件，即 **文件 = [MRU … LRU]**；
+    //   这里逐条 push_back，于是内存链表天然就是 [MRU … LRU] —— 头部恰好是最近
+    //   使用、尾部是最久未用，**无需（也不该）再 reverse()**。
+    //   （本轮曾加过一行 lru_.reverse() 并声称"修正倒置"，实测会让裁剪把**最新**
+    //   的条目当成 LRU 端丢掉：文件 [5,0,19,…,1] 反转后头部变成最旧的 1，
+    //   裁剪保留 [1,2,3,4,6]。test_lru_store 的"最近使用必须留下"断言当场抓到。）
+    //
+    // 裁剪：旧实现完全不看 max_entries_，于是一份旧文件（或调小 max_entries 之后）
+    // 能让稳态条目数**永久**超出配置上限——插入路径是"先淘汰 1 条再插 1 条"，
+    // size() 恒定不变，所以超限状态永不收敛（实测 max=5 时装入 20 条、再写 3 条
+    // 仍是 20 条）。这正是 MemoryMax=150M 那个 OOM 风险点的放大器：配置层以为限住了，
+    // 实际没有，而且超限条目还会被 for_each_embedding 全部建进 HNSW 索引。
+    size_t trimmed = 0;
+    if (max_entries_ > 0) {
+      while (lru_.size() > max_entries_) {
+        iter_map_.erase(lru_.back().key);
+        lru_.pop_back();
+        ++trimmed;
+      }
+    }
+    if (trimmed > 0) {
+      // 不静默丢弃：落日志说明"文件里的条目多于配置上限"，并给出两边数字，
+      // 否则用户只会看到重启后缓存莫名变少
+      LOG_WARN("cache: loaded file has {} entries > max_entries={}, "
+               "dropped {} LRU tail entries (newest kept)",
+               lru_.size() + trimmed, max_entries_, trimmed);
+      evict_count_ += trimmed;
     }
     return true;
   } catch (...) { return false; }
