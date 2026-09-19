@@ -147,6 +147,7 @@ ai-gateway/
 - **HttpServer**: epoll ET 主循环 + 线程池调度
 - **ConnectionHandler**: 连接生命周期（keep-alive 决策、借出与归还）
 - **Filter**: 安全过滤（反注入 / URL / 关键词 / 长度），流式输出按 **SSE 事件边界**逐条判定
+  （对可能构成 URL 的内容另有跨事件判定），命中缓存的响应回放前同样要过一遍
 - **Router**: URL 路由表（METHOD + path 精确匹配）
 - **Request/Response**: HTTP/1.1 解析与响应构造
 
