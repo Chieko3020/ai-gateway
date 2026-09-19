@@ -120,7 +120,7 @@ std::string MessageFilter::sse_feed(SseFilterState& st, std::string_view chunk,
       st.rejected_event = std::move(event);
       return out;  // 不返回任何未交付的字节？——已放行的部分照常返回
     }
-    st.accepted.append(st.pending, 0, next_start);
+    accumulate_accepted(st, st.pending, 0, next_start);
     st.accepted_bytes += next_start;
     out.append(st.pending, 0, next_start);
 
@@ -147,7 +147,7 @@ std::string MessageFilter::sse_feed(SseFilterState& st, std::string_view chunk,
       return out;
     }
     out += st.pending;
-    st.accepted += st.pending;
+    accumulate_accepted(st, st.pending, 0, st.pending.size());
     st.accepted_bytes += st.pending.size();
     st.pending.clear();
   }

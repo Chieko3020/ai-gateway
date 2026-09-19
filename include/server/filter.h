@@ -44,7 +44,11 @@ class MessageFilter {
   //   st.feed({}, true);                        // 上游结束时冲刷尾部
   struct SseFilterState {
     std::string pending;        // 尚未构成完整事件（无空行结尾）的字节
-    std::string accepted;       // 已放行的事件（供日志/统计与缓冲式路径统一口径）
+    // 已放行的事件原文。**只在启用输出截断（max_output_chars > 0）时维护**：
+    // 旧实现无条件累积，而默认配置 max_output_chars = 0（不截断），于是整条流的
+    // 每个事件都会被完整留到最后——纯占内存，且没有任何读端（SsePassthroughSink
+    // 只读 rejected / rejected_event，见报告 L6）。截断判定本身只用 accepted_bytes
+    std::string accepted;
     std::string rejected_event; // 被拒的那一条事件原文（供日志）
     bool rejected = false;
     bool truncated = false;
@@ -60,6 +64,14 @@ class MessageFilter {
                        bool final_chunk) const;
 
  private:
+  // 把"已放行的字节"记进 SseFilterState::accepted —— 只在启用输出截断时维护
+  // （见 accepted 字段的说明；默认不截断时这里什么都不做，避免整条流被留一份副本）
+  void accumulate_accepted(SseFilterState& st, std::string_view data,
+                           size_t pos, size_t len) const {
+    if (config_.max_output_chars <= 0 || len == 0) return;
+    st.accepted.append(data.data() + pos, len);
+  }
+
   // 检测是否包含 URL
   static bool contains_url(std::string_view text);
 
