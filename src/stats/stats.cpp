@@ -96,6 +96,46 @@ void Stats::record_stream(int64_t first_byte_ms, int64_t total_ms,
   (void)total_ms;
 }
 
+void Stats::record_stream_hit(int64_t latency_ms) {
+  std::lock_guard lock(mutex_);
+  // 与非流式命中同一套口径：进主延迟池、计命中、做 saved-token 估算。
+  // 为什么流式命中也要进主池：它同样是"零上游调用"的响应，延迟量级（毫秒级）
+  // 与非流式命中一致；把它塞进旁路池会与"回源 TTFT（几百毫秒）"混在一起
+  push_latency(latency_ms);
+  ++total_;
+  ++hits_;
+  ++streams_;
+  ++stream_hits_;
+  // saved-token 估算与非流式命中一致（见 record_cache_hit 的说明）
+  auto total_tokens = total_prompt_tokens_ + total_completion_tokens_;
+  int64_t avg_tokens = (misses_ > 0) ? total_tokens / misses_ : 0;
+  tokens_saved_ += avg_tokens;
+  if (misses_ > 0) {
+    saved_prompt_tokens_ += total_prompt_tokens_ / static_cast<int64_t>(misses_);
+    saved_completion_tokens_ +=
+        total_completion_tokens_ / static_cast<int64_t>(misses_);
+  }
+}
+
+void Stats::record_stream_miss(int64_t first_byte_ms, int64_t total_ms,
+                               int prompt_tokens, int completion_tokens) {
+  std::lock_guard lock(mutex_);
+  // 可缓存流量：计入命中率分母（与 record_stream 的关键区别）
+  push_latency(first_byte_ms);
+  ++total_;
+  ++misses_;
+  ++streams_;
+  total_prompt_tokens_ += prompt_tokens;
+  total_completion_tokens_ += completion_tokens;
+  // total_ms 只进日志：混进样本池会让"一半样本是 TTFT、一半是整段时长"
+  (void)total_ms;
+}
+
+void Stats::record_cache_write() {
+  std::lock_guard lock(mutex_);
+  ++cache_writes_;
+}
+
 void Stats::record_stream_aborted() {
   std::lock_guard lock(mutex_);
   ++streams_aborted_;
@@ -234,6 +274,8 @@ StatsSnapshot Stats::snapshot() const {
   s.streams = streams_;
   s.streams_aborted = streams_aborted_;
   s.streams_without_usage = streams_without_usage_;
+  s.stream_hits = stream_hits_;
+  s.cache_writes = cache_writes_;
   return s;
 }
 

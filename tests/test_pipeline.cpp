@@ -316,6 +316,42 @@ RunResult run_pipeline(PipelineFixture& fx, const std::string& body,
   return r;
 }
 
+// 跑一次**流式**请求，并从客户端侧读回真正写出的字节。
+// 流式路径的响应体不经 handle_request 的返回值（它由 ResponseWriter 直接写
+// socket），因此只有从 socketpair 另一端读，才能对"到底回放了哪些字节"下断言
+struct StreamRun {
+  std::string raw;  // 客户端侧收到的完整字节（响应头 + chunked 分帧 + 事件）
+  bool committed = false;
+};
+
+StreamRun run_stream_pipeline(PipelineFixture& fx, const std::string& body) {
+  int sp[2] = {-1, -1};
+  ::socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
+  ResponseWriter writer(sp[0], 5000, std::chrono::steady_clock::now() + 5s,
+                        nullptr, 1000);
+  StreamRun r;
+  std::thread t([&] {
+    handle_request(body, fx.cfg, fx.filter.get(), fx.engine.get(), &fx.sf,
+                   fx.stats.get(), writer, /*client_wants_keep_alive=*/true);
+    r.committed = writer.committed();
+    ::shutdown(sp[0], SHUT_WR);  // 让读端看到 EOF，否则 recv 一直等
+  });
+  // 读端带超时：任何一条路径写失败都能让循环退出，不会把用例挂死
+  timeval tv{};
+  tv.tv_sec = 5;
+  ::setsockopt(sp[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  char buf[8192];
+  while (true) {
+    ssize_t n = ::recv(sp[1], buf, sizeof(buf), 0);
+    if (n <= 0) break;
+    r.raw.append(buf, static_cast<size_t>(n));
+  }
+  t.join();
+  ::close(sp[0]);
+  ::close(sp[1]);
+  return r;
+}
+
 }  // namespace
 
 int main() {
@@ -513,6 +549,85 @@ int main() {
     CHECK(fx.stats->bypass_latency_samples() == 0);  // ★ 中止样本不进 TTFT 池
     ok++;
     CHECK(r.outcome.second == false);  // 被中停的流不复用连接
+    ok++;
+  }
+
+  std::fprintf(stderr, "[progress] start stream cache\n");
+  // ── 流式语义缓存：未命中回源并回填 → 再请求命中并回放原始 SSE 字节 ──────
+  //
+  // 判别力：
+  //   把命中路径改成"返回缓存的非流式 JSON"→ raw 里不会有 : cache hit /
+  //   X-Cache / data: 事件，第 2 组断言全红；
+  //   把回填条件里的 sse_has_done() 去掉 → 见下面第 3 组（SILENT 流不完整）
+  {
+    PipelineFixture fx;
+    const int before = fx.upstream.request_count();
+    // 第一次：未命中 → 回源 → 正常流完 → 回填
+    auto r1 = run_stream_pipeline(fx, chat_body("CACHEME 请回答", "", true));
+    CHECK(r1.committed);
+    ok++;
+    CHECK(fx.upstream.request_count() == before + 1);  // 第一次确实回源了
+    ok++;
+    CHECK(fx.stats->cache_writes() == 1);
+    ok++;
+    CHECK(fx.stats->stream_hits() == 0);
+    ok++;
+    CHECK(r1.raw.find(": cache hit") == std::string::npos);  // 首答不是命中
+    ok++;
+    CHECK(r1.raw.find("[DONE]") != std::string::npos);  // 上游的 [DONE] 透传了
+    ok++;
+    CHECK(r1.raw.find("text/event-stream") != std::string::npos);
+    ok++;
+
+    // 第二次：同一句话 → 命中 → 回放，零上游调用
+    auto r2 = run_stream_pipeline(fx, chat_body("CACHEME 请回答", "", true));
+    CHECK(fx.upstream.request_count() == before + 1);  // ★ 命中没有打上游
+    ok++;
+    CHECK(fx.stats->stream_hits() == 1);
+    ok++;
+    CHECK(r2.raw.find("X-Cache: hit") != std::string::npos);  // 响应头探针
+    ok++;
+    CHECK(r2.raw.find(": cache hit") != std::string::npos);  // SSE 注释行探针
+    ok++;
+    CHECK(r2.raw.find("[DONE]") != std::string::npos);  // 回放的流有结束标志
+    ok++;
+    // 回放的是**上游原样字节**（不是重新合成的流）：回答正文逐字出现
+    CHECK(r2.raw.find("ANSWER") != std::string::npos);
+    ok++;
+  }
+
+  // ── 命中的条目若没有 SSE 字节（非流式路径写入的），必须回源而不是回 JSON ──
+  // 判别力：去掉 handle_stream_request 里"payload 为空则回源"的分支（改成
+  // 无论如何都回放/回 JSON），第 1、3 组断言会红——流式客户端拿到非流式 JSON
+  {
+    PipelineFixture fx;
+    auto n1 = run_pipeline(fx, chat_body("NOSSE 请回答"));  // 非流式写入缓存
+    CHECK(n1.outcome.first.body.find("_cache") != std::string::npos);
+    ok++;
+    const int before = fx.upstream.request_count();
+    auto s1 = run_stream_pipeline(fx, chat_body("NOSSE 请回答", "", true));
+    CHECK(fx.upstream.request_count() == before + 1);  // 回源了
+    ok++;
+    CHECK(fx.stats->stream_hits() == 0);  // 没有把非流式条目当流式命中
+    ok++;
+    CHECK(s1.raw.find(": cache hit") == std::string::npos);
+    ok++;
+    CHECK(s1.raw.find("text/event-stream") != std::string::npos);
+    ok++;
+  }
+
+  // ── 流不完整（没等到 [DONE] 就被中停）时不得回填缓存 ─────────────────────
+  // 判别力：把回填条件里的 sse_has_done(raw) 去掉，这里有内容的半截流会被
+  // 写成缓存条目（cache_writes 变成 1），断言红
+  {
+    PipelineFixture fx;
+    fx.cfg.server.stream_idle_timeout_seconds = 1;
+    auto r = run_stream_pipeline(fx, chat_body("SILENT 请回答", "", true));
+    CHECK(r.committed);
+    ok++;
+    CHECK(fx.stats->streams_aborted() == 1);
+    ok++;
+    CHECK(fx.stats->cache_writes() == 0);  // ★ 半截答案不进缓存
     ok++;
   }
 

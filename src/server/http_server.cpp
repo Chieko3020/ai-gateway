@@ -205,7 +205,8 @@ bool ResponseWriter::write_head(int status_code, std::string_view content_type,
 
 bool ResponseWriter::write_stream_head(int status_code,
                                        std::string_view content_type,
-                                       bool keep_alive) {
+                                       bool keep_alive,
+                                       std::string_view extra_headers) {
   if (committed_ || failed_) return false;
   committed_ = true;
   chunked_ = true;
@@ -215,6 +216,7 @@ bool ResponseWriter::write_stream_head(int status_code,
   h.content_length = kChunkedLength;
   h.chunked = true;
   h.keep_alive = keep_alive;
+  h.extra_headers = std::string(extra_headers);
   // 起点：空闲死线从"响应头发出去"这一刻开始算。之后每次 write_body 成功都会
   // 把它推到 now + 空闲值。上游迟迟不吐第一个 token（"首包很慢"）这段时间
   // 也受同一个空闲值约束——否则一个连上就不发数据的上游能把 worker 挂死

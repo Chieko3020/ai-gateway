@@ -89,6 +89,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         req = self._read_body()
+        # 供集成测试统计"上游被真实调用了几次"：流式缓存命中必须零回源
+        sys.stderr.write("REQ\n")
+        sys.stderr.flush()
         user = self._field(req, "user")
         system = self._field(req, "system")
         stream = bool(req.get("stream"))

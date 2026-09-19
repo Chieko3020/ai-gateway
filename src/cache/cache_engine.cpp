@@ -129,7 +129,7 @@ CacheEngine::HitResult CacheEngine::try_hit(
       if (cached.has_value()) {
         LOG_INFO_SAMPLED("cache: HIT key={} sim={:.3f} ns={}", r.key,
                          r.similarity, ns.empty() ? "default" : ns);
-        return HitResult{true, std::move(cached.value()), r.similarity};
+        return HitResult{true, std::move(cached.value()), r.similarity, {}, r.key};
       }
       ghost_count_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -144,7 +144,8 @@ CacheEngine::HitResult CacheEngine::try_hit(
 void CacheEngine::cache_reply(const std::string& user_message,
                                const std::string& reply,
                                const std::vector<float>& cached_embedding,
-                               const std::string& ns) {
+                               const std::string& ns,
+                               const std::string& sse_bytes) {
   std::lock_guard lock(mutex_);
 
   auto key = std::format("{}msg:{}", ns.empty() ? "" : ns + ":", next_id_);
@@ -155,19 +156,20 @@ void CacheEngine::cache_reply(const std::string& user_message,
   auto ns_key = ns.empty() ? user_message : ns + ":" + user_message;
 
   if (cached_embedding.empty()) {
-    store_->put(key, reply);
+    store_->put_full(key, reply, sse_bytes, {});
     store_->set_source(key, std::move(ns_key));
-    LOG_DEBUG("cache: stored key={} (no embedding) len={}", key, reply.size());
+    LOG_DEBUG("cache: stored key={} (no embedding) len={} sse={}", key,
+              reply.size(), sse_bytes.size());
     return;
   }
 
-  store_->put_with_embedding(key, reply, cached_embedding);
+  store_->put_full(key, reply, sse_bytes, cached_embedding);
   store_->set_source(key, ns_key);
   index_->add(next_id_ - 1, key, cached_embedding);
 
   // 不打印源消息原文（ns_key 含完整用户消息），只落长度（报告 M5）
-  LOG_DEBUG("cache: stored key={} content_len={} src_len={} dims={}", key,
-            reply.size(), ns_key.size(), cached_embedding.size());
+  LOG_DEBUG("cache: stored key={} content_len={} src_len={} dims={} sse={}", key,
+            reply.size(), ns_key.size(), cached_embedding.size(), sse_bytes.size());
 }
 
 void CacheEngine::rebuild_index() {

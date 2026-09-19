@@ -18,6 +18,7 @@
 #include "cache/entity_tokens.h"
 #include "common/logger.h"
 #include "common/singleflight.h"
+#include "server/sse_capture.h"
 #include "server/sse_usage.h"
 
 namespace ai_gateway {
@@ -251,6 +252,18 @@ class SsePassthroughSink : public LlmStreamSink {
                      std::chrono::steady_clock::time_point t0, bool keep_alive)
       : filter_(filter), writer_(writer), t0_(t0), keep_alive_(keep_alive) {}
 
+  // 开启"上游原始 SSE 字节"捕获（流式写回缓存用）。
+  // 为什么默认关：绝大多数流不需要在网关里留副本（纯白占内存）；只有
+  // "可缓存 + 未命中、准备回填"的请求才开。
+  // max_bytes 是保护上限：超长流放弃回填而不是把内存交给一条长回答，
+  // 溢出后 overflowed() 为真，调用方据此跳过写缓存
+  void enable_capture(size_t max_bytes) {
+    capture_ = true;
+    capture_max_ = max_bytes;
+  }
+  const std::string& captured() const { return captured_; }
+  bool capture_overflowed() const { return capture_overflowed_; }
+
   // 上游响应头到齐：**在这里**把响应头发给下游。
   // 为什么不提前发：只有这一刻才知道上游的状态码与 Content-Type，按上游原样
   // 透传（text/event-stream）是硬要求；也不能等第一个 chunk，那样"上游迟迟不吐
@@ -271,6 +284,12 @@ class SsePassthroughSink : public LlmStreamSink {
               .count();
     }
     bytes_in_ += len;
+    if (capture_) {
+      if (captured_.size() + len <= capture_max_)
+        captured_.append(data, len);
+      else
+        capture_overflowed_ = true;  // 超上限：这条流不回填缓存
+    }
     scan_for_done(data, len);
     // 旁路观察一份 usage（不改动透传的字节）：token 用量只在最后一个 SSE 事件里，
     // 客户端要求了 stream_options.include_usage 才存在。解析是有界窗口的
@@ -370,6 +389,11 @@ class SsePassthroughSink : public LlmStreamSink {
   // curl 侧的中止原因（on_done 的入参），与 abort_ 分开保存：
   // 两者语义不同（一个来自写客户端，一个来自上游/传输层），合并会丢掉诊断信息
   StreamAbortReason relay_abort_ = StreamAbortReason::kNone;
+  // 原始 SSE 字节捕获（默认关，见 enable_capture）
+  bool capture_ = false;
+  bool capture_overflowed_ = false;
+  size_t capture_max_ = 0;
+  std::string captured_;
 };
 
 // 流式中止原因的可读文本：日志与告警按它分类（报告 M1）。
@@ -407,17 +431,87 @@ std::string stream_abort_detail(const SsePassthroughSink& sink) {
 
 }  // namespace
 
+// 流式命中缓存：把当初记下的**上游原始 SSE 字节**回放给客户端。
+//
+// 为什么回放字节而不是"把文本重新合成为事件"：流式响应没有可以改写的 JSON 容器，
+// 合成一条流要自己造 finish_reason、usage 与事件切分，产出的只是"看起来像流"；
+// 回放原始字节则与上游输出同源（data: 前缀、多事件结构、usage、[DONE] 全都在）。
+HandleOutcome serve_stream_cache_hit(const GatewayConfig& /*cfg*/, Stats* stats,
+                                     ResponseWriter& writer,
+                                     std::chrono::steady_clock::time_point t0,
+                                     bool head_keep_alive,
+                                     const std::string& key, float similarity,
+                                     const std::string& sse) {
+  // 流式响应头由网关自己构造（此刻并不存在上游），因此可以带上缓存探针头。
+  // 头必须立刻发：客户端要看到 200 + text/event-stream 才开始处理事件
+  if (!writer.write_stream_head(
+          200, "text/event-stream; charset=utf-8", head_keep_alive,
+          std::format("X-Cache: {}\r\n", kCacheStatusHit))) {
+    LOG_WARN("stream: cache HIT key={} but response head not sent (client gone)",
+             key);
+    return {HttpReply{200, "text/event-stream", {}}, false};
+  }
+  // SSE 注释行：规范允许、客户端默认忽略 —— 让 `curl -N` 这种"看得见的流"里
+  // 也能一眼看出命中，不必去翻响应头或 /metrics
+  std::string body = std::format(": cache {}\n\n", kCacheStatusHit);
+  body += sse;
+  // 缓存字节里理应含 [DONE]（只有正常流完的流才会回填）；万一没有（人为构造的
+  // 缓存文件、旧格式），补一个，否则客户端等不到流结束标志
+  if (!sse_has_done(body)) body += std::string(kSseDoneEvent);
+  const bool written = writer.write_body(body);
+  const bool finished = written && writer.finish_stream();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0);
+  stats->record_stream_hit(elapsed.count());
+  LOG_INFO_SAMPLED(
+      "stream: cache HIT key={} sim={:.3f} bytes={} elapsed={}ms keep_alive={}",
+      key, similarity, sse.size(), elapsed.count(), finished ? "yes" : "no");
+  // 响应已经写出去了，返回的 HttpReply 不会再被发送（连接处理器看 committed()）
+  return {HttpReply{200, "text/event-stream", {}}, kStreamKeepAlive && finished};
+}
+
 // 处理 stream:true：把上游 SSE 逐块透传给客户端
 HandleOutcome handle_stream_request(
     const std::string& request_body, const GatewayConfig& cfg,
-    MessageFilter* filter, Stats* stats, ResponseWriter& writer,
-    std::chrono::steady_clock::time_point t0, bool client_wants_keep_alive) {
+    MessageFilter* filter, CacheEngine* engine, Stats* stats,
+    ResponseWriter& writer, std::chrono::steady_clock::time_point t0,
+    bool client_wants_keep_alive) {
   // 响应头的 Connection 必须如实反映客户端意愿（客户端显式要求 close 时
   // 写 keep-alive 会把它挂死在"等下一个响应"上）；真正是否复用由连接处理器
   // 用同一份意愿决定
   const bool head_keep_alive = kStreamKeepAlive && client_wants_keep_alive;
   const bool request_includes_usage = stream_includes_usage(request_body);
+
+  // ---- 流式语义缓存：命中则回放，未命中边回源边捕获 ------------------------
+  // 可缓存判定与非流式路径同源：缓存开启 + 非工具请求 + 有 user_message。
+  // 工具请求（带 tools）一律旁路：同一句话的答案取决于工具执行结果
+  const bool may_cache = engine != nullptr && cfg.cache.enabled &&
+                         !is_tool_request(request_body);
+  std::string user_message = may_cache ? extract_user_message(request_body)
+                                       : std::string{};
+  const std::string ns = may_cache ? extract_namespace(request_body)
+                                   : std::string{};
+  const bool cacheable_stream = may_cache && !user_message.empty();
+  std::vector<float> embedding;  // 未命中时由 try_hit 带回，回填时复用
+  if (cacheable_stream) {
+    auto hit = engine->try_hit(user_message, ns);
+    if (hit.hit) {
+      auto payload = engine->sse_of(hit.key);
+      if (payload.has_value() && !payload->empty())
+        return serve_stream_cache_hit(cfg, stats, writer, t0, head_keep_alive,
+                                      hit.key, hit.similarity, *payload);
+      // 命中但没有 SSE 字节（早于本功能写入的条目 / 非流式路径写入的条目）：
+      // 不能把非流式 JSON 当流发出去，按未命中回源，回源后再补一条带字节的
+      LOG_INFO_SAMPLED(
+          "cache: HIT key={} sim={:.3f} but no SSE payload, relaying upstream",
+          hit.key, hit.similarity);
+    }
+    embedding = std::move(hit.embedding);
+  }
+
   SsePassthroughSink sink(filter, &writer, t0, head_keep_alive);
+  // 只有准备回填的请求才捕获原始字节（默认关，避免给每条流都留一份副本）
+  if (cacheable_stream) sink.enable_capture(kMaxSseCaptureBytes);
   // 上游空闲死线：server.stream_idle_timeout_seconds（秒）-> 毫秒。
   // 这是"上游不发数据"那一侧的防线——写死线只在**写客户端**时被检查，
   // 上游静默时根本没有写调用发生（集成测试 C 段实测过这个缺口）
@@ -464,10 +558,36 @@ HandleOutcome handle_stream_request(
       // 并用 streams_no_usage 单列计数——"网关没解析"与"上游没给"在报表里可区分
       const StreamUsage usage = sink.usage();
       if (!usage.seen) stats->record_stream_no_usage();
-      // 延迟口径：进样本池的是首字节延迟 TTFT，total 只进日志
-      stats->record_stream(sink.first_byte_ms(), elapsed.count(),
-                           static_cast<int>(usage.prompt_tokens),
-                           static_cast<int>(usage.completion_tokens));
+      // 延迟口径：进样本池的是首字节延迟 TTFT，total 只进日志。
+      // 经过缓存查询的流式流量记 miss（进命中率分母），工具请求等仍记 bypass——
+      // 两者混算会让命中率的分子分母口径不一致
+      if (cacheable_stream)
+        stats->record_stream_miss(sink.first_byte_ms(), elapsed.count(),
+                                  static_cast<int>(usage.prompt_tokens),
+                                  static_cast<int>(usage.completion_tokens));
+      else
+        stats->record_stream(sink.first_byte_ms(), elapsed.count(),
+                             static_cast<int>(usage.prompt_tokens),
+                             static_cast<int>(usage.completion_tokens));
+
+      // ---- 回填缓存：只有**正常流完**（拿到 [DONE]）的流才写 ----
+      // 客户端中途断开留下的半截答案不能固化 30 天；捕获超出上限的巨流也不写
+      if (cacheable_stream && !sink.capture_overflowed()) {
+        const std::string& raw = sink.captured();
+        std::string answer = extract_sse_content(raw);
+        if (!answer.empty() && sse_has_done(raw)) {
+          engine->cache_reply(user_message, answer, embedding, ns, raw);
+          stats->record_cache_write();
+          LOG_INFO_SAMPLED(
+              "stream: cache filled text_len={} sse_bytes={} ns={}",
+              answer.size(), raw.size(), ns.empty() ? "default" : ns);
+        } else if (!answer.empty()) {
+          // 有内容但没有终止事件：多半是上游断流，不写缓存但留痕（便于区分
+          // "没抓到内容"与"抓到了但流不完整"）
+          LOG_INFO_SAMPLED("stream: skip cache fill (no [DONE], bytes={})",
+                           raw.size());
+        }
+      }
       LOG_INFO_SAMPLED(
           "stream: done ttft={}ms total={}ms bytes={} done_event={} "
           "filter_rejected={} keep_alive={} tokens_in={} tokens_out={} "
@@ -578,7 +698,8 @@ HandleOutcome handle_request(const std::string& request_body,
 
   // 3. stream:true：真透传（SSE）。放在输入过滤之后，保证被拒请求同样经过过滤器
   if (wants_stream(request_body)) {
-    return handle_stream_request(request_body, cfg, filter, stats, writer, t0,
+    return handle_stream_request(request_body, cfg, filter, engine, stats,
+                                 writer, t0,
                                  client_wants_keep_alive);
   }
 

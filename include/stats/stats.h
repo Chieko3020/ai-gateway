@@ -53,6 +53,10 @@ struct StatsSnapshot {
   size_t streams = 0;
   size_t streams_aborted = 0;
   size_t streams_without_usage = 0;
+  // 流式命中语义缓存的次数（回放上游原始 SSE 字节，零上游调用）
+  size_t stream_hits = 0;
+  // 回填缓存的次数（含流式正常完成后写回）
+  size_t cache_writes = 0;
 };
 
 class Stats {
@@ -90,6 +94,31 @@ class Stats {
   // 进旁路样本池（不进命中率分母，也不与缓冲式响应混进同一个 avg/min/max）
   void record_stream(int64_t first_byte_ms, int64_t total_ms,
                      int prompt_tokens, int completion_tokens);
+
+  // 记录一次**流式命中语义缓存**：命中后不再回源，直接把当初记下的上游原始
+  // SSE 字节回放给客户端（见 gateway/pipeline.cpp 的 handle_stream_request）。
+  // 与非流式命中同样计入 hits_ 与命中率分母，并做同样的 saved-token 估算；
+  // 额外单列 stream_hits_ —— 否则"命中的流"与"命中的缓冲式响应"在报表里分不开
+  void record_stream_hit(int64_t latency_ms);
+
+  // 记录一次**流式未命中回源**（可缓存流量）。
+  // 与 record_stream() 的区别只有一处、但很关键：这类流量经过缓存查询，因此
+  // 计入命中率**分母**（misses_）；而 record_stream() 收的是不可缓存流量
+  // （工具请求等），它只进旁路池。把两者混起来会让命中率分子分母口径不一致
+  void record_stream_miss(int64_t first_byte_ms, int64_t total_ms,
+                          int prompt_tokens, int completion_tokens);
+
+  // 记录一次缓存回填（写入成功）。用途：回答"流式流量到底有没有进缓存"——
+  // 只看命中率看不出来（回填后要等下一次同义请求才可能命中）
+  void record_cache_write();
+  size_t cache_writes() const {
+    std::shared_lock lock(mutex_);
+    return cache_writes_;
+  }
+  size_t stream_hits() const {
+    std::shared_lock lock(mutex_);
+    return stream_hits_;
+  }
 
   // 流式请求正常结束、但上游事件里**没有** usage 字段（未带
   // stream_options.include_usage，或上游不是标准 OpenAI 实现）。
@@ -167,6 +196,8 @@ class Stats {
   size_t streams_ = 0;   // 流式请求完成数（首字节/总时长已入旁路样本池）
   size_t streams_aborted_ = 0;  // 流式请求提前结束数（不进延迟样本池）
   size_t streams_without_usage_ = 0;  // 正常结束但上游未给 usage 的流式请求数
+  size_t stream_hits_ = 0;      // 其中命中缓存（回放原始 SSE 字节）的次数
+  size_t cache_writes_ = 0;     // 缓存回填次数（含流式正常完成后写回）
 
   int64_t total_prompt_tokens_ = 0;
   int64_t total_completion_tokens_ = 0;

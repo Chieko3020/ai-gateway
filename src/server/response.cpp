@@ -21,6 +21,7 @@ std::string build_response_head(const ResponseHeader& h) {
   else
     out += std::format("Content-Length: {}\r\n", h.content_length);
   out += h.keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+  out += h.extra_headers;
   out += "\r\n";
   return out;
 }

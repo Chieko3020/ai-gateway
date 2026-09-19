@@ -93,6 +93,12 @@ add_executable(test_stream_timeout test_stream_timeout.cpp)
 target_link_libraries(test_stream_timeout ai_gateway_server ai_gateway_common
     ai_gateway_test_check)
 
+# 原始 SSE 字节 → 回答文本（流式回填缓存的解析路径）：null content / reasoning /
+# [DONE] / CRLF / 多行 data / 坏事件 / 断流 / 非流式形态
+add_executable(test_sse_capture test_sse_capture.cpp)
+target_link_libraries(test_sse_capture ai_gateway_server ai_gateway_common
+    ai_gateway_test_check)
+
 # 日志轮转（报告 8.7 第 4 条）：切分/保留份数/行边界/关闭开关
 add_executable(test_log_rotation test_log_rotation.cpp)
 target_link_libraries(test_log_rotation ai_gateway_common ai_gateway_test_check)
@@ -115,6 +121,7 @@ add_executable(test_pipeline test_pipeline.cpp)
 target_link_libraries(test_pipeline ai_gateway_pipeline ai_gateway_test_check)
 
 add_test(NAME filter COMMAND test_filter)
+add_test(NAME sse_capture COMMAND test_sse_capture)
 add_test(NAME request COMMAND test_request)
 add_test(NAME response COMMAND test_response)
 add_test(NAME router COMMAND test_router)

@@ -43,6 +43,20 @@ class LruStore {
                           std::string value,
                           std::vector<float> embedding);
 
+  // 存入完整条目：回答文本 + 上游原始 SSE 字节 + embedding。
+  // 为什么要连 SSE 字节一起存：流式命中要**回放上游原样的字节**（`data:` 前缀、
+  // 多事件结构、usage、[DONE] 一个都不能少），而实体提取、精确匹配降级、按条目的
+  // saved-token 估算仍然要文本。把文本重新合成为事件是另一条路（得自己造
+  // finish_reason/usage 并决定事件切分），本实现不走那条路——合成的流只是"看起来
+  // 像流"，与上游字节不等价。
+  void put_full(std::string key, std::string value, std::string sse,
+                std::vector<float> embedding);
+
+  // 读取条目关联的原始 SSE 字节（条目不存在/已过期/本就没有 → nullopt）。
+  // 只读：不移动 LRU 位置、不计 hit/miss——命中判定与计数已经由 try_hit 记过账，
+  // 这里再 get() 一次会把一次命中记成两次，还会把候选顶到 LRU 头部（同 source_of）
+  std::optional<std::string> sse_of(const std::string& key) const;
+
   // 获取关联的 embedding；不存在返回空 vector
   std::vector<float> get_embedding(const std::string& key);
 
@@ -117,6 +131,9 @@ class LruStore {
     std::string key;
     std::string value;
     std::string source;  // 原始查表键（namespace:user_message），可为空
+    // 上游原始 SSE 字节（仅流式回源并写回缓存时非空）。流式命中直接回放它，
+    // 见 put_full()/sse_of()
+    std::string sse;
     Embedding embedding;
     TimePoint ctime;  // 创建时间（TTL 判断用）
   };
@@ -126,6 +143,7 @@ class LruStore {
     std::string key;
     std::string value;
     std::string source;
+    std::string sse;
     std::vector<float> embedding;
     int64_t ctime_seconds = 0;
   };

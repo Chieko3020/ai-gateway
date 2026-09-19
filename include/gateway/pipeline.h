@@ -16,6 +16,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <string>
 #include <utility>
 
@@ -55,13 +56,25 @@ inline constexpr const char* kCacheStatusMerged = "merged";
 inline constexpr const char* kCacheStatusBypass = "bypass";
 inline constexpr const char* kCacheStatusStreamFallback = "stream_fallback";
 
+// 流式回填缓存时单条流最多捕获多少原始字节。超限即放弃回填（不把内存交给一条
+// 超长回答）；该请求在统计上仍按"未命中"计，只是缓存里不会多出这条
+inline constexpr size_t kMaxSseCaptureBytes = 2u * 1024u * 1024u;
+
 // 处理 stream:true：把上游 SSE 逐块透传给客户端。
 //
 // writer 在这一条路径上被真正使用（边收边发）；缓冲式路径只用返回值。
+//
+// 语义缓存（engine 非空时启用）：
+//   - **命中**：回放当初记下的**上游原始 SSE 字节**（不是把文本重新合成事件），
+//     并附 `: cache hit` 注释行与 `X-Cache: hit` 响应头；零上游调用
+//   - **未命中回源**：边透传边捕获原始字节，只有**正常流完（含 [DONE]）**才回填，
+//     客户端中途断开留下的半截内容不会固化进缓存
+//   - 命中的条目若没有 SSE 字节（非流式路径写入的条目），当作未命中回源——
+//     流式客户端按 `stream:true` 发起，回一个非流式 JSON 会让它的 SSE 解析器失效
 HandleOutcome handle_stream_request(const std::string& request_body,
                                     const GatewayConfig& cfg,
-                                    MessageFilter* filter, Stats* stats,
-                                    ResponseWriter& writer,
+                                    MessageFilter* filter, CacheEngine* engine,
+                                    Stats* stats, ResponseWriter& writer,
                                     std::chrono::steady_clock::time_point t0,
                                     bool client_wants_keep_alive);
 

@@ -60,6 +60,11 @@ void LruStore::put(std::string key, std::string value) {
 void LruStore::put_with_embedding(std::string key,
                                    std::string value,
                                    std::vector<float> embedding) {
+  put_full(std::move(key), std::move(value), {}, std::move(embedding));
+}
+
+void LruStore::put_full(std::string key, std::string value, std::string sse,
+                        std::vector<float> embedding) {
   std::lock_guard lock(mutex_);
 
   auto it = iter_map_.find(key);
@@ -68,6 +73,7 @@ void LruStore::put_with_embedding(std::string key,
     auto& node = *(it->second);
     node.value = std::move(value);
     node.embedding.data = std::move(embedding);
+    node.sse = std::move(sse);
     node.ctime = Clock::now();
     lru_.splice(lru_.begin(), lru_, it->second);
     return;
@@ -88,10 +94,27 @@ void LruStore::put_with_embedding(std::string key,
   Node node;
   node.key = std::move(key);
   node.value = std::move(value);
+  node.sse = std::move(sse);
   node.embedding.data = std::move(embedding);
   node.ctime = Clock::now();
   lru_.push_front(std::move(node));
   iter_map_[lru_.front().key] = lru_.begin();
+}
+
+std::optional<std::string> LruStore::sse_of(const std::string& key) const {
+  std::lock_guard lock(mutex_);
+  auto it = iter_map_.find(key);
+  if (it == iter_map_.end()) return std::nullopt;
+
+  // 过期条目等同不存在（与 source_of 同口径：只读路径不触发淘汰副作用）
+  const auto& node = *(it->second);
+  if (ttl_seconds_ > 0) {
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+        Clock::now() - node.ctime).count();
+    if (age >= ttl_seconds_) return std::nullopt;
+  }
+  if (node.sse.empty()) return std::nullopt;
+  return node.sse;
 }
 
 std::vector<float> LruStore::get_embedding(const std::string& key) {
@@ -226,6 +249,7 @@ bool LruStore::save(const std::string& path) const {
       e.key = node.key;
       e.value = node.value;
       e.source = node.source;
+      e.sse = node.sse;
       e.embedding = node.embedding.data;
       e.ctime_seconds = std::chrono::duration_cast<std::chrono::seconds>(
                             node.ctime.time_since_epoch())
@@ -253,6 +277,8 @@ bool LruStore::save(const std::string& path) const {
       entry["value"] = e.value;
       // src: 原始查表键（旧文件没有这个字段，load 时按空处理）
       if (!e.source.empty()) entry["src"] = e.source;
+      // sse: 上游原始 SSE 字节（只有流式回源写回的条目才有；旧文件没有该字段）
+      if (!e.sse.empty()) entry["sse"] = e.sse;
       if (!e.embedding.empty()) entry["embedding"] = e.embedding;
       entry["ctime"] = e.ctime_seconds;
       arr.push_back(std::move(entry));
@@ -351,6 +377,8 @@ bool LruStore::load(const std::string& path) {
       // 向后兼容：src 是本轮新增字段，旧落盘文件没有
       if (entry.contains("src") && entry["src"].is_string())
         node.source = entry["src"].get<std::string>();
+      if (entry.contains("sse") && entry["sse"].is_string())
+        node.sse = entry["sse"].get<std::string>();
       if (entry.contains("embedding")) {
         auto vec = entry["embedding"].get<std::vector<float>>();
         // 指纹不一致：**丢弃向量、保留文本**。

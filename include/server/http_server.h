@@ -122,9 +122,11 @@ class ResponseWriter {
   // 是否真的复用由调用方决定。返回 false = 写失败或已经写过响应头
   bool write_head(int status_code, std::string_view content_type,
                   size_t content_length, bool keep_alive);
-  // 流式响应头：Transfer-Encoding: chunked
+  // 流式响应头：Transfer-Encoding: chunked。
+  // extra_headers 是额外的头行（每条自带 CRLF），用于流式缓存命中的 `X-Cache`
   bool write_stream_head(int status_code, std::string_view content_type,
-                         bool keep_alive);
+                         bool keep_alive,
+                         std::string_view extra_headers = {});
   // 写正文（内部按需分包；chunked 模式下自动补长度字段）
   bool write_body(std::string_view data);
   // 结束流式响应（写 0 长度终止块）。非流式模式下是 no-op

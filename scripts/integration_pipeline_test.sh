@@ -431,6 +431,82 @@ print(sum(1 for line in data.splitlines() if 'incomplete header' in line))
   UP_PID=""
 }
 
+# ═══════════════════════════════════════════════════════════════════════
+echo
+echo "== F. 流式语义缓存：未命中回填 → 命中回放原始 SSE 字节 =="
+# ═══════════════════════════════════════════════════════════════════════
+# 判别力：
+#   - 命中路径若改回"把缓存的非流式 JSON 发出去"，第二次的字节里不会出现
+#     `: cache hit` 与 data: 事件，X-Cache 也不会出现；
+#   - 回填若不做（或没有 sse_has_done 守卫），/metrics 的 cache_writes_total 为 0
+{
+  UP_PORT_F="$(pick_port)"
+  python3 "$PROBE" upstream --port "$UP_PORT_F" >"$UP_LOG" 2>&1 &
+  UP_PID=$!
+  for _ in $(seq 1 60); do
+    grep -q "LISTENING" "$UP_LOG" 2>/dev/null && break
+    sleep 0.1
+  done
+  rm -f "${WORK}/cache/lru_store.json"   # 从空缓存开始，确保第一次必然未命中
+  start_gateway "$UP_PORT_F" "F" || { kill "$UP_PID" 2>/dev/null; exit 2; }
+
+  SREQ='{"model":"probe","stream":true,"messages":[{"role":"user","content":"PROBE-STREAMCACHE 请回答"}]}'
+
+  curl -sN -D "${WORK}/sc1.hdr" -o "${WORK}/sc1.body" \
+    -X POST "http://127.0.0.1:${GW_PORT}/v1/chat/completions" \
+    -H 'Content-Type: application/json' -d "$SREQ" || true
+  curl -sN -D "${WORK}/sc2.hdr" -o "${WORK}/sc2.body" \
+    -X POST "http://127.0.0.1:${GW_PORT}/v1/chat/completions" \
+    -H 'Content-Type: application/json' -d "$SREQ" || true
+
+  grep -qi "text/event-stream" "${WORK}/sc1.hdr" \
+    && ok "第一次：响应头 text/event-stream（未命中回源）" \
+    || bad "第一次响应头不是 SSE：$(tr -d '\r' < "${WORK}/sc1.hdr" | paste -sd' ')"
+  grep -q "DONE" "${WORK}/sc1.body" \
+    && ok "第一次：上游 [DONE] 透传到客户端" \
+    || bad "第一次没有收到 [DONE]"
+  grep -qi "X-Cache: hit" "${WORK}/sc1.hdr" \
+    && bad "第一次就被判成命中（装置不对）" \
+    || ok "第一次不是命中"
+
+  grep -qi "X-Cache: hit" "${WORK}/sc2.hdr" \
+    && ok "第二次：响应头带 X-Cache: hit" \
+    || bad "第二次没有 X-Cache: hit：$(tr -d '\r' < "${WORK}/sc2.hdr" | paste -sd' ')"
+  grep -q ": cache hit" "${WORK}/sc2.body" \
+    && ok "第二次：SSE 注释行 : cache hit 出现在流里" \
+    || bad "第二次流里没有 : cache hit"
+  grep -q "DONE" "${WORK}/sc2.body" \
+    && ok "第二次：回放的流带结束标志 [DONE]" \
+    || bad "第二次回放的流没有 [DONE]"
+
+  # 注意 json.dumps 的默认分隔符是 ": "，冒号后有空格（写死 "content":" 会匹配不到）
+  EV1="$(grep -o '"content": *"[^"]*"' "${WORK}/sc1.body" | head -1)"
+  EV2="$(grep -o '"content": *"[^"]*"' "${WORK}/sc2.body" | head -1)"
+  if [[ -n "$EV1" && "$EV1" == "$EV2" ]]; then
+    ok "第二次回放的事件正文与第一次逐字相同"
+  else
+    bad "回放内容与首次不一致：'${EV1}' vs '${EV2}'"
+  fi
+
+  sleep 0.5
+  UP_REQS="$(grep -c '^REQ$' "$UP_LOG" 2>/dev/null || true)"
+  [[ "${UP_REQS:-0}" == "1" ]] \
+    && ok "上游总共只被调用 1 次（命中零回源）" \
+    || bad "上游被调用了 ${UP_REQS} 次（命中本应零回源）"
+
+  METRICS="$(curl -s "http://127.0.0.1:${GW_PORT}/metrics")"
+  echo "$METRICS" | grep -qE "^ai_gateway_stream_cache_hits_total 1" \
+    && ok "/metrics: stream_cache_hits_total=1" \
+    || bad "/metrics 未记到流式命中：$(echo "$METRICS" | grep stream_cache || true)"
+  echo "$METRICS" | grep -qE "^ai_gateway_cache_writes_total 1" \
+    && ok "/metrics: cache_writes_total=1（未命中回填一次）" \
+    || bad "/metrics 未记到回填：$(echo "$METRICS" | grep cache_writes || true)"
+
+  kill_pid_file "$GW_PIDFILE"
+  kill "$UP_PID" 2>/dev/null || true
+  UP_PID=""
+}
+
 echo "=============================================================="
 echo "集成验证结果：PASS=${PASS} FAIL=${FAIL}"
 echo "workdir 保留在 ${WORK}（gateway.log / upstream.log 可查现场）"

@@ -24,6 +24,10 @@ struct ResponseHeader {
   // 注意这只是"声明"，真正决定连接是否复用是 worker 写完后的处置动作
   bool keep_alive = true;
   bool chunked = false;
+  // 额外的响应头行（每条自带 CRLF），插在 Connection 之后、结束空行之前。
+  // 用途：流式缓存命中要给客户端一个 `X-Cache: hit` 探针 —— 流式响应头由网关
+  // 自己构造（上游此刻并不存在），这里没有可以"顺带透传"的上游头
+  std::string extra_headers;
 };
 
 // 流式响应用这个哨兵长度：不写 Content-Length，改写 Transfer-Encoding: chunked

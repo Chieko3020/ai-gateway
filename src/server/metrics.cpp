@@ -130,6 +130,16 @@ std::string render_metrics(const Stats& stats, int64_t uptime_seconds,
   e.counter("ai_gateway_streams_without_usage_total",
             "正常完成但上游未返回 usage 的流式请求数",
             static_cast<double>(s.streams_without_usage));
+  // 流式命中语义缓存：把当初记下的上游原始 SSE 字节回放给客户端，零上游调用。
+  // 单列而不并进 cache_hits_total：命中率是同一个口径，但"命中的是一条流"与
+  // "命中的是一段缓冲式响应"在排障时要能分开看
+  e.counter("ai_gateway_stream_cache_hits_total",
+            "流式请求命中语义缓存的次数（回放原始 SSE 字节）",
+            static_cast<double>(s.stream_hits));
+  // 缓存回填次数（含流式正常完成后写回）：只看命中率看不出"流式流量有没有进
+  // 缓存"——回填要等下一次同义请求才可能体现为命中
+  e.counter("ai_gateway_cache_writes_total", "缓存回填次数（含流式写回）",
+            static_cast<double>(s.cache_writes));
 
   // 本项目没有内存池；线程池队列深度是唯一的"内部资源排队"信号
   if (pool_pending >= 0)

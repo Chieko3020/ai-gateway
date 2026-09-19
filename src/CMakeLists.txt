@@ -19,6 +19,7 @@ add_library(ai_gateway_server STATIC
     server/connection_handler.cpp
     server/metrics.cpp
     server/sse_usage.cpp
+    server/sse_capture.cpp
 )
 target_include_directories(ai_gateway_server PUBLIC ${INCLUDE_ROOT})
 # metrics.cpp 渲染 Stats 快照（ai_gateway_stats 在下方定义，CMake 在生成期解析）

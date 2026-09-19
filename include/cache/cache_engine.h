@@ -47,14 +47,27 @@ class CacheEngine {
     std::string reply;
     float similarity = 0.0f;
     std::vector<float> embedding;
+    // 命中条目的键。流式命中要靠它把当初记下的原始 SSE 字节取回来回放；
+    // 降级路径（embedding 失败后走精确匹配）拿不到条目键，这里留空 —— 流式
+    // 命中随即退回回源，而不是把非流式 JSON 当流发出去
+    std::string key;
   };
   HitResult try_hit(const std::string& user_message,
                      const std::string& ns = "");
 
-  // 将 LLM 回复存入缓存，传入已计算的 embedding 向量（避免重复 API 调用）
+  // 将 LLM 回复存入缓存，传入已计算的 embedding 向量（避免重复 API 调用）。
+  // sse_bytes 非空时一并存入：那是**上游原始 SSE 字节**，供流式命中回放
+  // （见 LruStore::put_full）。非流式路径传空
   void cache_reply(const std::string& user_msg, const std::string& reply,
                    const std::vector<float>& embedding,
-                   const std::string& ns = "");
+                   const std::string& ns = "",
+                   const std::string& sse_bytes = {});
+
+  // 读取条目关联的原始 SSE 字节（流式命中回放用）。key 取自 HitResult::key。
+  // 只读、不计命中——命中判定已经由 try_hit 记过账
+  std::optional<std::string> sse_of(const std::string& key) const {
+    return store_->sse_of(key);
+  }
 
   // 从 LruStore 重建向量索引（缓存恢复后调用）
   // 线程安全：函数内部自行加锁，调用方无需（也不得）持 mutex_——

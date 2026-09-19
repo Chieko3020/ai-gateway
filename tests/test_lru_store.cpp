@@ -80,6 +80,39 @@ int main() {
         CHECK(r.get_exact("q2") == "reply-2"); ok++;
         CHECK(!r.get_exact("q-unknown").has_value()); ok++;
 
+        // 原始 SSE 字节（put_full）跨进程保留：流式命中要靠它回放。
+        // 判别力：save/load 里漏掉 sse 字段 → 重启后流式命中退化为"无 SSE 载荷"，
+        // 只能回源（功能静默失效，不留任何错误）
+        {
+            const std::string spath = path + ".sse";
+            LruStore sw(10, 0);
+            const std::string sse =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+                "data: [DONE]\n\n";
+            sw.put_full("msg:9", "hi", sse, {0.5f, 0.5f});
+            sw.set_source("msg:9", "q9");
+            CHECK(sw.save(spath)); ok++;
+
+            LruStore sr(10, 0);
+            CHECK(sr.load(spath)); ok++;
+            CHECK(sr.get("msg:9") == "hi"); ok++;
+            auto back = sr.sse_of("msg:9");
+            CHECK(back.has_value()); ok++;
+            CHECK(back.value() == sse); ok++;  // 逐字节相同（回放必须原样）
+            CHECK(sr.get_embedding("msg:9").size() == 2); ok++;
+
+            // 普通条目（没有 SSE 字节）读出来是 nullopt，而不是空串
+            CHECK(!sr.sse_of("msg:1").has_value()); ok++;
+            // 不存在的键同样是 nullopt
+            CHECK(!sr.sse_of("msg:404").has_value()); ok++;
+            // sse_of 是只读：**不改变命中计数**（命中判定已由 try_hit 记过账，
+            // 这里再记一次会把一次命中记成两次）
+            const size_t hits_before = sr.hit_count();
+            CHECK(!sr.sse_of("msg:9").has_value() == false); ok++;
+            CHECK(sr.hit_count() == hits_before); ok++;
+            std::remove(spath.c_str());
+        }
+
         // 旧落盘文件（没有 src 字段）必须仍能读进来
         {
             const std::string legacy = path + ".legacy";
