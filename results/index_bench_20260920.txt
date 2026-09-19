@@ -1,0 +1,57 @@
+# HNSW 索引基准（重测 2026-09-20 00:26）
+# 环境: 2 vCPU, MB, 6.8.0-90-generic, taskset -c 0
+
+## 真实集 scripts/datasets/synthetic.jsonl (320 条, ONNX 编码)
+[00:26:27 INFO] onnx: tokenizer loaded, vocab=21128
+[00:26:27 INFO] onnx: model loaded configured_dim=512 model_output_dim=512 pooling=cls do_lower_case=true
+编码完成: 923ms，平均 2ms/条
+数据集: scripts/datasets/synthetic.jsonl（320 向量）
+索引构建: 320 向量, 80ms
+
+=== 结果 ===
+查询数: 200 / 320 向量
+自检索 top-1 成功率: 200/200 (100%)
+空结果查询数: 0
+top-3 召回率(vs 暴力): 100%
+HNSW 检索平均: 201.855us
+暴力检索平均: 264.495us
+加速比: 1.31032x
+
+## 合成向量 N=1000 (512d random unit), queries=200
+数据集: synthetic(1000 x 512d random unit vectors)（1000 向量）
+索引构建: 1000 向量, 1219ms
+
+=== 结果 ===
+查询数: 200 / 1000 向量
+自检索 top-1 成功率: 200/200 (100%)
+空结果查询数: 0
+top-3 召回率(vs 暴力): 99.6667%
+HNSW 检索平均: 658.855us
+暴力检索平均: 772.91us
+加速比: 1.17311x
+
+## 合成向量 N=5000 (512d random unit), queries=200
+数据集: synthetic(5000 x 512d random unit vectors)（5000 向量）
+索引构建: 5000 向量, 46796ms
+
+=== 结果 ===
+查询数: 200 / 5000 向量
+自检索 top-1 成功率: 200/200 (100%)
+空结果查询数: 0
+top-3 召回率(vs 暴力): 93.8333%
+HNSW 检索平均: 1479.71us
+暴力检索平均: 4043.45us
+加速比: 2.73259x
+
+## 合成向量 N=10000 (512d random unit), queries=200
+数据集: synthetic(10000 x 512d random unit vectors)（10000 向量）
+索引构建: 10000 向量, 117372ms
+
+=== 结果 ===
+查询数: 200 / 10000 向量
+自检索 top-1 成功率: 200/200 (100%)
+空结果查询数: 0
+top-3 召回率(vs 暴力): 81.6667%
+HNSW 检索平均: 1741.19us
+暴力检索平均: 8180.42us
+加速比: 4.69816x

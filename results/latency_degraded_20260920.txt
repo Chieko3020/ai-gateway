@@ -1,0 +1,15 @@
+# 建图窗口内"降级扫描"与建图完成后"HNSW 检索"的命中延迟对照
+# 日期: 2026-09-20 02:40  环境: 2 vCPU / 1968MB, 同机环回, keep-alive 复用连接
+# 装置: build-fix/rel2/src/ai-gateway，缓存 10000 条（107.7MB），mock 上游
+#      启动后立即开测（此时 index_ready=0 / index_building=1 / index_vectors=0）
+# 脚本: 内联 python（50 次同一条已缓存问题的命中请求）
+
+【建图窗口内】 索引状态: ready=0 building=1 vectors=0 degraded=0
+【建图窗口内】 命中延迟: n=50 p50=17.9ms p95=22.6ms _cache=hit   ← 走 LruStore::scan_topk 暴力扫描
+[02:40:09] cache: index rebuilt, 9999 vectors (9999 built + 0 backfilled)
+【建图完成后】 索引状态: ready=1 building=0 vectors=9999 degraded=50
+【建图完成后】 命中延迟: n=50 p50=6.7ms p95=9.0ms _cache=hit     ← 走 HNSW 检索
+
+# 读法：降级扫描比 HNSW 检索慢约 11ms（与 recall_bench 的暴力检索基线方向一致：
+#       1 万条暴力 8.18ms vs HNSW 1.74ms）。
+#       对比：同一时刻若放弃语义检索，这些请求会全部回源（实测未命中 p50 669ms + token）。

@@ -1,0 +1,20 @@
+# 延迟测量（mock 上游，量化网关自身处理开销）
+# 日期: 2026-09-20 00:46  环境: 2 vCPU / 1968MB, 同机环回, keep-alive 连接复用
+# 装置: build-fix/rel2/src/ai-gateway，缓存已灌满 10000 条，mock 上游（本地 :45999）
+#      监听者 PID 校验通过，模型加载确认（onnx: model loaded）
+# 脚本: scripts/latency_bench.py --port 4110 --n 200
+
+命中（同一问题，精确命中）: n=200 min=6.5 p50=7.0 p95=8.8 p99=9.6 max=10.6 avg=7.1 (ms)  _cache={hit: 200}
+未命中（互不相同，回源+写缓存）: n=200 min=6.7 p50=7.9 p95=49.2 p99=51.1 max=51.3 avg=17.7 (ms)  _cache={miss: 200}
+
+# 交叉验证（同一次测量后立刻抓取的 /metrics，与上面独立测得的分位数一致）
+ai_gateway_requests_total 10400
+ai_gateway_cache_hits_total 200
+ai_gateway_cache_misses_total 10200
+ai_gateway_latency_milliseconds{quantile="0.5"} 7
+ai_gateway_latency_milliseconds{quantile="0.95"} 47
+ai_gateway_latency_milliseconds{quantile="0.99"} 48
+
+# 读法：命中路径 = 进程内向量化 + HNSW 检索 + 输出过滤（不含上游）；
+#       未命中路径 = 上述 + 本地 mock 上游往返 + 写缓存。p95 明显高于 p50 说明
+#       少数请求会撞上分配/淘汰抖动（满缓存时更明显）。
