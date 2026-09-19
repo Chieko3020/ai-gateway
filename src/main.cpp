@@ -252,27 +252,34 @@ int main(int argc, char* argv[]) {
   g_shutdown.store(false, std::memory_order_release);
 
   Singleflight flight_merge;
-  // handle_request 的返回值是 pair<HttpReply, keep_alive>，而路由层只接受
-  // HttpReply（keep-alive 由连接处理器按请求头自行判定）。流式响应在
-  // 连接处理器里走的是"writer.committed() 就直接返回"的旁路，不依赖这里返回的
-  // HttpReply——因此 keep_alive 这一项在本路由上是多余的，丢弃即可
+  // handle_request 的返回值是 pair<HttpReply, keep_alive>。
+  //   - HttpReply 交给路由层（缓冲式响应由它套 Content-Length / Connection 头）；
+  //   - keep_alive **必须回写到 info**（报告 M3）：管道按响应内容决定"这个响应
+  //     能不能留在同一条连接上"（400/502/上游 5xx/流式兜底 → 否），连接处理器
+  //     读回写后的值再与客户端意愿取合取。旧实现丢弃了这一项，于是"上游 5xx
+  //     不复用""流式兜底不复用"两条注释与实现不一致：实测 stream_fallback 仍回
+  //     Connection: keep-alive 且连接真被复用（同一条连接上的第二个请求成功）。
+  //     流式真透传路径上响应头已经由管道写出，此时回写的值就是已经写出去的那个
+  //     意愿（connection_handler 的 writer.committed() 旁路直接采用它）
   server.set_handler([&](const std::string& body, ResponseWriter& writer,
-                         const HttpRequestInfo& info) -> HttpReply {
+                         HttpRequestInfo& info) -> HttpReply {
     // 兜底：线程池 worker 里逃出的异常会直接 std::terminate 整个进程，
     // 因此任何异常都必须在这里被拦住并转成一个普通错误响应。
     // 注意：异常若发生在流式响应已经开始写之后，这里无法回退已发出的响应头
     // （客户端会看到一个被截断的流），只能保证进程存活——见简报"已知限制"
     try {
-      // 客户端是否希望复用连接：由连接处理器从版本 + Connection 头解析后传入。
-      // 响应头的 Connection 与"是否真的复用"必须用同一份意愿
-      return handle_request(body, cfg, filter.get(), engine.get(),
-                            &flight_merge, stats.get(), writer, info.keep_alive)
-          .first;
+      auto outcome = handle_request(body, cfg, filter.get(), engine.get(),
+                                    &flight_merge, stats.get(), writer,
+                                    info.keep_alive);
+      info.keep_alive = outcome.second;
+      return std::move(outcome.first);
     } catch (const std::exception& e) {
       LOG_ERROR("request handler threw: {}", e.what());
+      info.keep_alive = false;  // 异常路径不与正常响应共享连接状态
       return HttpReply{500, "application/json", R"({"error":"Internal error"})"};
     } catch (...) {
       LOG_ERROR("request handler threw non-std exception");
+      info.keep_alive = false;
       return HttpReply{500, "application/json", R"({"error":"Internal error"})"};
     }
   });
@@ -287,7 +294,7 @@ int main(int argc, char* argv[]) {
   server.add_route("GET", "/metrics",
                    [stats, &server, process_start](const std::string&,
                                                    ResponseWriter&,
-                                                   const HttpRequestInfo&) {
+                                                   HttpRequestInfo&) {
                      auto uptime =
                          std::chrono::duration_cast<std::chrono::seconds>(
                              std::chrono::steady_clock::now() - process_start)
@@ -306,7 +313,23 @@ int main(int argc, char* argv[]) {
   // 传入关闭标志：否则 SIGTERM/SIGINT 只置位而无人检查，优雅退出（保存缓存）永不执行
   server.run(&g_shutdown);
 
-  // ---- 6. 清理：保存缓存 + 统计 ----
+  // ---- 6. 优雅关闭：先排空在途请求，再统计/落盘 ----
+  //
+  // 顺序是有语义的，不能调换（报告 H1）：
+  //   1) run() 返回 = reactor 已停：不再接受新连接、不再提交新任务；
+  //   2) drain() 等线程池里**已经在跑**的请求跑完。这一步缺席时，下面的
+  //      stats->report() / lru->save() 会与仍在运行的 worker 并发访问
+  //      Stats / LruStore / CacheEngine（报告 M12），而且在途请求的第 9/10 步
+  //      （写缓存 + 记统计）根本不会执行 —— 客户端侧表现为连接被掐断
+  //      （curl 52 Empty reply）、缓存与统计漏记；
+  //   3) 之后才唤醒并 join bg_thread、输出统计、最终落盘。
+  // 第五轮"新增 drain() 排空在途请求后再统计落盘"的说法在文档里成立、在 main 里
+  // 不成立：那段修复只写了 drain() 的实现与单测，生产入口从未接线（grep 只命中
+  // 定义与 tests/）。这正是 ops-incident-log 第 13 条那类缺陷：接口支持了、调用方
+  // 忘了用。本次把它接上，并由 scripts/integration_pipeline_test.sh 的 A 段
+  // （真实二进制 + 在途请求 + SIGTERM）守着——回退这一行该用例必须失败。
+  server.drain();
+
   g_shutdown.store(true, std::memory_order_release);
   g_bg_cv.notify_one();  // 唤醒 bg_thread 避免等待 60s 超时
   if (bg_thread.joinable()) bg_thread.join();
