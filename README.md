@@ -75,49 +75,55 @@
 
 ```
 ai-gateway/
-├── include/                     # 头文件
-│   ├── common/                  #   公共组件
-│   │   ├── config.h             #     JSON 配置加载
-│   │   ├── logger.h             #     日志宏
-│   │   ├── log_file.h           #     日志输出
-│   │   ├── types.h              #     公共类型（ErrorCode）
-│   │   ├── curl_client.h        #     RAII libcurl 封装
-│   │   └── thread_pool.h        #     线程池
+├── include/
+│   ├── common/                  # 公共组件
+│   │   ├── config.h             #   JSON 配置加载
+│   │   ├── logger.h             #   日志宏
+│   │   ├── log_file.h           #   日志输出与轮转
+│   │   ├── types.h              #   公共类型（ErrorCode）
+│   │   ├── curl_client.h        #   RAII libcurl 封装
+│   │   ├── singleflight.h       #   同义在途请求合并
+│   │   └── thread_pool.h        #   线程池
 │   ├── server/                  #   模块1: HTTP 接入
-│   │   ├── http_server.h        #     epoll ET + 线程池调度
-│   │   ├── connection_handler.h #     请求管道（解析、路由、处理、响应）
+│   │   ├── http_server.h        #     epoll ET + 线程池调度 + ResponseWriter
+│   │   ├── connection_handler.h #     连接生命周期与 keep-alive 决策
 │   │   ├── request.h            #     HTTP/1.1 请求解析
 │   │   ├── response.h           #     HTTP 响应构造
-│   │   ├── filter.h             #     安全过滤器
-│   │   └── router.h             #     URL 路由
+│   │   ├── filter.h             #     安全过滤器（含 SSE 按事件过滤）
+│   │   ├── router.h             #     URL 路由
+│   │   ├── metrics.h            #     /metrics 的 Prometheus 文本渲染
+│   │   ├── sse_usage.h          #     旁路解析 SSE 里的 token 用量
+│   │   └── sse_capture.h        #     旁路解析 SSE，还原回答文本（流式回填用）
 │   ├── cache/                   #   模块2: 语义缓存
-│   │   ├── cache_engine.h       #     缓存协调器（根据命名空间隔离）
-│   │   ├── lru_store.h          #     LRU + TTL 缓存存储
+│   │   ├── cache_engine.h       #     缓存协调器（命名空间隔离 + 实体否决）
+│   │   ├── lru_store.h          #     LRU + TTL 存储 + JSON 持久化（含原始 SSE 字节）
 │   │   ├── hnsw_index.h         #     HNSW 图索引（header-only）
-│   │   ├── onnx_embedding.h     #     ONNX Runtime 嵌入推理 + 贪心分词
-│   │   ├── embedding.h          #     HTTP Embedding 客户端（备用）
-│   │   └── vector_index.h       #     暴力搜索索引（已弃用）
-│   ├── backend/                 #   模块3: LLM 后端
-│   │   └── llm_client.h         #     LLM API 客户端（Keep-Alive 连接池）
-│   └── stats/                   #   模块4: 统计
+│   │   ├── onnx_embedding.h     #     ONNX Runtime 进程内推理 + WordPiece 分词
+│   │   ├── entity_tokens.h      #     实体标记提取与不对称差集判定
+│   │   └── embedding_fingerprint.h  # 向量指纹（模型/词表/分词器标识）
+│   ├── gateway/                 #   模块3: 请求管道
+│   │   └── pipeline.h           #     输入过滤 → 流式/缓存/合并 → 上游 → 统计 → 输出过滤
+│   ├── backend/                 #   模块4: LLM 后端
+│   │   └── llm_client.h         #     LLM API 客户端（含 SSE 流式回调）
+│   └── stats/                   #   模块5: 统计
 │       └── stats.h              #     命中率/token/费用/延迟统计
-├── src/                         # 源文件
-│   ├── main.cpp                 #   入口：组装 + 启动 + 信号处理
-│   ├── common/                  #   config.cpp, log_file.cpp
-│   ├── server/                  
-│   ├── cache/                   
-│   ├── backend/                 
-│   └── stats/                   
+├── src/                         # 源文件（与 include/ 同构）
+│   ├── main.cpp                 #   入口：组装 + 启动 + 信号处理 + 优雅停机
+│   ├── common/  server/  cache/  gateway/  backend/  stats/
 ├── model/                       # 内嵌模型文件
 │   ├── model_int8.onnx          #   INT8 量化 bge-small-zh (23MB)
 │   └── vocab.txt                #   词表 (107KB)
-├── tests/                       # 单元测试
+├── tests/                       # 单元测试（23 个 ctest 目标）
 ├── config/
-│   ├── gateway.example.json     #   配置模板
-│   └── gateway.env              #   API Key
+│   └── gateway.example.json     #   配置模板
 ├── scripts/
 │   ├── ai-gateway.service       #   systemd 服务
-│   └── benchmark.py             #   综合压测脚本
+│   ├── benchmark.py             #   综合压测脚本
+│   ├── integration_pipeline_test.sh  # 真二进制端到端集成验证（A–F 六段）
+│   ├── gw_probe.py              #   集成验证用的探针 / mock 上游
+│   ├── eval_semantic_cache.py   #   公开数据集上的缓存质量评测
+│   ├── fetch_eval_datasets.sh   #   下载 LCQMC / PAWS-X
+│   └── quantize.py              #   FP32 → INT8 动态量化
 ├── .gitignore
 ├── CMakeLists.txt
 └── README.md
@@ -127,23 +133,32 @@ ai-gateway/
 
 #### server — HTTP 接入层
 - **HttpServer**: epoll ET 主循环 + 线程池调度
-- **ConnectionHandler**: 请求管道（解析、路由、处理、响应）
-- **Filter**: 安全过滤（反注入/URL/关键词/长度）
+- **ConnectionHandler**: 连接生命周期（keep-alive 决策、借出与归还）
+- **Filter**: 安全过滤（反注入 / URL / 关键词 / 长度），流式输出按 **SSE 事件边界**逐条判定
 - **Router**: URL 路由表（METHOD + path 精确匹配）
 - **Request/Response**: HTTP/1.1 解析与响应构造
 
+#### gateway — 请求管道
+- **Pipeline**: 一次请求的完整生产路径（输入过滤 → 工具请求旁路 → 流式分支 → 语义缓存 →
+  请求合并 → 上游转发 → 写缓存 → 统计 → 输出过滤）。抽成独立库是为了让单测链接**同一份**
+  对象代码，而不是测试里另写一份逻辑。
+
 #### cache — 语义缓存引擎
-- **CacheEngine**: 编排缓存流程（Embedding 搜索，命中/未命中判断，命名空间隔离）
-- **HnswIndex**: HNSW 图索引（header-only；按论文实现启发式邻居选择与邻居收缩，`shared_mutex` 保护读写并发，visited 标记线程本地复用）
-- **LruStore**: LRU + TTL 内存缓存 + JSON 持久化（锁内只取快照，序列化与落盘在锁外；临时文件 + `fsync` + `rename` 原子替换）
-- **OnnxEmbedding**: C++ ONNX Runtime 进程内推理 + WordPiece 词表贪心分词
-- **LruStore**: LRU + TTL 内存缓存 + JSON 持久化
+- **CacheEngine**: 编排缓存流程（向量化、Top-K 检索、阈值 + 命名空间 + 实体一致性判定）
+- **HnswIndex**: HNSW 图索引（header-only；按论文实现几何分布层数、启发式邻居选择与邻居饱和收缩，
+  `shared_mutex` 保护读写并发，visited 标记线程本地复用）
+- **LruStore**: LRU + TTL 内存缓存 + JSON 持久化（锁内只取快照，序列化与落盘在锁外；
+  临时文件 + `fsync` + `rename` 原子替换）。条目同时保存回答文本与**上游原始 SSE 字节**
+- **OnnxEmbedding**: C++ ONNX Runtime 进程内 INT8 推理 + 对齐官方的 BERT WordPiece 分词
+- **EntityTokens / EmbeddingFingerprint**: 实体标记不对称差集否决；向量指纹（换模型 / 改分词后
+  旧向量不再被当作新向量使用）
 
 #### backend — LLM 转发
-- **LlmClient**: LLM API 客户端（Keep-Alive 连接池复用 TCP）
+- **LlmClient**: LLM API 客户端（Keep-Alive 连接池复用 TCP；流式路径用 write 回调逐块交付，
+  并支持按"两次数据的间隔"判定的上游空闲死线）
 
 #### stats — 统计
-- **Stats**: 命中率/token/费用/延迟统计，每 60s 定期输出
+- **Stats**: 命中率 / token / 费用 / 延迟统计，每 60s 定期输出
 
 ## 架构设计
 
