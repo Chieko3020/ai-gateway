@@ -17,6 +17,7 @@
 //     让第 4 段在秒级内可判定
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -96,6 +97,20 @@ bool read_one_response(int fd, std::string& out, int timeout_ms = 5000,
         out.size() >= body_start + content_length) {
       if (consumed) *consumed = body_start + content_length;
       return true;
+    }
+    // 先用 poll 带超时等可读：直接对阻塞 socket 调 recv 的话，没有响应时
+    // 会一直阻塞在里面，上面算出来的 deadline 就是摆设——"服务端没答"这种
+    // 失败会表现成用例挂死而不是断言失败
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - std::chrono::steady_clock::now())
+                          .count();
+    if (left <= 0) break;
+    pollfd p{fd, POLLIN, 0};
+    int prc = ::poll(&p, 1, static_cast<int>(left));
+    if (prc == 0) break;  // 超时：这段时间内没有任何可读事件
+    if (prc < 0) {
+      if (errno == EINTR) continue;
+      return false;
     }
     char buf[4096];
     ssize_t n = recv(fd, buf, sizeof(buf), 0);
@@ -318,8 +333,10 @@ int main() {
         for (int i = 0; i < 2; ++i) {
           size_t consumed = 0;
           // 注意：find(...) 返回的是下标，命中在开头时是 0（假值），
-          // 不能直接当布尔用——这里显式与 npos 比较
-          if (read_one_response(fd, stream, 5000, &consumed) &&
+          // 不能直接当布尔用——这里显式与 npos 比较。
+          // 读超时给宽一些：Debug 构建 + 机器被压满时，5s 会把"服务端稍慢"
+          // 误判成"复用没生效"
+          if (read_one_response(fd, stream, 15000, &consumed) &&
               stream.find("200 OK") != std::string::npos)
             ++got;
           stream.erase(0, consumed);
@@ -390,6 +407,124 @@ int main() {
       close(fd);
     }
     CHECK(server.active_connections() == 0);
+    ok++;
+
+    stop_flag.store(true);
+    t.join();
+    server.drain();
+  }
+
+  // ── 7. 并发连接下的借出/归还协议：8 条连接同时处理时，每条连接都必须拿到
+  //      属于自己的那个响应（本轮内存破坏崩溃的回归判据）──────────────────
+  //   (a) 4 条线程每条请求都用新连接（close 语义），覆盖"借出后立即归还"
+  //   (b) 4 条线程各自复用一条连接，覆盖"归还后重新登记再借出"
+  //
+  // 判别力（两条独立的缺陷都能被这一段抓住）：
+  //   - 把令牌发号改回"每条连接各自从 1 开始计数"（修复前的写法）：8 条并发连接的
+  //     第 1 次借出都登记成令牌 1，而 borrowed_tokens_ 是按值去重的集合，于是只有
+  //     1 个 worker 认领成功，其余任务被丢弃且不归还所有权 —— 那些连接的
+  //     worker_owned 永远为真，reactor 既不读也不关，客户端只能读超时，
+  //     下面的 answered == 总数 断言失败（实测 200 请求并发 8 丢 15 个）
+  //   - 把连接表改回 `deque<pair<int,Connection>>` + `unordered_map<int,
+  //     deque::iterator>`：deque::erase 会搬移元素，索引里的迭代器跟着失效/错位，
+  //     随后 close_connection 用陈旧迭代器 erase 会在 deque 有效区间之外读写
+  //     （glibc: "corrupted double-linked list" / "double free detected"），
+  //     这一段会崩在这里而不是给出响应
+  {
+    ServerConfig sc;
+    sc.port = 0;
+    sc.idle_timeout_seconds = 30;  // 足够长：连接只能因为响应结束而关闭
+    sc.max_connections = 64;
+
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 15;  // 合计 120 个请求
+    constexpr int kHandlerMs = 25;  // 让 worker 慢一点，制造借出重叠的窗口
+    constexpr int kReadTimeoutMs = 8000;
+
+    std::atomic<bool> stop_flag{false};
+    std::atomic<int> hits{0};
+    HttpServer server(sc);
+    // 回显请求体：这样"响应属于哪条连接"可以被客户端自己核对
+    // （连接状态错位时客户端会收到别人的请求体，而不是超时）
+    server.set_handler([&hits, kHandlerMs](const std::string& body, ResponseWriter&,
+                                          const HttpRequestInfo&) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kHandlerMs));
+      ++hits;
+      return HttpReply{200, "application/json", body};
+    });
+
+    std::thread t([&] { server.run(&stop_flag); });
+    CHECK(wait_listening(server, 5000));
+    ok++;
+    const int port = server.listen_port();
+
+    auto make_request = [](const std::string& tag, bool keep_alive) {
+      std::string body = R"({"model":"m","messages":[],"tag":")" + tag + R"("})";
+      std::string r = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                      "Content-Type: application/json\r\nContent-Length: " +
+                      std::to_string(body.size()) + "\r\n";
+      r += keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+      r += "\r\n";
+      r += body;
+      return r;
+    };
+
+    std::atomic<int> answered{0};
+    std::atomic<int> wrong_body{0};
+    std::atomic<int> unreadable{0};
+    std::vector<std::thread> clients;
+    for (int id = 0; id < kThreads; ++id) {
+      const bool reuse = id >= kThreads / 2;  // 后半数线程复用同一条连接
+      clients.emplace_back([&, id, reuse] {
+        int fd = -1;
+        for (int i = 0; i < kPerThread; ++i) {
+          const std::string tag =
+              "c" + std::to_string(id) + "-" + std::to_string(i);
+          if (fd < 0) {
+            fd = connect_to(port);
+            if (fd < 0) {
+              ++unreadable;
+              return;
+            }
+          }
+          std::string req = make_request(tag, reuse);
+          if (send(fd, req.data(), req.size(), MSG_NOSIGNAL) < 0) {
+            ++unreadable;
+            return;
+          }
+          std::string resp;
+          if (!read_one_response(fd, resp, kReadTimeoutMs) ||
+              resp.find("200 OK") == std::string::npos) {
+            // 服务端没答（或答了别的）——正是"任务被丢弃、所有权泄漏"的表现
+            ++unreadable;
+            close(fd);
+            return;
+          }
+          if (resp.find(tag) == std::string::npos) ++wrong_body;
+          ++answered;
+          if (!reuse) {
+            close(fd);
+            fd = -1;
+          }
+        }
+        if (fd >= 0) close(fd);
+      });
+    }
+    for (auto& c : clients) c.join();
+
+    std::fprintf(stderr,
+                 "[keep-alive] 并发借出：answered=%d/%d hits=%d 无响应=%d "
+                 "响应串线=%d accept=%llu\n",
+                 answered.load(), kThreads * kPerThread, hits.load(),
+                 unreadable.load(), wrong_body.load(),
+                 (unsigned long long)server.accepted_connections());
+    CHECK(answered.load() == kThreads * kPerThread);
+    ok++;
+    CHECK(unreadable.load() == 0);  // 没有请求被静默丢弃
+    ok++;
+    CHECK(wrong_body.load() == 0);  // 没有响应被写到别的连接上
+    ok++;
+    CHECK(hits.load() == kThreads * kPerThread);
     ok++;
 
     stop_flag.store(true);

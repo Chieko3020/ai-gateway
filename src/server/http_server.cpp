@@ -248,7 +248,6 @@ HttpServer::~HttpServer() {
     close(fd);
   }
   conns_.clear();
-  conn_index_.clear();
   {
     std::lock_guard lock(io_mutex_);
     for (auto& r : io_returns_) close(r.fd);
@@ -439,9 +438,9 @@ void HttpServer::run(std::atomic<bool>* external_shutdown) {
             close(client_fd);
             continue;
           }
-          auto it = conns_.emplace(conns_.end(), client_fd,
-                                   Connection{std::chrono::steady_clock::now()});
-          conn_index_[client_fd] = it;
+          // try_emplace 就地构造 Connection，节点地址在后续任意增删下不变，
+          // 因此 conns_ 里的引用/指针可以放心跨调用持有（见头文件 conns_ 说明）
+          conns_.try_emplace(client_fd, std::chrono::steady_clock::now());
         }
       } else if (fd == wake_fd_) {
         // ---- worker 归还的 fd ----
@@ -529,20 +528,46 @@ void HttpServer::process_returned_fds(bool stop_requested) {
       close_connection(r.fd);
       continue;
     }
+    if (r.action == FdAction::kReleaseBorrow) {
+      release_borrow(r.fd, r.token);
+      continue;
+    }
     rearm_keep_alive(r.fd, r.token);
   }
 }
 
+// 撤销一次借出：认领失败的兜底路径。reactor 独占 conns_，因此只有它能安全地
+// 把 worker_owned 清掉；令牌核对保证不会动到"fd 号已被复用"的新连接
+void HttpServer::release_borrow(int fd, uint64_t token) {
+  auto it = conns_.find(fd);
+  if (it == conns_.end() || it->second.borrow_token != token) {
+    LOG_DEBUG("borrow release: fd {} token {} is not ours (closed or reused)", fd,
+              token);
+    return;
+  }
+  it->second.worker_owned.store(false);
+  it->second.last_activity = std::chrono::steady_clock::now();
+  // 借出时该 fd 已经从 epoll 上摘掉了（见 handle_buffer），这里挂回去
+  epoll_event ev{};
+  ev.events = EPOLLIN | EPOLLET;
+  ev.data.fd = fd;
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+    LOG_WARN("borrow release: epoll_ctl ADD failed for fd {}: {}", fd,
+             std::strerror(errno));
+    close_connection(fd);
+  }
+}
+
 void HttpServer::rearm_keep_alive(int fd, uint64_t token) {
-  auto it = conn_index_.find(fd);
-  if (it == conn_index_.end()) {
+  auto it = conns_.find(fd);
+  if (it == conns_.end()) {
     // 连接项已经没了：若 fd 仍然有效，说明它已经不属于我们（正常路径上
     // 不会发生——reactor 只在归还流程里删连接项），保守关闭避免 fd 泄漏
     LOG_DEBUG("keep-alive: fd {} has no registered connection, closing", fd);
     ::close(fd);
     return;
   }
-  auto& conn = it->second->second;
+  auto& conn = it->second;
   if (conn.borrow_token != token) {
     // fd 号已被复用（旧连接在借用期间被关闭，新连接拿到了同一个号码）。
     // 这时既不能 close 也不能重新登记：那个 fd 现在是别人的连接
@@ -578,11 +603,8 @@ void HttpServer::rearm_keep_alive(int fd, uint64_t token) {
 void HttpServer::close_connection(int client_fd) {
   if (epoll_fd_ >= 0)
     epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
-  auto it = conn_index_.find(client_fd);
-  if (it != conn_index_.end()) {
-    conns_.erase(it->second);
-    conn_index_.erase(it);
-  }
+  auto it = conns_.find(client_fd);
+  if (it != conns_.end()) conns_.erase(it);
   close(client_fd);
 }
 
@@ -601,39 +623,39 @@ void HttpServer::maintain_connections() {
 
   size_t closed_idle = 0;
   for (int fd : fds) {
-    auto it = conn_index_.find(fd);
-    if (it == conn_index_.end()) continue;  // 同一轮里已被处理掉
+    auto it = conns_.find(fd);
+    if (it == conns_.end()) continue;  // 同一轮里已被处理掉
 
     // 借给 worker 的连接：所有权不在 reactor 手里，绝不能读或关它
     // （读会与 worker 的响应写/客户端并发行为抢数据，关会让 worker 的
     //   send 落到一个已被复用出去的 fd 上）
-    if (it->second->second.worker_owned.load())
+    if (it->second.worker_owned.load())
       continue;
 
     // 主动读一次：把因 ET 边沿丢失而滞留在内核缓冲区（含 FIN）的数据取出来。
     // 这里不刷新 last_activity —— 空闲超时必须按"客户端最后一次发字节"计时，
     // 否则维护本身会把连接续命。
-    ReadState state = read_into_buffer(fd, it->second->second.buf);
+    ReadState state = read_into_buffer(fd, it->second.buf);
     if (state == ReadState::kError) {
       LOG_WARN("recv failed: {}", std::strerror(errno));
       close_connection(fd);
       continue;
     }
     if (state == ReadState::kData) {
-      it->second->second.last_activity = now;
+      it->second.last_activity = now;
       if (handle_buffer(fd, /*peer_closed=*/false)) continue;
     } else if (state == ReadState::kEof) {
       if (handle_buffer(fd, /*peer_closed=*/true)) continue;
     }
 
     // 仍不完整的连接：检查空闲超时
-    it = conn_index_.find(fd);
-    if (it == conn_index_.end()) continue;
-    if (it->second->second.worker_owned.load())
+    it = conns_.find(fd);
+    if (it == conns_.end()) continue;
+    if (it->second.worker_owned.load())
       continue;
-    if (has_timeout && now - it->second->second.last_activity >= limit) {
+    if (has_timeout && now - it->second.last_activity >= limit) {
       LOG_WARN("idle timeout ({}s): closing connection, buffered {} bytes",
-               config_.idle_timeout_seconds, it->second->second.buf.size());
+               config_.idle_timeout_seconds, it->second.buf.size());
       close_connection(fd);
       ++closed_idle;
     }
@@ -709,15 +731,15 @@ static size_t parse_content_length_caseless(std::string_view header_section) {
 }
 
 void HttpServer::handle_client(int client_fd) {
-  auto idx_it = conn_index_.find(client_fd);
-  if (idx_it == conn_index_.end()) {
+  auto idx_it = conns_.find(client_fd);
+  if (idx_it == conns_.end()) {
     // 已被空闲超时清理 / 已被归还流程处理：fd 号里已无我们的状态
     return;
   }
   // 借给 worker 的连接：worker 正在写响应，reactor 不能读它的 socket
-  if (idx_it->second->second.worker_owned.load())
+  if (idx_it->second.worker_owned.load())
     return;
-  auto& conn = idx_it->second->second;
+  auto& conn = idx_it->second;
 
   ReadState state = read_into_buffer(client_fd, conn.buf);
   if (state == ReadState::kError) {
@@ -744,9 +766,9 @@ void HttpServer::handle_client(int client_fd) {
 //   不完整且对端已 FIN → 立即关闭并回收 fd（返回 true，报告 H5 的核心修复）
 //   不完整且对端仍开着 → 保留（返回 false，等后续数据或空闲超时）
 bool HttpServer::handle_buffer(int client_fd, bool peer_closed) {
-  auto idx_it = conn_index_.find(client_fd);
-  if (idx_it == conn_index_.end()) return true;
-  std::string& buf = idx_it->second->second.buf;
+  auto idx_it = conns_.find(client_fd);
+  if (idx_it == conns_.end()) return true;
+  std::string& buf = idx_it->second.buf;
 
   // 1. 定位头部结束 \r\n\r\n
   auto header_end = buf.find("\r\n\r\n");
@@ -810,18 +832,25 @@ bool HttpServer::handle_buffer(int client_fd, bool peer_closed) {
   // 请求之后可能已经跟着下一个请求（pipelining）：把已消费的部分从缓冲区摘掉，
   // 剩余字节留给归还后重新登记时继续解析
   buf.erase(0, body_start + content_length);
-  idx_it->second->second.worker_owned.store(true);
-  const uint64_t borrow_token = ++idx_it->second->second.borrow_token;
+  idx_it->second.worker_owned.store(true);
+  // 令牌由**全局**计数器发号，且仍然记在这条连接上供归还时核对
+  const uint64_t borrow_token = ++next_borrow_token_;
+  idx_it->second.borrow_token = borrow_token;
   grant_borrow(borrow_token);
 
   pool_.execute([this, client_fd, borrow_token, req = std::move(request)] {
     // 借用认领：这个 fd 号在"提交任务"到"worker 真正开始跑"之间可能已经被
     // reactor 关闭并复用（空闲超时 / 半关闭），此时绝不能再碰它
     if (!try_claim_borrow(borrow_token)) {
-      LOG_DEBUG("worker: fd {} borrow revoked before start, dropping task",
-                client_fd);
       // 这次借出已被撤销：fd 要么已经被 reactor 关闭、要么已经是别人的连接，
-      // 两种情况下都不能 close，直接放弃任务
+      // 两种情况下 worker 都不能自己 close/写。但**也不能就这样丢弃任务**：
+      // 连接项的 worker_owned 会永远为真，reactor 从此既不读也不关这条连接，
+      // 请求与 fd 一起永久泄漏（旧实现就是这样丢请求的）。改为把控制权交还
+      // reactor：它按令牌核对后自己决定重新登记还是关闭
+      LOG_WARN("worker: borrow for fd {} (token {}) was revoked, "
+               "releasing back to reactor",
+               client_fd, borrow_token);
+      return_fd(client_fd, FdAction::kReleaseBorrow, borrow_token);
       return;
     }
 

@@ -33,7 +33,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -53,28 +52,6 @@
 // pool_ 先析构 join 所有任务 此时 conn_handler_ 仍有效 线程池执行execute任务传入lambda时使用[this]捕获是安全的
 
 namespace ai_gateway {
-
-// 可移动的原子布尔：std::atomic 不可拷贝/移动，而存储容器的元素构造要求
-// 可移动（否则只能用已经在别处构造好的对象去 move 构造）。这里的 move 语义
-// 只用于容器内部迁移，因此"搬走即清空源"是安全的
-class MovableFlag {
- public:
-  MovableFlag() = default;
-  explicit MovableFlag(bool v) : v_(v) {}
-  MovableFlag(const MovableFlag&) = delete;
-  MovableFlag& operator=(const MovableFlag&) = delete;
-  MovableFlag(MovableFlag&& o) noexcept : v_(o.v_.load()) { o.v_.store(false); }
-  MovableFlag& operator=(MovableFlag&& o) noexcept {
-    v_.store(o.v_.load());
-    o.v_.store(false);
-    return *this;
-  }
-  void store(bool v) { v_.store(v); }
-  bool load() const { return v_.load(); }
-
- private:
-  std::atomic<bool> v_{false};
-};
 
 // 写路径的结果（send_all_with_deadline 的返回值，也是 ResponseWriter 的内部状态）
 enum class WriteStatus {
@@ -301,8 +278,12 @@ class HttpServer {
 
   // worker 写完后的归还动作
   enum class FdAction : uint8_t {
-    kClose = 0,  // 关闭（非 keep-alive / 出错 / 已请求停机）
-    kKeepAlive,  // 重新登记进 conns_ 并挂回 epoll
+    kClose = 0,   // 关闭（非 keep-alive / 出错 / 已请求停机）
+    kKeepAlive,   // 重新登记进 conns_ 并挂回 epoll
+    kReleaseBorrow,  // 借出被撤销（认领失败）：把 worker_owned 标志还回来，
+                     // 连接重新交给 reactor 读/超时回收——绝不能像旧实现那样
+                     // 直接丢弃任务，那条连接的 worker_owned 会永远为真，
+                     // reactor 从此不读不关，请求与 fd 一起永久泄漏
   };
   struct FdReturn {
     int fd;
@@ -315,6 +296,9 @@ class HttpServer {
   void grant_borrow(uint64_t token);
   // worker：认领借出。false = 这次借出已被撤销（fd 已被 reactor 关掉/复用）
   bool try_claim_borrow(uint64_t token);
+  // reactor 线程：撤销一次借出，把连接的控制权还给 reactor（认领失败的兜底）。
+  // 令牌不一致说明 fd 号已被复用，本调用作废（不动新连接的状态）
+  void release_borrow(int fd, uint64_t token);
   // reactor 线程：处理归还队列。stop_requested=true 时全部按 close 处理
   void process_returned_fds(bool stop_requested);
   // reactor 线程：把 fd 重新登记为可复用的空闲连接。
@@ -336,45 +320,63 @@ class HttpServer {
   ThreadPool pool_{4};  // 单 reactor + 线程池架构
 
   // 每个连接的累积接收缓冲与最近活动时间。
-  // reactor 线程独占访问 conns_/conn_index_；worker 只通过 return_fd() 归还，
-  // 从不直接读写这两张表——因此结构本身不需要同步。
+  // reactor 线程独占访问 conns_；worker 只通过 return_fd() 归还，
+  // 从不直接读写这张表——因此结构本身不需要同步。
   struct Connection {
     Connection() = default;
-    // 含 atomic 成员，因此不能拷贝/移动；用显式构造在 emplace 时就地初始化
+    // 含 atomic 成员，因此不能拷贝/移动；unordered_map 的 try_emplace 会就地
+    // 构造节点，不要求元素可移动
     explicit Connection(std::chrono::steady_clock::time_point t)
         : last_activity(t) {}
 
     std::string buf;
     std::chrono::steady_clock::time_point last_activity;
     // 该连接当前是否借给了某个 worker：reactor 见到 true 就跳过（不读不关），
-    // 由 worker 通过归还队列交还所有权。worker 写、reactor 读，因此是原子量
-    MovableFlag worker_owned;
+    // 由 worker 通过归还队列交还所有权。worker 写、reactor 读，因此是原子量。
+    // 直接放 std::atomic<bool>：conns_ 是节点式容器（unordered_map），元素不会
+    // 被搬移，因此不再需要为"容器要求元素可移动"而包一层可移动的原子量
+    std::atomic<bool> worker_owned{false};
     // 这条连接上已经处理过的请求数（reactor 独占访问）。>1 即发生了 keep-alive
     // 复用，reused_connections_ 据此累加——用它区分"真复用"与"客户端恰好连了两次"
     uint64_t requests_served = 0;
-    // fd 借用令牌（"第几轮接管"）。每登记一条新连接时 +1，worker 归还时核对：
-    // 期间这个 fd 号被 close 后又被 accept 复用的话，令牌已经变了，旧的归还请求
-    // 必须被丢弃。没有这道校验，"worker 借 fd -> reactor 因空闲超时关闭它 ->
-    // 新连接恰好拿到同一个 fd 号 -> 旧 worker 的归还作用到新连接上"会造成
-    // 新连接被莫名重新登记/关闭（本轮实测到过：keep-alive 复用因此完全失效）
+    // 这条连接最近一次借出的令牌（取自 HttpServer 的**全局**递增计数器，
+    // 不是本连接上的第几次借出）。worker 归还时核对：期间这个 fd 号被 close
+    // 后又被 accept 复用的话，令牌已经变了，旧的归还请求必须被丢弃。
+    // 没有这道校验，"worker 借 fd -> 关闭 -> 新连接恰好拿到同一个 fd 号 ->
+    // 旧 worker 的归还作用到新连接上"会造成新连接被莫名重新登记/关闭。
+    // 令牌必须由全表共享的一个计数器发号：旧实现在每个 Connection 上各自从 1
+    // 开始计数，于是"所有新连接的第 1 次借出"都拿到令牌 1，而登记借出的集合是
+    // 全表共享的 set<uint64_t>（集合语义会去重），并发的两条连接会互相把对方
+    // 的借出认领掉——认领失败者丢弃任务且不归还所有权，那条连接从此既不被读
+    // 也不被关（请求静默消失 + fd 泄漏），实测 200 请求并发 8 丢 15 个
     uint64_t borrow_token = 0;
   };
-  // 用 deque 而非 unordered_map：扫描时顺序遍历性能更好。
-  // 不用 list 的原因：Connection 含原子量，list 的 emplace 需要由"已构造好的
-  // 元素"移动构造节点（pair 构造），而 deque 的 emplace_back 是就地构造。
-  // 元素地址在两端增删时不失效这点两者一致：worker 只持 fd 号，不持迭代器
-  std::deque<std::pair<int, Connection>> conns_;
-  std::unordered_map<int, std::deque<std::pair<int, Connection>>::iterator>
-      conn_index_;
+  // 连接表：fd -> 连接状态。**用 unordered_map 而不是 deque + 迭代器索引**，
+  // 原因是稳定性而不是性能：
+  //   - unordered_map 的节点是独立分配的，插入/删除**不移动**其它元素，
+  //     因此元素的地址（引用/指针）在任意增删下保持有效；
+  //   - 早先的实现是 `deque<pair<int, Connection>>` + `unordered_map<int, deque::iterator>`，
+  //     而 deque::erase 会搬移元素来填补空洞：删掉中间一条连接后，所有后续元素
+  //     前移一格，索引里存的迭代器要么指向**另一个连接**的状态，要么（当节点被
+  //     整块释放时）**越界**。此后 close_connection() 用陈旧迭代器去 erase，
+  //     会在 deque 有效区间之外读写 → glibc 报 "corrupted double-linked list" /
+  //     "free(): double free detected"；而 recv 往已析构的 Connection::buf 追加
+  //     字节则是另一条堆破坏路径（本轮实测：一次 400 请求的压测里有 3934 次不变量
+  //     违例）。deque 的"顺序扫描更友好"收益远小于这个代价，因此改回按 fd 直接
+  //     寻址的单张表：连接的身份就是 fd，不再需要第二套索引去跟它保持一致
+  std::unordered_map<int, Connection> conns_;
 
   // worker -> reactor 的 fd 归还队列（归还 = close 或重新登记）
   std::mutex io_mutex_;
   std::vector<FdReturn> io_returns_;
   // 已"借出"给 worker 的借用令牌集合（受 io_mutex_ 保护）。
-  // 为什么需要一张单独的注册表而不是让 worker 直接查 conn_index_：
-  // conn_index_ 由 reactor 独占，worker 读它本身就是数据竞争（reactor 可能在
+  // 为什么需要一张单独的注册表而不是让 worker 直接查 conns_：
+  // conns_ 由 reactor 独占，worker 读它本身就是数据竞争（reactor 可能在
   // 并发 erase）。worker 只在这里做一次"我的令牌还在不在"的原子判定，
-  // 不在就说明 fd 已被 reactor 关闭/复用，任务必须放弃
+  // 不在就说明这次借出已被撤销（fd 可能已关闭/复用），任务不能再碰该 fd，
+  // 但仍须把所有权交还 reactor（见 FdAction::kReleaseBorrow），不能一丢就走。
+  // 令牌由全表唯一的发号器产生（见 Connection::borrow_token），否则集合去重
+  // 会让不同连接的借出互相抵消
   std::unordered_set<uint64_t> borrowed_tokens_;
 
   // 写路径遇到 EAGAIN 的次数（worker 写，测试/metrics 读 -> 必须原子）
@@ -383,6 +385,8 @@ class HttpServer {
   std::atomic<uint64_t> reused_connections_{0};
   // 重新登记次数（测试同步点，见 keep_alive_rearms()）
   std::atomic<uint64_t> keep_alive_rearms_{0};
+  // 借出令牌发号器：**全局唯一**（跨连接也不重复），见 Connection::borrow_token
+  std::atomic<uint64_t> next_borrow_token_{0};
   // 累计 accept 次数（诊断/基准用）
   std::atomic<uint64_t> accepted_connections_{0};
 };
