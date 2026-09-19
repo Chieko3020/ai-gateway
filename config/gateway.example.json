@@ -33,7 +33,7 @@
   "filter": {
     "max_input_chars": 500,
     "max_output_chars": 0,
-    "block_urls": true,
+    "block_urls": false,
     "blocked_keywords": []
   },
   "log": {

@@ -121,7 +121,8 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       auto& f = root["filter"];
       out.filter.max_input_chars = f.value("max_input_chars", 500);
       out.filter.max_output_chars = f.value("max_output_chars", 0);
-      out.filter.block_urls = f.value("block_urls", true);
+      // 默认 false：URL 规则是"减少无意暴露面"，不是安全边界（见 config.h 的说明）
+      out.filter.block_urls = f.value("block_urls", false);
       if (f.contains("blocked_keywords") && f["blocked_keywords"].is_array()) {
         out.filter.blocked_keywords.clear();  // 防止重复 load 累加
         for (auto& kw : f["blocked_keywords"]) {

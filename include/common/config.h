@@ -113,7 +113,11 @@ struct CacheConfig {
 struct FilterConfig {
   int max_input_chars = 500;
   int max_output_chars = 0;
-  bool block_urls = true;
+  // 默认**关闭**。理由见 README 的配置表：URL 规则只能拦"顺手贴出的链接"这类
+  // 无意情形，对有意变形的 URL（hxxp://、插零宽字符、编码拼接）天然无效——
+  // 那是模式匹配的边界，不是配置能补的；开着还会误伤正常回答里的文档链接与
+  // 代码示例。需要"减少无意暴露面"时再显式打开
+  bool block_urls = false;
   std::vector<std::string> blocked_keywords;
 };
 

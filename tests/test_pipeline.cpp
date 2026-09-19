@@ -643,6 +643,12 @@ int main() {
   // 下面三条断言全红。
   {
     PipelineFixture fx;
+    // 显式打开 URL 拦截：block_urls 的默认值已改为 false（它是"减少无意暴露面"
+    // 而非安全边界），所以依赖它拦下内容的用例必须自己打开，不能吃默认值。
+    // 注意 filter 是 fixture **构造时**按当时的配置建好的，改 cfg 之后必须重建它，
+    // 否则过滤器里还是旧配置（第一次写这条用例时就踩了这个）
+    fx.cfg.filter.block_urls = true;
+    fx.filter = std::make_shared<MessageFilter>(fx.cfg.filter);
     const std::string user = "含链接的缓存问题";
     const std::string evil = "见 https://evil.example/x";
     const std::string sse =
