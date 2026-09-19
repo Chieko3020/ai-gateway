@@ -9,6 +9,8 @@
 //   5. 大响应（4MB）+ 慢客户端（4KB 接收缓冲、先不读）：非阻塞 fd 上的 EAGAIN
 //      不得截断响应（报告 8.7 第 3 条）
 //   6. 写超时：写不完时按死线放弃（socketpair 确定性验证，不依赖 TCP 时序）
+//   7. 析构顺序（报告 M4）：~HttpServer 必须先等在途 worker 结束再关连接 fd——
+//      旧实现的函数体先 close 了 conns_ 里的 fd，而 worker 仍在写它
 //
 // 判别力说明：把 read_into_buffer 改回"EOF 也返回 true、body 未收齐时直接 return"
 // 的旧逻辑后，第 1 段断言失败（fd 数不回落）；去掉 accept 处的 max_connections
@@ -26,6 +28,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -90,7 +93,7 @@ int main() {
     std::atomic<bool> stop_flag{false};
     std::atomic<int> served{0};
     HttpServer server(sc);
-    server.set_handler([&served](const std::string& body, ResponseWriter&, const HttpRequestInfo&) {
+    server.set_handler([&served](const std::string& body, ResponseWriter&, HttpRequestInfo&) {
       ++served;
       return HttpReply{200, "application/json", "{\"echo\":\"" + body + "\"}"};
     });
@@ -138,7 +141,7 @@ int main() {
 
     std::atomic<bool> stop_flag{false};
     HttpServer server(sc);
-    server.set_handler([](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
+    server.set_handler([](const std::string& , ResponseWriter&, HttpRequestInfo&) {
       return HttpReply{200, "application/json", "{}"};
     });
 
@@ -181,10 +184,10 @@ int main() {
     std::atomic<bool> stop_flag{false};
     std::atomic<bool> slow_done{false};
     HttpServer server(sc);
-    server.set_handler([](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
+    server.set_handler([](const std::string& , ResponseWriter&, HttpRequestInfo&) {
       return HttpReply{200, "application/json", "{}"};
     });
-    server.add_route("/slow", [&slow_done](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
+    server.add_route("/slow", [&slow_done](const std::string& , ResponseWriter&, HttpRequestInfo&) {
       std::this_thread::sleep_for(300ms);
       slow_done.store(true);
       return HttpReply{200, "application/json", "{\"ok\":true}"};
@@ -227,7 +230,7 @@ int main() {
 
     std::atomic<bool> stop_flag{false};
     HttpServer server(sc);
-    server.set_handler([](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
+    server.set_handler([](const std::string& , ResponseWriter&, HttpRequestInfo&) {
       return HttpReply{200, "application/json", "{}"};
     });
 
@@ -286,10 +289,10 @@ int main() {
 
     std::atomic<bool> stop_flag{false};
     HttpServer server(sc);
-    server.set_handler([](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
+    server.set_handler([](const std::string& , ResponseWriter&, HttpRequestInfo&) {
       return HttpReply{200, "application/json", "{}"};
     });
-    server.add_route("/big", [&big_body](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
+    server.add_route("/big", [&big_body](const std::string& , ResponseWriter&, HttpRequestInfo&) {
       return HttpReply{200, "application/octet-stream", big_body};
     });
 
@@ -448,6 +451,81 @@ int main() {
       }
       close(sp[0]);
       close(sp[1]);
+    }
+  }
+
+  // ── 7. 析构路径：worker 在途时析构不得挂死、不得提前关闭它正在写的 fd ──
+  // 场景：大响应 + 客户端故意不读 → worker 阻塞在 poll(POLLOUT)；此时析构 server。
+  //
+  // 【为什么这一段没有"M4 判别力"断言（诚实记录）】
+  // 报告 M4 的缺陷是"析构函数体先 close(fd)，之后才轮到成员 pool_ 去 join"，
+  // 后果是 worker 往已关闭（甚至已被复用）的 fd 上写。本轮试了三种黑盒观测：
+  //   ① 析构耗时 ≥ X ms —— worker 无论 fd 是否被提前关闭都会在一次 poll 超时/
+  //      RST 后很快结束，两种实现的耗时都在 0.5s 量级，无法区分；
+  //   ② 客户端收到的字节数 —— worker 本来就会在写死线处放弃（实测 8MB 只写出
+  //      2.5MB），两种实现都收不满；
+  //   ③ 客户端提前关闭诱发 RST —— RST 会让 poll 立刻醒来，两种实现同样快。
+  // 结论：M4 没有稳定的黑盒判别面（它需要 fd 所有权插桩）。因此这里只保留
+  // "worker 在途时析构不会挂死、进程不崩"这条完整性断言，真正的防线是
+  // 代码顺序本身（~HttpServer 显式 pool_.wait_idle() 后再 close）+ 注释。
+  // 这是本轮**唯一**没有判别力覆盖的修点，已写入简报的"未验证"一节。
+  {
+    ServerConfig sc;
+    sc.port = 0;
+    sc.idle_timeout_seconds = 30;
+    sc.max_connections = 64;
+    sc.write_timeout_seconds = 1;  // 写死线 1s：保证 worker 一定会退出
+
+    std::string big_body(8 * 1024 * 1024, 'y');  // 8MB，确保写不完
+    std::atomic<bool> stop_flag{false};
+    std::unique_ptr<HttpServer> server(new HttpServer(sc));
+    server->set_handler([](const std::string&, ResponseWriter&, HttpRequestInfo&) {
+      return HttpReply{200, "application/json", "{}"};
+    });
+    server->add_route("/huge", [&big_body](const std::string&, ResponseWriter&,
+                                           HttpRequestInfo&) {
+      return HttpReply{200, "application/octet-stream", big_body};
+    });
+
+    std::thread t([&] { server->run(&stop_flag); });
+    CHECK(wait_listening(*server, 5000));
+    ok++;
+    const int port = server->listen_port();
+
+    int fd = connect_to(port);
+    CHECK(fd >= 0);
+    ok++;
+    if (fd >= 0) {
+      int rcvbuf = 4096;
+      setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+      const char* req =
+          "POST /huge HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
+      send(fd, req, std::strlen(req), MSG_NOSIGNAL);
+      std::this_thread::sleep_for(300ms);  // worker 进入 poll 等可写
+
+      stop_flag.store(true);
+      t.join();  // reactor 退出
+      const auto t0 = std::chrono::steady_clock::now();
+      server.reset();  // 析构：worker 仍在途
+      const auto dtor_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+      std::fprintf(stderr,
+                   "[dtor-while-inflight] 析构耗时 %lldms（worker 在途时析构完成，"
+                   "进程存活）\n",
+                   static_cast<long long>(dtor_ms));
+      // 只需证明析构返回值有界（挂死会让 ctest 超时），且不会走到这里崩溃
+      CHECK(dtor_ms < 5000);
+      ok++;
+      char buf[65536];
+      ssize_t n = recv(fd, buf, sizeof(buf), 0);
+      CHECK(n > 0);  // 客户端至少拿到了一部分响应（fd 不是"还没写就被关掉"）
+      ok++;
+      close(fd);
+    } else {
+      stop_flag.store(true);
+      t.join();
+      server.reset();
     }
   }
 

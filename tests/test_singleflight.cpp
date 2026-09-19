@@ -58,7 +58,8 @@ int main() {
   {
     Singleflight sf;
     auto owner = sf.insert("k", emb, EntityTokens{});
-    auto fut = sf.try_merge("k", emb, EntityTokens{}, false);
+    auto fut = sf.try_merge("k", emb, "",
+                           EntityTokens{}, false);
     CHECK(fut.has_value()); ok++;
     sf.complete("k", "answer", owner);
     std::string v;
@@ -66,22 +67,26 @@ int main() {
     if (fut.has_value()) out = read(*fut, &v);
     CHECK(out == Outcome::kValue); ok++;
     CHECK(v == "answer"); ok++;
-    CHECK(!sf.try_merge("k", emb, EntityTokens{}, false).has_value()); ok++;  // 完成后槽位已释放
+    CHECK(!sf.try_merge("k", emb, "",
+                           EntityTokens{}, false).has_value()); ok++;  // 完成后槽位已释放
   }
 
   // 2. 语义合并：同向量合并，不同向量不合并
   {
     Singleflight sf;
     (void)sf.insert("k1", emb, EntityTokens{});
-    CHECK(sf.try_merge("k2", emb, EntityTokens{}, false).has_value()); ok++;
-    CHECK(!sf.try_merge("k3", other, EntityTokens{}, false).has_value()); ok++;
+    CHECK(sf.try_merge("k2", emb, "",
+                           EntityTokens{}, false).has_value()); ok++;
+    CHECK(!sf.try_merge("k3", other, "",
+                           EntityTokens{}, false).has_value()); ok++;
   }
 
   // 3. 取消：显式失败信号，而非 broken_promise
   {
     Singleflight sf;
     auto owner = sf.insert("k", emb, EntityTokens{});
-    auto fut = sf.try_merge("k", emb, EntityTokens{}, false);
+    auto fut = sf.try_merge("k", emb, "",
+                           EntityTokens{}, false);
     CHECK(fut.has_value()); ok++;
     sf.cancel("k", owner);
     owner.reset();  // 旧语义下 promise 在此析构并写出 broken_promise
@@ -97,7 +102,8 @@ int main() {
   {
     Singleflight sf;
     (void)sf.insert("k", emb, EntityTokens{});
-    auto fut = sf.try_merge("k", emb, EntityTokens{}, false);
+    auto fut = sf.try_merge("k", emb, "",
+                           EntityTokens{}, false);
     CHECK(fut.has_value()); ok++;
     CHECK(fut->wait_for(20ms) == std::future_status::timeout); ok++;
   }
@@ -106,11 +112,13 @@ int main() {
   {
     Singleflight sf;
     auto old_owner = sf.insert("k", emb, EntityTokens{});  // leader A
-    auto fut_a = sf.try_merge("k", emb, EntityTokens{}, false);   // 等待者合并到 A
+    auto fut_a = sf.try_merge("k", emb, "",
+                           EntityTokens{}, false);   // 等待者合并到 A
     auto new_owner = sf.insert("k", emb, EntityTokens{});  // A 超时被顶替，B 成为 leader
     sf.complete("k", "A的结果（旧世代，应被丢弃）", old_owner);
 
-    auto fut_b = sf.try_merge("k", emb, EntityTokens{}, false);   // 槽位应仍属于 B
+    auto fut_b = sf.try_merge("k", emb, "",
+                           EntityTokens{}, false);   // 槽位应仍属于 B
     CHECK(fut_b.has_value()); ok++;
     if (fut_b.has_value()) {
       sf.complete("k", "B的结果", new_owner);
@@ -141,7 +149,8 @@ int main() {
   {
     Singleflight sf;
     auto owner = sf.insert("k", emb, EntityTokens{});
-    auto fut = sf.try_merge("k", emb, EntityTokens{}, false);
+    auto fut = sf.try_merge("k", emb, "",
+                           EntityTokens{}, false);
     CHECK(fut.has_value()); ok++;
     sf.cancel("k", owner);
     owner.reset();  // 旧语义下 promise 在此析构；新语义下已显式 set_exception
@@ -178,7 +187,8 @@ int main() {
         "什么是DMA",                 // 大写缩略语不同
     };
     for (const auto& text : mismatch_cases) {
-      CHECK(!sf.try_merge("qb", emb, extract_entity_tokens(text), true)
+      CHECK(!sf.try_merge("qb", emb, "",
+                           extract_entity_tokens(text), true)
                  .has_value());
       ok++;
     }
@@ -187,7 +197,8 @@ int main() {
     // 同一批候选在 veto 关闭时**必须**合并：证明上面 3 次失败只来自实体规则，
     // 而不是键/向量本来就没对上（否则那 3 条断言是假阳性）
     CHECK(sf
-              .try_merge("qb", emb, extract_entity_tokens(mismatch_cases[0]),
+              .try_merge("qb", emb, "",
+                           extract_entity_tokens(mismatch_cases[0]),
                          false)
               .has_value());
     ok++;
@@ -198,19 +209,22 @@ int main() {
     Singleflight sf;
     (void)sf.insert("k-http", emb, extract_entity_tokens("什么是HTTP协议"));
     CHECK(sf.try_merge("k-http2", emb,
-                       extract_entity_tokens("请问什么是HTTP协议"), true)
+                       "",
+                           extract_entity_tokens("请问什么是HTTP协议"), true)
               .has_value());
     ok++;
     // 两边实体集合都为空（普通同义句，`继续下一题` ↔ `请继续下一题`）：放行
     (void)sf.insert("k-next", emb, extract_entity_tokens("继续下一题"));
     CHECK(sf.try_merge("k-next2", emb,
-                       extract_entity_tokens("请继续下一题"), true)
+                       "",
+                           extract_entity_tokens("请继续下一题"), true)
               .has_value());
     ok++;
     // 实体完全相同而问题措辞不同：放行
     (void)sf.insert("k-num", emb, extract_entity_tokens("问题编号1234 是什么"));
     CHECK(sf.try_merge("k-num2", emb,
-                       extract_entity_tokens("编号1234 到底是什么意思"), true)
+                       "",
+                           extract_entity_tokens("编号1234 到底是什么意思"), true)
               .has_value());
     ok++;
   }
@@ -222,7 +236,8 @@ int main() {
     Singleflight sf;
     (void)sf.insert("k-1234", emb, extract_entity_tokens("问题编号1234"));
     (void)sf.insert("k-5678", emb, extract_entity_tokens("问题编号5678"));
-    CHECK(sf.try_merge("k-9999", emb, extract_entity_tokens("问题编号5678"),
+    CHECK(sf.try_merge("k-9999", emb, "",
+                           extract_entity_tokens("问题编号5678"),
                        true)
               .has_value());
     ok++;
@@ -232,13 +247,15 @@ int main() {
     // 只有不一致的候选时：不得合并，且确实是被实体规则否决（而不是没匹配上）
     Singleflight sf2;
     (void)sf2.insert("k-1234", emb, extract_entity_tokens("问题编号1234"));
-    CHECK(!sf2.try_merge("k-9999", emb, extract_entity_tokens("问题编号5678"),
+    CHECK(!sf2.try_merge("k-9999", emb, "",
+                           extract_entity_tokens("问题编号5678"),
                          true)
                .has_value());
     ok++;
     CHECK(sf2.merge_veto_count() == 1); ok++;
     // 同一对请求在 veto 关闭时必须合并：这是"没匹配上"与"被否决"的对照
-    CHECK(sf2.try_merge("k-9999", emb, extract_entity_tokens("问题编号5678"),
+    CHECK(sf2.try_merge("k-9999", emb, "",
+                           extract_entity_tokens("问题编号5678"),
                         false)
               .has_value());
     ok++;

@@ -156,11 +156,11 @@ int main() {
     std::atomic<bool> stop_flag{false};
     std::atomic<int> hits{0};
     HttpServer server(sc);
-    server.set_handler([&hits](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
+    server.set_handler([&hits](const std::string& , ResponseWriter&, HttpRequestInfo&) {
       ++hits;
       return HttpReply{200, "application/json", R"({"ok":true})"};
     });
-    server.add_route("GET", "/metrics", [](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
+    server.add_route("GET", "/metrics", [](const std::string& , ResponseWriter&, HttpRequestInfo&) {
       return HttpReply{200, "text/plain", "ai_gateway_up 1\n"};
     });
 
@@ -361,7 +361,7 @@ int main() {
 
     std::atomic<bool> stop_flag{false};
     HttpServer server(sc);
-    server.set_handler([](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
+    server.set_handler([](const std::string& , ResponseWriter&, HttpRequestInfo&) {
       return HttpReply{200, "application/json", R"({"ok":true})"};
     });
 
@@ -447,7 +447,7 @@ int main() {
     // 回显请求体：这样"响应属于哪条连接"可以被客户端自己核对
     // （连接状态错位时客户端会收到别人的请求体，而不是超时）
     server.set_handler([&hits, kHandlerMs](const std::string& body, ResponseWriter&,
-                                          const HttpRequestInfo&) {
+                                          HttpRequestInfo&) {
       std::this_thread::sleep_for(std::chrono::milliseconds(kHandlerMs));
       ++hits;
       return HttpReply{200, "application/json", body};

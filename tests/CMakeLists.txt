@@ -108,6 +108,12 @@ target_link_libraries(test_tokenizer ai_gateway_cache ai_gateway_common
     ai_gateway_test_check)
 target_compile_definitions(test_tokenizer PRIVATE GATEWAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
+# 生产请求管道（对抗性审查 T2）：直接链接 src/gateway/pipeline.cpp —— 与
+# ai-gateway 可执行文件同一份对象代码，覆盖 H2（合并 ns 隔离）/M1（SSE 中止归因）/
+# M3（keep_alive 决策真的作用到连接）三处此前零覆盖的缺陷
+add_executable(test_pipeline test_pipeline.cpp)
+target_link_libraries(test_pipeline ai_gateway_pipeline ai_gateway_test_check)
+
 add_test(NAME filter COMMAND test_filter)
 add_test(NAME request COMMAND test_request)
 add_test(NAME response COMMAND test_response)
@@ -127,6 +133,15 @@ add_test(NAME embedding_fingerprint COMMAND test_embedding_fingerprint)
 add_test(NAME entity_tokens COMMAND test_entity_tokens)
 add_test(NAME sse_usage COMMAND test_sse_usage)
 add_test(NAME stream_timeout COMMAND test_stream_timeout)
+add_test(NAME pipeline COMMAND test_pipeline)
+
+# 端到端集成验证（本轮新增）：真实 ai-gateway 二进制 + 真实 TCP + 真实 SIGTERM。
+# 覆盖单测覆盖不到的部分：H1（main 是否真的接线 drain，要发 SIGTERM 才看得出来）、
+# H2（真 curl 并发的跨 system 合并）、M3（真连接上的 Connection/复用行为）、
+# M1（真实 SSE 静默流的日志归因）。脚本自己挑随机端口、自己清理进程（只按 PID）。
+add_test(NAME integration_pipeline
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/integration_pipeline_test.sh
+            $<TARGET_FILE:ai-gateway>)
 
 # HNSW 自检索召回率断言（合成向量 + 固定种子，确定性）
 add_test(NAME hnsw_recall

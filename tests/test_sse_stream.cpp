@@ -283,11 +283,11 @@ int main() {
     };
 
     HttpServer server(sc);
-    server.set_handler([](const std::string& , ResponseWriter&, const HttpRequestInfo&) {
+    server.set_handler([](const std::string& , ResponseWriter&, HttpRequestInfo&) {
       return HttpReply{200, "application/json", "{}"};
     });
     server.add_route("/sse", [&fake_sse](const std::string&, ResponseWriter& w,
-                                        const HttpRequestInfo& info) {
+                                        HttpRequestInfo& info) {
       // 与生产代码同一套规则：响应头的 Connection 如实反映客户端意愿
       fake_sse(w, info.keep_alive);
       return HttpReply{200, "text/event-stream", {}};  // 已自行写完，body 留空

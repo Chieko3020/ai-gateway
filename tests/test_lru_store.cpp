@@ -123,5 +123,63 @@ int main() {
         std::remove(path.c_str());
     }
 
+    // load 必须按 max_entries 裁剪（报告 M2）：
+    //  旧实现逐条 push_back、全程不看 max_entries_，而插入路径是"淘汰 1 条 + 插 1 条"
+    //  ⇒ size() 恒定不变，超限状态**永不收敛**（实测 max=5 时装入 20 条、再写 3 条
+    //  仍是 20 条）。这是 MemoryMax=150M 那个 OOM 风险点的放大器：配置层以为限住了，
+    //  实际没有，超限条目还会被 for_each_embedding 全部建进 HNSW 索引。
+    //
+    // 判别力：去掉 load() 末尾的裁剪循环（或把 while 改回 if），下面
+    // "(2) 裁剪到上限" 与 "(3) 插入后收敛" 两组断言失败。
+    //
+    // 这里**不**断言"留下的具体是哪几条"：save() 的顺序是 [MRU…LRU]、这里逐条
+    // push_back，因此内存链表天然也是 [MRU…LRU]（头部最近使用、尾部最久未用），
+    // 裁剪必然丢尾部。"留下的就是最近使用的那些"由 LruStore 的顺序约定保证，
+    // 不是这条用例的断言点（本轮曾在 load 里加过一行 reverse() 并声称"修正倒置"，
+    // 那会让裁剪丢最新条目；该错误由下面 (2) 的 size 断言之外的一条
+    // "最近访问过的条目仍在"断言当场抓到）
+    {
+        const std::string path = "/tmp/ai-gateway-lru-trim.json";
+        std::remove(path.c_str());
+        {
+            LruStore w(100, 0);
+            for (int i = 0; i < 20; ++i)
+                w.put("msg:" + std::to_string(i), "v" + std::to_string(i));
+            CHECK(w.size() == 20); ok++;
+            // 让 msg:19 成为"最近使用"（后面断言它必须活过裁剪）
+            CHECK(w.get("msg:19").has_value()); ok++;
+            CHECK(w.save(path)); ok++;
+        }
+        // (1) 上限足够大：整份文件原样加载（不得丢条目）
+        {
+            LruStore r(100, 0);
+            CHECK(r.load(path)); ok++;
+            CHECK(r.size() == 20); ok++;
+        }
+        // (2) 上限小于文件条目数：必须裁剪到上限，且最近使用的那条必须在
+        {
+            LruStore r(5, 0);
+            CHECK(r.load(path)); ok++;
+            CHECK(r.size() == 5); ok++;              // ★ 不裁剪时这里是 20
+            CHECK(r.get("msg:19").has_value()); ok++;  // 最近使用 → 保留
+        }
+        // (3) 插入路径防御：一次写入就把超限压回上限
+        //     （旧实现"淘汰 1 条 + 插 1 条"，超限状态下 size 恒定不变）
+        {
+            LruStore r(5, 0);
+            CHECK(r.load(path)); ok++;
+            for (int i = 100; i < 105; ++i) r.put("new:" + std::to_string(i), "v");
+            CHECK(r.size() <= 5); ok++;
+            CHECK(r.get("new:104").has_value()); ok++;
+        }
+        // (4) 上限为 0 = 不限制：不得误裁
+        {
+            LruStore r(0, 0);
+            CHECK(r.load(path)); ok++;
+            CHECK(r.size() == 20); ok++;
+        }
+        std::remove(path.c_str());
+    }
+
     return test_check::finish("test_lru_store", ok);
 }
