@@ -23,11 +23,19 @@
 
 ### 请求能力的边界
 
-- **流式（`stream: true`）真透传**：上游 SSE 逐块转发给客户端（`llm_client` 用 write 回调，
-  不再整段缓冲），`Content-Type` 按上游原样透传（`text/event-stream`），长度语义用
-  `Transfer-Encoding: chunked`。流式请求**不查缓存、不写缓存**（SSE 与单条 JSON 回复无法互转）。
-  输出过滤按 **SSE 事件边界**逐条判定：命中拦截规则的那一条事件被丢弃，其余事件照常透传
-  （不会把整段流替换成错误 JSON）。客户端断开或写死线到点时，网关立即中停上游传输。
+- **流式（`stream: true`）真透传 + 语义缓存**：上游 SSE 逐块转发给客户端（`llm_client` 用
+  write 回调，不再整段缓冲），`Content-Type` 按上游原样透传（`text/event-stream`），长度语义用
+  `Transfer-Encoding: chunked`。
+  - **流式请求同样走语义缓存**：命中时回放**当初记下的上游原始 SSE 字节**（而不是把缓存的
+    文本重新合成事件——流式响应没有可以改写的 JSON 容器，合成的流会自己造
+    `finish_reason`/`usage`/事件切分，与上游字节不等价）。命中响应带 `X-Cache: hit`，流首附一条
+    `: cache hit` 注释行（SSE 规范允许、客户端默认忽略）。未命中时边透传边捕获原始字节，
+    **只有正常流完（含 `[DONE]`）才回填**——客户端中途断开留下的半截答案不会写进缓存。
+    命中的条目若没有 SSE 字节（非流式路径写入的条目），按未命中回源。
+  - 输出过滤按 **SSE 事件边界**逐条判定：命中拦截规则的那一条事件被丢弃，其余事件照常透传
+    （不会把整段流替换成错误 JSON）。启用 `filter.max_output_chars` 时，到达上限会补发一个
+    `data: [DONE]` 并停止透传，让客户端拿到明确的结束标志。客户端断开或写死线到点时，
+    网关立即中停上游传输。
   ```bash
   curl -N http://127.0.0.1:9000/v1/chat/completions \
     -H 'Content-Type: application/json' \
@@ -47,7 +55,7 @@
 
 ### 技术特性
 - **并发模型**: 单 Reactor + 线程池，主线程管理连接，线程池处理缓存和 LLM 转发
-- **向量检索**: 按论文实现 HNSW 图索引（分层结构、几何分布层数、启发式邻居选择、邻居满时收缩重选）。实测（见 `tests/recall_bench`）：320 向量下自检索 top-1 **99.4%**、top-3 召回率 99.7%；1000 / 5000 / 10000 向量下自检索 top-1 均为 **100%**，top-3 召回率 99.7% / 93.8% / 81.7%（`ef_search=50` 固定时规模增大导致束搜索覆盖不足，属 HNSW 固有特性；缓存只需 top-1，故不影响命中），相对暴力检索加速比 1.16x / 2.74x / 4.75x
+- **向量检索**: 按论文实现 HNSW 图索引（分层结构、几何分布层数、启发式邻居选择、邻居满时收缩重选）。实测（见 `tests/recall_bench`）：320 向量下自检索 top-1 **100%**（320/320）、top-3 召回率 99.7%；1000 / 5000 / 10000 向量下自检索 top-1 均为 **100%**，top-3 召回率 99.7% / 93.8% / 81.7%（`ef_search=50` 固定时规模增大导致束搜索覆盖不足，属 HNSW 固有特性；缓存只需 top-1，故不影响命中），相对暴力检索加速比 1.16x / 2.74x / 4.75x
 - **存储引擎**: LRU + TTL 缓存管理，JSON 持久化
 - **嵌入推理**: C++ ONNX Runtime 进程内 INT8 量化推理，零外部依赖
 - **模型量化**: `scripts/quantize.py` — HuggingFace → FP32 ONNX → 动态量化 INT8 (~90MB→~23MB)
@@ -238,13 +246,15 @@ sudo systemctl enable --now ai-gateway
 | `embedding.dim` | 512 | 向量维度；与模型实际输出不符时启动即失败 |
 | `cache.enabled` | true | 启用语义缓存 |
 | `cache.similarity_threshold` | 0.85 | 余弦相似度阈值 |
+| `cache.entity_veto` | true | 实体一致性否决：候选与查询的数字 / 大写缩略语 / 混合标识符存在不对称差集时否决该次命中（关掉可退回纯阈值判定，用于 A/B 对照） |
 | `cache.max_entries` | 10000 | 最大缓存条目 |
 | `cache.ttl_days` | 7 | 缓存过期天数 |
 | `filter.max_input_chars` | 500 | 输入最大字符 |
-| `filter.max_output_chars` | 0 | 输出最大字符（0 = 不截断） |
+| `filter.max_output_chars` | 0 | 输出最大字符（0 = 不截断）。流式响应按**事件**累计，到达上限后补发一个 `data: [DONE]` 并停止透传——截断也必须给客户端一个明确的流结束标志 |
 | `filter.block_urls` | true | 拦截 URL |
 | `server.max_connections` | 256 | 并发连接上限（超出回 503） |
 | `server.idle_timeout_seconds` | 30 | 连接空闲超时（秒） |
+| `server.stream_idle_timeout_seconds` | 60 | 流式请求的**上游空闲死线**：上游连续多久不发数据就中停它（按"两次数据的间隔"判定，不是平均速率） |
 | `log.sample_every` | 1 | 每请求 INFO 采样率（1 = 全量，N = 每 N 条留 1 条） |
 | `log.max_bytes` | 10485760 | 单文件日志上限（字节），达到后切分；0 = 关闭轮转 |
 | `log.keep_files` | 5 | 日志历史保留份数（不含当前文件） |
@@ -272,10 +282,18 @@ scrape_configs:
 
 暴露 `ai_gateway_requests_total`（可缓存流量，不含旁路与合并）、`ai_gateway_cache_hits_total`
 / `_misses_total`、`ai_gateway_cache_hit_ratio`、`ai_gateway_cache_bypassed_total`、
-`ai_gateway_cache_merged_total`、`ai_gateway_tokens_{prompt,completion,saved}_total`、
+`ai_gateway_cache_merged_total`、`ai_gateway_cache_writes_total`（回填次数）、
+`ai_gateway_tokens_{prompt,completion,saved}_total`、
 `ai_gateway_cost_yuan_total` / `ai_gateway_cost_saved_yuan_total`、延迟分位数
 `ai_gateway_latency_milliseconds{quantile="0.5|0.95|0.99"}`、旁路延迟与线程池队列深度。
+
+流式流量单列一组：`ai_gateway_streams_total`（含正常完成与中止）、`ai_gateway_streams_aborted_total`
+（上游空闲超时 / 客户端断开 / 写死线）、`ai_gateway_streams_without_usage_total`（上游没给 usage）、
+`ai_gateway_stream_cache_hits_total`（命中并回放缓存的流）。
+
 口径与日志里的 `[STATS]` 摘要一致，且只含聚合数值，不含任何请求内容或键哈希。
+注意"可缓存流量"的口径：经过缓存查询的流式请求计入命中率分母（命中记 `hits`，回源记 `misses`），
+工具调用类请求仍记 `bypassed`——把两者混起来会让命中率的分子分母口径不一致。
 
 **日志轮转** — `gateway.log` 达到 `log.max_bytes` 后改名为 `gateway.log.1`，旧的依次
 后移，最老一份删除，共保留 `log.keep_files` 份；进程启动时若发现当前文件已超限会先归档。
@@ -284,12 +302,13 @@ scrape_configs:
 ## 测试
 
 ```bash
-cmake --build build --target test_filter test_lru_store test_request \
-                                          test_response test_router \
-                                          test_stats test_config
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+# 23/23 目标（Release 与 Debug 各跑一遍都是全绿）
 
-for t in build/tests/test_*; do $t; done
-# 7/7 模块, 50/50 用例
+# 集成验证：真二进制 + 真 TCP + mock 上游，A–F 六段共 30 条断言
+bash scripts/integration_pipeline_test.sh ./build/src/ai-gateway
 
 # HNSW 召回率基准（手动运行，不纳入 ctest）
 cmake --build build --target recall_bench
@@ -297,29 +316,84 @@ cmake --build build --target recall_bench
 ./build/tests/recall_bench scripts/datasets/synthetic.jsonl model/model_int8.onnx model/vocab.txt
 # 合成向量模式（规模曲线：抽样 200 查询与暴力检索对比）
 ./build/tests/recall_bench --synthetic 10000 --dim 512 --queries 200
+
+# 语义缓存质量评测（公开数据集，先下载）
+bash scripts/fetch_eval_datasets.sh
+python3 scripts/eval_semantic_cache.py --limit 3000
 ```
+
+两点判据上的说明：
+
+- `test_pipeline` 链接的是与可执行文件**同一份**请求管道对象代码（`ai_gateway_pipeline`），
+  覆盖的是生产路径本身，而不是测试里另写的一份逻辑。此前管道只存在于 `main.cpp`，
+  于是 `drain`、请求合并的命名空间隔离、keep-alive 决策三处缺陷都落在零覆盖的代码层。
+- `integration_pipeline_test.sh` 每一段都先做**监听者校验**（端口 inode ↔ 进程 fd 比对），
+  避免端口被残留进程占着、测试却连到别的实例上得出假结论。
 
 ## 实测性能
 
-> 测试环境：本机 2 vCPU / 2GB 内存（**压测端与被测服务同机环回**，服务 `taskset -c 0`、压测端 `taskset -c 1`）
-> 后端：DeepSeek v4-flash（公网 API）；Embedding：ONNX bge-small-zh-v1.5 INT8 (512d)，进程内推理
-> 数据集：`scripts/datasets/synthetic.jsonl` 320 条（15 语义簇 × 20 条同义改写 + 20 条独立问题）、`scripts/datasets/real.jsonl` 92 条（真实提问），各 2 轮
-> 原始输出：`results/replay_synthetic_fixed.json`、`results/replay_real_fixed.json`（HNSW 修复前：`replay_synthetic.json`、`replay_real.json`）
+> 测试环境：2 vCPU / 2GB 内存的 VPS。压测端与被测服务**同机环回**，服务 `taskset -c 0`、压测端 `taskset -c 1`。
+> 上游：DeepSeek v4-flash（公网 API）；Embedding：ONNX bge-small-zh-v1.5 INT8 (512d)，进程内推理。
+> 这些绝对值都带环境依赖（环回压测不含真实网络），引用时请连同环境一起引用。
 
-| 指标 | 合成集 | 真实集 | 说明 |
-|------|--------|--------|------|
-| 命中率 R1 / R2 | 25.6% / **100.0%** | 15.4% / **100.0%** | 两轮合计 62.8% / 57.7% |
-| 命中延迟 p50 / p95 | 13ms / 18ms | 22ms / 51ms | 本地 ONNX 推理 + 图检索 |
-| 未命中延迟 p50 | 808ms | 731ms | 含公网 LLM API 往返 |
-| 网关自身处理延迟 | < 1ms | < 1ms | 不含 LLM 与 Embedding |
+### 语义匹配质量（公开数据集）
 
-**读法**：R1 是"首次提问"——每个语义簇的首条必然未命中，同义改写还要跨过
-`similarity_threshold`（默认 0.85）才算命中，因此 R1 反映的是**语义匹配的严格程度**；
-R2 是"重复提问"，命中率 100% 说明**缓存写入与检索链路完全正常**。
+缓存判定的质量用公开数据集量，而不是自造的相似句集合——自造集的重复度会把命中率抬到不可信的高位。
 
-**HNSW 召回修复（本次重测的主要产出）**：修复前 `tests/recall_bench` 实测自研 HNSW 在 320 向量规模下
-**自检索 top-1 仅 30.9%、top-3 召回率 31.7%**，导致 R2 命中率被压在 48.4%（字面完全相同的消息也检索不回来）。
-根因是**邻居饱和时直接放弃反向连接**，使大量节点没有入边、在图中不可达（缺失论文的启发式剪枝）。
-补上 `SELECT-NEIGHBORS-HEURISTIC`（多样性筛选）与**满时收缩重选**后：
-**自检索 top-1 30.9% → 99.4%、top-3 召回率 31.7% → 99.6%**，R2 命中率随之升到 100%。
+| 判定策略（LCQMC 3000 对） | 召回 | 误命中 | F1 |
+|---|---|---|---|
+| 0.85 + 实体一致性否决（当前默认） | 87.8% | **29.6%** | 80.4% |
+| 0.80 纯阈值 | 94.4% | 49.2% | 77.0% |
 
+LCQMC 的"相似"包含问答对关系，当作"同义改写"用会天然偏高，因此**误命中率**才是关键指标：
+0.80 时近一半的"命中"是错的；0.85 叠加实体一致性否决（数字 / 大写缩略语 / 混合标识符存在
+不对称差集即否决）之后降到 29.6%。PAWS-X 上精确率在所有阈值下都只有 43–45%，说明该量级的
+embedding 对"语序颠倒 / 主宾互换"这类深层改写无能为力——这也是加上实体否决的原因。
+阈值扫描与逐条明细由 `scripts/eval_semantic_cache.py` 输出。
+
+### 延迟
+
+| 指标 | 合成集（320 条 × 2 轮） | 真实集（92 条 × 2 轮） |
+|---|---|---|
+| 命中 p50 / p95 | 13ms / 17ms | 22–25ms / 51–53ms |
+| 未命中 p50 / p95 | 808ms / 1074ms | 731ms / 1065ms |
+| 命中率 R1 / R2 / 合计 | 25.6% / 100% / 62.8% | 15.4% / 100% / 57.7% |
+
+口径说明（这组数字来自 `results/replay_*_fixed.json`）：阈值 0.80、**纯阈值**、未开实体否决，
+两轮均为"先写入再回放"。R1 是首次提问，同义改写还要跨过阈值才算命中，所以它反映的是**语义
+匹配的严格程度**，不是缓存效率；R2 是重复提问，100% 说明缓存写入与检索链路本身是通的。
+未命中延迟含公网 LLM API 往返，因此它衡量的是上游而不是网关。
+
+真实上游口径下的回放（824 次请求，阈值 0.85 + 实体否决）：命中 469 / 未命中 355
+（**56.9%**），省下 **30,287 tokens**。这里 `saved` 是按已发生未命中的平均调用量外推的
+**估算值**，对外引用用 token 数比用金额稳（金额随上游定价变动）。
+
+### 流式请求
+
+| 指标 | 首次（回源 + 回填缓存） | 第二次（命中并回放原始 SSE 字节） |
+|---|---|---|
+| 端到端 | 1.444s | **0.014s** |
+| 客户端收到的字节 | 34,963（含 `[DONE]`） | 34,976（= 首次 + 注释行，去掉注释行后**逐字节相同**） |
+
+同一条链路用 OpenAI 兼容 SDK 侧（`@earendil-works/pi-ai`）复测：TTFT **2410ms → 19ms**，
+两次的事件序列完全一致（`thinking_*` → `text_start` → `text_delta` × 81 → `text_end` → `done`），
+usage 完整。
+
+### 内存
+
+| 状态 | RSS | 说明 |
+|---|---|---|
+| 空载 | 65.7 MB | 含 23MB INT8 模型 |
+| 灌满 1 万条缓存 | 138.1 MB | 落盘 JSON 28.1 MB |
+| 保存窗口 | 158.6 MB | 序列化快照的瞬时占用，不回落 |
+| 灌入过程峰值 | 264–320 MB | 与并发灌入的分配峰值有关；已确认无泄漏 |
+
+### HNSW 索引
+
+自检索（把库里的向量当查询）top-1：320 向量 **100%**（320/320），1k / 5k / 10k 均 **100%**；
+top-3 召回率 99.7% / 99.7% / 93.8% / 81.7%，相对暴力检索的加速比 1.16x / 2.74x / 4.75x。
+`ef_search=50` 固定时规模增大会让束搜索覆盖不足（HNSW 固有特性），而缓存只需要 top-1。
+
+这一项与早期版本的数字差别很大：修复前 320 向量自检索 top-1 只有 30.9%，根因是"邻居饱和时
+直接放弃反向连接"，导致大量节点没有入边、在图中不可达。补上论文的
+`SELECT-NEIGHBORS-HEURISTIC`（多样性筛选）与"满时收缩重选"后恢复到 100%。
