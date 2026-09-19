@@ -262,8 +262,9 @@ void CacheEngine::rebuild_index_impl() {
         if (!vec.empty() && store_->set_embedding(key, std::move(vec))) ++encoded;
       });
   if (encoded > 0)
-    LOG_INFO("cache: re-encoded {} vectors from source (store_vectors=false)",
-             encoded);
+    // 不写"store_vectors=false"：触发条件只是"有条目缺向量"（可能来自旧文件、
+    // 指纹丢弃、或 dim 缺失），把它归因到某个配置项会误导排查
+    LOG_INFO("cache: re-encoded {} vectors from source text", encoded);
 
   // 1. 锁外构建新索引：建图要对每个条目跑一次 O(ef_construction) 搜索，
   //    整个过程持 mutex_ 会让检索与写入全部阻塞，因此先构建、再交换。
