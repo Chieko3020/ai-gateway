@@ -100,6 +100,10 @@ struct CacheConfig {
   bool entity_veto = true;
   int max_entries = 10000;
   int ttl_days = 7;
+  // 是否把向量一并落盘。false = 只存文本（source 里本来就有原文），启动时按
+  // source 重算向量。取舍：落盘体积与 save 的内存峰值都大幅下降，代价是每次
+  // 启动多一次全量编码（1 万条实测约 20s，且这个成本落在后台建图线程里）
+  bool store_vectors = true;
 };
 
 // 安全过滤器配置

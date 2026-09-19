@@ -75,6 +75,37 @@ class LruStore {
   // 用于 embedding 不可用时的降级路径（旧实现靠"再存一份 ns_key"实现）
   std::optional<std::string> get_exact(const std::string& lookup_key);
 
+  // 是否把向量落盘（对应 cache.store_vectors）。false 时 save 只写文本，
+  // 启动后由 CacheEngine 按 source 重算并回写（见 for_each_missing_embedding）
+  void set_store_vectors(bool v) { store_vectors_ = v; }
+  bool store_vectors() const { return store_vectors_; }
+
+  // 回写某条目的向量（store_vectors=false 的启动重算路径用）。
+  // 只在该条目存在且当前**没有**向量时才写：有向量说明它已经是重算过的或被
+  // 指纹校验接受的，重复写会白费一次推理。不移动 LRU 位置（不是"访问"）
+  bool set_embedding(const std::string& key, std::vector<float> embedding);
+
+  // 遍历"有 source 但没有向量"的条目（回调：key, source）。启动重算用它挑
+  // 出需要现算向量的条目；不能复用 for_each_embedding——那个只遍历**有向量**的
+  void for_each_missing_embedding(
+      const std::function<void(const std::string&, const std::string&)>& fn) const;
+
+  // 线性扫描的命中项（只回 key 与相似度，不回向量本体）
+  struct ScanHit {
+    std::string key;
+    float similarity = 0.0f;
+  };
+
+  // 线性扫描全部未过期条目，返回相似度最高的 k 条。
+  //
+  // 与 for_each_embedding 的取舍**正好相反**：这里持锁执行、不拷贝向量。
+  // 那边（建索引）的回调是重活（每条一次 O(ef_construction) 建图搜索），持锁会把
+  // 所有 get/put 堵住，所以先快照再在锁外算；这里（降级检索）的回调只是一次点积
+  // （万条 × 512 维实测约 8ms），拷 20MB 反倒更贵。
+  // 用途：向量索引不可用（后台建图中）时保住语义命中率——否则那段时间所有
+  // 请求都会退化成回源，而回源一次要几百毫秒且真花 token
+  std::vector<ScanHit> scan_topk(const std::vector<float>& query, int k) const;
+
   // 遍历所有非过期条目的 embedding（供索引重建使用）
   void for_each_embedding(
       const std::function<void(const std::string&,
@@ -164,6 +195,7 @@ class LruStore {
   size_t evict_count_ = 0;
   size_t expired_count_ = 0;
 
+  bool store_vectors_ = true;
   // 期望的 embedding 指纹（调用方通过 set_fingerprint 给出）
   std::string expected_fingerprint_;
   // 文件里实际记录的指纹（空 = 无该字段）

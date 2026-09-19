@@ -1,6 +1,9 @@
 // LRU + TTL 缓存存储实现
 #include "cache/lru_store.h"
 
+#include "cache/hnsw_index.h"
+#include "common/base64.h"  // HnswIndex::cosine（降级扫描复用同一套相似度）
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -129,6 +132,76 @@ std::vector<float> LruStore::get_embedding(const std::string& key) {
     if (age >= ttl_seconds_) return {};
   }
   return node.embedding.data;
+}
+
+bool LruStore::set_embedding(const std::string& key,
+                             std::vector<float> embedding) {
+  if (embedding.empty()) return false;
+  std::lock_guard lock(mutex_);
+  auto it = iter_map_.find(key);
+  if (it == iter_map_.end()) return false;
+  auto& node = *(it->second);
+  if (!node.embedding.data.empty()) return false;  // 已有向量：不覆盖（白费一次推理）
+  node.embedding.data = std::move(embedding);
+  return true;
+}
+
+void LruStore::for_each_missing_embedding(
+    const std::function<void(const std::string&, const std::string&)>& fn) const {
+  // 先在锁内筛出 (key, source)，再在锁外回调：回调里是重活（embedding 推理），
+  // 与 for_each_embedding 的取舍一致
+  std::vector<std::pair<std::string, std::string>> snapshot;
+  {
+    std::lock_guard lock(mutex_);
+    const auto now = Clock::now();
+    for (const auto& node : lru_) {
+      if (!node.embedding.data.empty()) continue;
+      if (node.source.empty()) continue;  // 没有原文就无从重算
+      if (ttl_seconds_ > 0) {
+        const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                             now - node.ctime)
+                             .count();
+        if (age >= ttl_seconds_) continue;
+      }
+      snapshot.emplace_back(node.key, node.source);
+    }
+  }
+  for (const auto& [key, source] : snapshot) fn(key, source);
+}
+
+std::vector<LruStore::ScanHit> LruStore::scan_topk(
+    const std::vector<float>& query, int k) const {
+  std::vector<ScanHit> hits;
+  if (query.empty() || k <= 0) return hits;
+
+  std::lock_guard lock(mutex_);
+  const auto now = Clock::now();
+  hits.reserve(lru_.size());
+  for (const auto& node : lru_) {
+    // 维度不符的条目（换过模型/文件混入）直接跳过，不要拿它算相似度
+    if (node.embedding.data.size() != query.size()) continue;
+    if (ttl_seconds_ > 0) {
+      const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                           now - node.ctime)
+                           .count();
+      if (age >= ttl_seconds_) continue;
+    }
+    hits.push_back(ScanHit{node.key, HnswIndex::cosine(query, node.embedding.data)});
+  }
+
+  if (static_cast<int>(hits.size()) > k) {
+    std::partial_sort(hits.begin(), hits.begin() + k, hits.end(),
+                      [](const ScanHit& a, const ScanHit& b) {
+                        return a.similarity > b.similarity;
+                      });
+    hits.resize(static_cast<size_t>(k));
+  } else {
+    std::sort(hits.begin(), hits.end(),
+              [](const ScanHit& a, const ScanHit& b) {
+                return a.similarity > b.similarity;
+              });
+  }
+  return hits;
 }
 
 void LruStore::for_each_embedding(
@@ -279,7 +352,14 @@ bool LruStore::save(const std::string& path) const {
       if (!e.source.empty()) entry["src"] = e.source;
       // sse: 上游原始 SSE 字节（只有流式回源写回的条目才有；旧文件没有该字段）
       if (!e.sse.empty()) entry["sse"] = e.sse;
-      if (!e.embedding.empty()) entry["embedding"] = e.embedding;
+      // 向量以 base64 存**原始 float 字节**，而不是 JSON 数字数组：nlohmann 会把
+      // 每个 float 按 17 位有效数字写出（与 double 同形），512 维就要 10.5KB；
+      // 换成 base64 后是 2731 字符，且 DOM 里只是一个字符串（见 common/base64.h）。
+      // dim 单独存：解码时用它校验长度，避免拿半截向量去检索
+      if (store_vectors_ && !e.embedding.empty()) {
+        entry["vec_b64"] = encode_float_vector(e.embedding);
+        entry["dim"] = e.embedding.size();
+      }
       entry["ctime"] = e.ctime_seconds;
       arr.push_back(std::move(entry));
     }
@@ -379,15 +459,26 @@ bool LruStore::load(const std::string& path) {
         node.source = entry["src"].get<std::string>();
       if (entry.contains("sse") && entry["sse"].is_string())
         node.sse = entry["sse"].get<std::string>();
-      if (entry.contains("embedding")) {
-        auto vec = entry["embedding"].get<std::vector<float>>();
+      // 两种存法都要能读：新的 vec_b64（base64 原始 float）与旧的 embedding 数组。
+      // 向后兼容是硬要求——升级不该让整份已有缓存作废
+      std::vector<float> vec;
+      if (entry.contains("vec_b64") && entry["vec_b64"].is_string()) {
+        const size_t dim = entry.value("dim", size_t{0});
+        vec = decode_float_vector(entry["vec_b64"].get<std::string>(), dim);
+        if (vec.empty() && dim > 0)
+          LOG_WARN("cache: entry {} has unreadable vec_b64 (dim={}), dropping it",
+                   node.key, dim);
+      } else if (entry.contains("embedding")) {
+        vec = entry["embedding"].get<std::vector<float>>();
+      }
+      if (!vec.empty()) {
         // 指纹不一致：**丢弃向量、保留文本**。
         // 为什么不整份丢弃：文本条目仍能通过 source 精确命中（embedding 不可用
         // 时的降级路径本来就是这个语义），而语义索引可以按新模型重建；
         // 真正危险的是"拿旧向量当新向量用"，这一条被严格禁止
         if (mismatch) {
           ++dropped_vectors_;
-        } else if (!vec.empty()) {
+        } else {
           node.embedding.data = std::move(vec);
         }
       }

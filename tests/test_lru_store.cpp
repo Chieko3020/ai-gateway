@@ -113,6 +113,53 @@ int main() {
             std::remove(spath.c_str());
         }
 
+        // cache.store_vectors=false：只写文本，向量留给启动时重算
+        // 判别力：漏掉 save 里的 store_vectors_ 开关 → 文件里会出现向量字段，
+        // 体积回到旧口径；漏掉 for_each_missing_embedding 的"跳过已有向量" →
+        // 重算后仍被反复列出
+        {
+            const std::string npath = path + ".novec";
+            LruStore sw(10, 0);
+            CHECK(sw.store_vectors()); ok++;        // 默认落盘向量
+            sw.set_store_vectors(false);
+            CHECK(!sw.store_vectors()); ok++;
+            sw.put_full("msg:11", "reply-11", {}, {1.0f, 2.0f});
+            sw.set_source("msg:11", "q11");
+            CHECK(sw.save(npath)); ok++;
+
+            std::ifstream infile(npath);
+            std::string content((std::istreambuf_iterator<char>(infile)),
+                                std::istreambuf_iterator<char>());
+            CHECK(content.find("vec_b64") == std::string::npos); ok++;
+            CHECK(content.find("embedding") == std::string::npos); ok++;
+            CHECK(content.find("reply-11") != std::string::npos); ok++;  // 文本在
+
+            LruStore sr(10, 0);
+            CHECK(sr.load(npath)); ok++;
+            CHECK(sr.get("msg:11") == "reply-11"); ok++;
+            CHECK(sr.get_embedding("msg:11").empty()); ok++;  // 向量待重算
+
+            // 重算路径：先能列出缺向量的条目，回写后不再列出
+            int missing = 0;
+            std::string only_key, only_src;
+            sr.for_each_missing_embedding([&](const std::string& k, const std::string& src) {
+                ++missing;
+                only_key = k;
+                only_src = src;
+            });
+            CHECK(missing == 1); ok++;
+            CHECK(only_key == "msg:11"); ok++;
+            CHECK(only_src == "q11"); ok++;
+            CHECK(sr.set_embedding("msg:11", {3.0f, 4.0f})); ok++;
+            CHECK(sr.get_embedding("msg:11").size() == 2); ok++;
+            CHECK(!sr.set_embedding("msg:11", {9.0f})); ok++;  // 已有向量 → 不覆盖
+            missing = 0;
+            sr.for_each_missing_embedding(
+                [&](const std::string&, const std::string&) { ++missing; });
+            CHECK(missing == 0); ok++;
+            std::remove(npath.c_str());
+        }
+
         // 旧落盘文件（没有 src 字段）必须仍能读进来
         {
             const std::string legacy = path + ".legacy";

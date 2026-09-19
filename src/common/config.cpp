@@ -113,6 +113,7 @@ int GatewayConfig::load(const std::string& path, GatewayConfig& out) {
       out.cache.entity_veto = c.value("entity_veto", true);
       out.cache.max_entries = c.value("max_entries", 10000);
       out.cache.ttl_days = c.value("ttl_days", 7);
+      out.cache.store_vectors = c.value("store_vectors", true);
     }
 
     // --- filter ---
