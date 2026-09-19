@@ -53,7 +53,17 @@ WriteStatus send_all_with_deadline_until(
       now + std::chrono::milliseconds(write_deadline_ms > 0 ? write_deadline_ms : 0);
   // 单次写调用的上限 = min(单次写死线, 整条响应的总死线)
   const auto deadline = std::min(call_deadline, total_deadline);
-  // 一次停顿的上限再取一次 min（idle 通常就是总死线本身；流式下 total 是 max）
+  // 一次停顿（poll 等待可写）的上限 = min(单次写死线, 整条响应总死线, 空闲死线)。
+  //
+  // 【报告 L5 评估结论：保持与 deadline 取 min，不改】
+  // 审查建议是"流式下让 pause_deadline 直接取 idle_deadline，使
+  // stream_idle_timeout 不被 write_timeout 夹紧"。实测该改动会让
+  // test_http_server 第 6 段（socketpair + 4MB + 已给 total_deadline 的
+  // send_all_with_deadline）永久阻塞在 poll(POLLOUT)：那里的
+  // current_idle_deadline() 是 time_point::max()，pause_deadline 变成 max 后
+  // "left"的毫秒换算失去上界。本项是 Low 级、无用户可见症状（默认两者同为 60s），
+  // 因此本轮不改，留在简报的"未修/需决策"里；真要改应当连同
+  // current_idle_deadline() 的 max 语义一起收敛
   const auto pause_deadline = std::min(deadline, idle_deadline);
 
   size_t offset = 0;
@@ -240,9 +250,29 @@ bool ResponseWriter::finish_stream() {
 HttpServer::HttpServer(const ServerConfig& config)
     : config_(config) {}
 
+// 析构顺序为什么是"先 join worker，再关连接 fd"（报告 M4）：
+//
+//   C++ 的对象析构是"函数体先跑，之后按声明逆序析构成员"。成员声明顺序是
+//   ... conns_ / io_mutex_ / io_returns_ ... / pool_，因此 **pool_ 的析构
+//   （stop_ = true + join 全部 worker）发生在函数体之后**。旧实现把这个顺序弄反了：
+//   函数体里 close(conns_ 里的 fd) 时，worker 可能仍在往这些 fd 写响应
+//   （worker_owned 为真的连接项仍在 conns_ 里），于是 worker 的 send 落到一个
+//   已被关闭、甚至已被下一步 accept 复用出去的 fd 号上。
+//
+//   正常停机时 main 会先 drain()（等 pool_ 空闲并把归还队列收尾），所以旧顺序在
+//   接好 drain 之后不再是现实路径；但这属于"靠调用方纪律兜住"的隐式约束，一旦
+//   有人直接析构（单测、异常路径）就重新变成缺陷。这里改成显式等待：
+//   pool_.wait_idle() 保证此刻没有任何在途任务，之后再关 fd 才是安全的。
+//
+//   wait_idle() 返回后不会再有新的归还入队（run 已退出 → 不再提交任务），
+//   因此下面关的都是"确实没人用"的 fd。
 HttpServer::~HttpServer() {
   stop();
-  // 关闭所有残留的连接
+  // 先等在途请求跑完（含它最后一次写响应），再回收 fd。
+  // 注意：这里**不**依赖 drain() 是否被调用过（H1 的教训就是"接口支持了、
+  // 调用方忘了用"），析构自身必须自洽
+  pool_.wait_idle();
+  // 关闭所有残留的连接（此刻已无 worker 持有它们）
   for (auto& [fd, conn] : conns_) {
     (void)conn;
     close(fd);
@@ -524,7 +554,25 @@ void HttpServer::process_returned_fds(bool stop_requested) {
   }
   for (const auto& r : batch) {
     // 连接项仍然由 reactor 持有（worker 只是"借用"），因此这里统一回收
-    if (stop_requested || r.action == FdAction::kClose) {
+    if (stop_requested) {
+      // 停机收尾：不再有新请求，此时无论归还动作是什么都关掉（fd 号不会在此期间
+      // 被复用——listen_fd 已在 run() 退出前关掉，没有新连接进来）
+      close_connection(r.fd);
+      continue;
+    }
+    if (r.action == FdAction::kClose) {
+      // 令牌一致性校验（报告 L3）：release_borrow 与 rearm_keep_alive 都有这道闸，
+      // 唯独 kClose 没有。静态推理上"fd 不在借出集合里就不会被复用"成立，本轮
+      // 插桩也从未观察到错配（0 次），因此这是防御性补齐而非已发生缺陷：
+      // 一旦 fd 已被新连接复用，这里 close 掉的会是别人的连接
+      auto it = conns_.find(r.fd);
+      if (it == conns_.end() || it->second.borrow_token != r.token) {
+        LOG_WARN("close return: fd {} token {} is not ours (closed or reused), "
+                 "ignoring",
+                 r.fd, r.token);
+        stale_return_count_.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
       close_connection(r.fd);
       continue;
     }
@@ -561,10 +609,16 @@ void HttpServer::release_borrow(int fd, uint64_t token) {
 void HttpServer::rearm_keep_alive(int fd, uint64_t token) {
   auto it = conns_.find(fd);
   if (it == conns_.end()) {
-    // 连接项已经没了：若 fd 仍然有效，说明它已经不属于我们（正常路径上
-    // 不会发生——reactor 只在归还流程里删连接项），保守关闭避免 fd 泄漏
-    LOG_DEBUG("keep-alive: fd {} has no registered connection, closing", fd);
-    ::close(fd);
+    // 连接项已经没了：说明这个 fd 号**已经不属于我们**（正常路径上不会发生——
+    // reactor 只在归还流程里删连接项）。此时绝不能 close(fd)：fd 号可能已被新的
+    // accept 复用，close 会关掉**别人的连接**（报告 L2；插桩版在 18-20s 混合压力下
+    // 未命中该分支，属代码级推断而非已复现缺陷，因此这里改成"只记账、不动手"）。
+    // 不关也不会泄漏：那条 fd 若真是我们的遗留，reactor 的连接表里没有它，
+    // 说明它早已在别处以 close 收场
+    LOG_WARN("keep-alive: fd {} has no registered connection, not closing "
+             "(token {}); counted as orphan return",
+             fd, token);
+    orphan_keep_alive_returns_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   auto& conn = it->second;
@@ -774,9 +828,24 @@ bool HttpServer::handle_buffer(int client_fd, bool peer_closed) {
   auto header_end = buf.find("\r\n\r\n");
   if (header_end == std::string::npos) {
     // 头部未收齐：超过头部上限断开防 slowloris；对端已 FIN 也立即回收
-    if (buf.size() > config_.max_header_bytes || peer_closed) {
+    if (buf.size() > config_.max_header_bytes) {
       LOG_WARN("incomplete header ({} bytes, eof={}), closing", buf.size(),
                peer_closed);
+      close_connection(client_fd);
+      return true;
+    }
+    if (peer_closed) {
+      // 缓冲区为空 + 对端 FIN = **正常**关闭：客户端处理完上一个请求后主动
+      // 关掉空闲的 keep-alive 连接（curl 每次调用结束就是这样）。
+      // 旧实现在这里也打 "incomplete header (0 bytes, eof=true)" 的 WARN，
+      // 把正常关闭误报成不完整请求——压力测试里这类 WARN 占 27%（236/874），
+      // ops-incident-log §8.10 的崩溃现场最后两行正是它，曾被当成线索排查（报告 L1）
+      if (buf.empty()) {
+        LOG_DEBUG("client closed idle keep-alive connection");
+      } else {
+        LOG_WARN("incomplete header ({} bytes, eof={}), closing", buf.size(),
+                 peer_closed);
+      }
       close_connection(client_fd);
       return true;
     }

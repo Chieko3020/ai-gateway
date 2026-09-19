@@ -168,7 +168,7 @@ class ResponseWriter {
 // info 里目前只有客户端的连接复用意愿——流式 handler 需要它来正确写 Connection 头
 using RequestHandler = std::function<HttpReply(
     const std::string& request_body, ResponseWriter& writer,
-    const HttpRequestInfo& info)>;
+    HttpRequestInfo& info)>;
 
 class HttpServer {
  public:
@@ -223,6 +223,19 @@ class HttpServer {
   // 否则用例可能只是碰巧没触发 EAGAIN 而"通过"
   uint64_t send_eagain_count() const {
     return send_eagain_count_.load(std::memory_order_relaxed);
+  }
+
+  // 归还流程里"令牌对不上、因而被拒"的次数（正确性哨兵，报告 L2/L3）：
+  //   - stale_return_count：kClose 归还的 fd 已不在我们的表里，或令牌不符
+  //   - orphan_keep_alive_returns：keep-alive 归还时连接项已消失
+  // 稳态下两者都应为 0；> 0 说明连接生命周期有不变量被破坏。
+  // 它们同时是"这两条防御分支确实存在且被走到"的运行时证据（此前这两处
+  // 只有静态推理，没有任何可观测面）
+  uint64_t stale_return_count() const {
+    return stale_return_count_.load(std::memory_order_relaxed);
+  }
+  uint64_t orphan_keep_alive_returns() const {
+    return orphan_keep_alive_returns_.load(std::memory_order_relaxed);
   }
 
   // keep-alive 复用次数（同一连接上第 2 个及以后的请求各计一次）。
@@ -286,6 +299,20 @@ class HttpServer {
                      // 连接重新交给 reactor 读/超时回收——绝不能像旧实现那样
                      // 直接丢弃任务，那条连接的 worker_owned 会永远为真，
                      // reactor 从此不读不关，请求与 fd 一起永久泄漏
+                     //
+                     // 【本轮审计结论：现实现下这条路径不可达，保留作兜底】
+                     // try_claim_borrow 失败的唯一条件是 token 不在
+                     // borrowed_tokens_ 里，而该集合的移除只发生在两个 worker 侧
+                     // 函数中（try_claim_borrow 自身、return_fd），reactor 从不
+                     // 移除 token——因此"借出被撤销"不会发生。ops-incident-log
+                     // §8.10 里"实测 15 条认领失败日志"是旧实现（每连接独立发号、
+                     // 令牌撞车）的产物，改成全局发号器后归零，本轮 18-20s 混合
+                     // 压力插桩同样是 0 次。
+                     // 为什么不删：它把"认领失败"从"静默丢任务 + fd 永久泄漏"
+                     // 变成可恢复路径，是这类改动唯一的安全网；将来给 reactor 加上
+                     // "撤销借出"的能力（例如缩短超时）时，删掉它会重新引入泄漏。
+                     // 代价只是一段不执行的分支。纪律上它属于"未被验证的死代码"，
+                     // 因此在这里显式登记，而不是让后人读代码去猜它是否可达
   };
   struct FdReturn {
     int fd;
@@ -389,6 +416,10 @@ class HttpServer {
   std::atomic<uint64_t> keep_alive_rearms_{0};
   // 借出令牌发号器：**全局唯一**（跨连接也不重复），见 Connection::borrow_token
   std::atomic<uint64_t> next_borrow_token_{0};
+  // 归还流程里被令牌校验拒掉的次数（见 stale_return_count() / 
+  // orphan_keep_alive_returns()）
+  std::atomic<uint64_t> stale_return_count_{0};
+  std::atomic<uint64_t> orphan_keep_alive_returns_{0};
   // 累计 accept 次数（诊断/基准用）
   std::atomic<uint64_t> accepted_connections_{0};
 };
