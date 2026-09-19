@@ -295,6 +295,14 @@ class SsePassthroughSink : public LlmStreamSink {
   }
 
   void on_done(StreamAbortReason reason) override {
+    // curl 侧的中止原因必须原样留下来（报告 M1）。
+    // 旧实现是 `(void)reason;`，于是"上游静默被空闲死线中停"在 handler 眼里与
+    // "上游正常发完"完全一样：不打 WARN、不计 streams_abort、还把这个超时值算进
+    // TTFT 样本池，而客户端收到的是一个"看起来正常结束但没有 [DONE]"的流
+    // （OpenAI 兼容 SDK 报 "Stream ended without finish_reason"，网关侧却查不到线索）。
+    // kClientGone 由 on_chunk 的写失败路径设置，这里不覆盖已有信息
+    if (reason != StreamAbortReason::kNone && relay_abort_ == StreamAbortReason::kNone)
+      relay_abort_ = reason;
     if (write_failed_) return;  // 已因写失败退出，上游传输也已被中断
     // 冲刷尾部：上游结束时最后一段可能没有以空行结尾
     std::string tail = filter_->sse_feed(filter_state_, {}, /*final_chunk=*/true);
@@ -303,7 +311,6 @@ class SsePassthroughSink : public LlmStreamSink {
       abort_ = writer_->abort_reason();
     }
     if (filter_state_.rejected) filter_rejected_ = true;
-    (void)reason;
   }
 
   // ---- 观测数据（handler 收尾时读取） ----
@@ -311,12 +318,26 @@ class SsePassthroughSink : public LlmStreamSink {
   bool done_seen() const { return done_seen_; }
   bool filter_rejected() const { return filter_rejected_; }
   bool write_failed() const { return write_failed_; }
+  // 中止原因 = "写客户端失败的原因"（abort_，由 ResponseWriter 给出）或
+  // "curl 侧中止传输的原因"（relay_abort_，上游空闲/总时限/客户端断开），
+  // 两者取先有值的那个。为什么要合并：写失败时 on_done 会提前返回、
+  // relay_abort_ 可能只有 on_chunk 设的 kClientGone，而 detail 仍在 abort_ 里
+  StreamAbortReason relay_abort_reason() const { return relay_abort_; }
   AbortReason abort_reason() const { return abort_; }
   int64_t first_byte_ms() const { return first_byte_ms_; }
   size_t bytes_in() const { return bytes_in_; }
   const StreamUsage& usage() const { return usage_.usage(); }
   const std::string& rejected_event() const {
     return filter_state_.rejected_event;
+  }
+
+  // 本次流是否被**上游侧**中止（而不是客户端侧）。
+  // 上游静默（kUpstreamIdle）与上游超时（kDeadline）属于这一类：客户端并没有
+  // 走开，是网关按死线主动中停了上游 —— 这是"防线生效"的证据，必须与
+  // "客户端提前断开"分开统计与告警
+  bool upstream_aborted() const {
+    return relay_abort_ == StreamAbortReason::kUpstreamIdle ||
+           relay_abort_ == StreamAbortReason::kDeadline;
   }
 
  private:
@@ -346,7 +367,43 @@ class SsePassthroughSink : public LlmStreamSink {
   int64_t first_byte_ms_ = 0;
   size_t bytes_in_ = 0;
   AbortReason abort_ = AbortReason::kNone;
+  // curl 侧的中止原因（on_done 的入参），与 abort_ 分开保存：
+  // 两者语义不同（一个来自写客户端，一个来自上游/传输层），合并会丢掉诊断信息
+  StreamAbortReason relay_abort_ = StreamAbortReason::kNone;
 };
+
+// 流式中止原因的可读文本：日志与告警按它分类（报告 M1）。
+// 顺序有讲究——**上游侧中止优先于"客户端断开"**：过滤拒绝与上游静默这两条路径
+// 上 curl 侧看到的原因都是"写回调返回 0 ⇒ kClientGone"，但真实原因分别是
+// "命中屏蔽规则"与"上游空闲死线到点"。先报具体原因，运维才不会把它误读成
+// "客户端自己断了"（旧实现既不区分、也不告警，这条防线在可观测面上完全隐形）
+std::string stream_abort_detail(const SsePassthroughSink& sink) {
+  if (sink.filter_rejected()) return "output filter rejected the SSE event";
+  switch (sink.relay_abort_reason()) {
+    case StreamAbortReason::kUpstreamIdle:
+      return "upstream idle timeout (no data between chunks)";
+    case StreamAbortReason::kDeadline:
+      return "upstream total deadline";
+    case StreamAbortReason::kClientGone:
+      return "client gone / write failed";
+    case StreamAbortReason::kNullSink:
+      return "internal: null sink";
+    case StreamAbortReason::kNone:
+      break;
+  }
+  // curl 侧没给原因：那就是写客户端时失败的（写死线 / 客户端断开）
+  switch (sink.abort_reason()) {
+    case AbortReason::kIdle:
+      return "write idle timeout";
+    case AbortReason::kDeadline:
+      return "write deadline";
+    case AbortReason::kClientGone:
+      return "client gone";
+    default:
+      return "unknown";
+  }
+}
+
 
 }  // namespace
 
@@ -386,21 +443,20 @@ HandleOutcome handle_stream_request(
     // 结束时写 chunked 终止块（0\r\n\r\n）。写不进去说明客户端已经走了，
     // 此时连接不能复用
     bool finished = writer.finish_stream();
-    bool keep_alive = kStreamKeepAlive && finished && !sink.write_failed() &&
-                      sink.abort_reason() != AbortReason::kDeadline &&
-                      sink.abort_reason() != AbortReason::kClientGone;
+    // 中止 = 写客户端失败，或 curl 侧中止了上游传输（报告 M1）。
+    // 后者以前被 sink 丢掉，于是"上游静默被中停"被当成正常完成
+    const bool aborted = sink.write_failed() || sink.upstream_aborted() ||
+                         sink.abort_reason() != AbortReason::kNone;
+    bool keep_alive = kStreamKeepAlive && finished && !aborted;
 
-    if (sink.write_failed() || sink.abort_reason() != AbortReason::kNone) {
-      // 客户端提前断开 / 写死线到点：不进延迟样本池（口径见 stats.h）
+    if (aborted) {
+      // 客户端提前断开 / 写死线到点 / 上游静默被中停：不进延迟样本池
+      // （口径见 stats.h——TTFT 只统计正常完成的流，否则被中止的流会把它的
+      //  等待时长算成"首字节延迟"，污染分位数）
       stats->record_stream_aborted();
-      LOG_WARN("stream: aborted after {} bytes ({}), keep_alive={}",
-               sink.bytes_in(),
-               sink.abort_reason() == AbortReason::kIdle
-                   ? "write idle timeout"
-                   : (sink.abort_reason() == AbortReason::kDeadline
-                          ? "write deadline"
-                          : "client gone"),
-               keep_alive ? "yes" : "no");
+      LOG_WARN("stream: aborted after {} bytes ({}), keep_alive={} done_event={}",
+               sink.bytes_in(), stream_abort_detail(sink),
+               keep_alive ? "yes" : "no", sink.done_seen() ? "yes" : "no");
     } else {
       // token 统计：usage 在最后一个 SSE 事件里（且只在客户端带了
       // stream_options.include_usage 时上游才会发）。SseUsageParser 旁路解析这份
@@ -532,8 +588,12 @@ HandleOutcome handle_request(const std::string& request_body,
   // 4. 语义缓存
   std::string ns;
   std::string ns_key;
+  // namespace 前缀（"ns<hash>:" 或空串）：缓存命中路径用它二次过滤候选，
+  // 请求合并路径也用它做同一维度的隔离（报告 H2，见 singleflight.h 文件头）
+  std::string ns_prefix;
   if (cfg.cache.enabled && !user_msg.empty()) {
     ns = extract_namespace(request_body);
+    ns_prefix = ns.empty() ? std::string{} : ns + ":";
     ns_key = ns.empty() ? user_msg : ns + ":" + user_msg;
     auto hit = engine->try_hit(user_msg, ns);
     if (hit.hit) {
@@ -559,11 +619,14 @@ HandleOutcome handle_request(const std::string& request_body,
   // 这样"等待超时后被新 leader 顶替"的旧 leader 不会误写别人的 promise
   std::shared_ptr<std::promise<std::string>> sf_slot;
   if (!user_msg.empty() && !cached_embedding.empty()) {
-    // 合并候选的实体一致性校验用查询自己的实体标记（与缓存命中的口径一致：
-    // 从 user_msg 提，不带 namespace 前缀——前缀自身的十六进制会被当成混合标识符）
+    // 合并候选的两道闸（口径与缓存命中路径一致）：
+    //   实体：从 user_msg 提标记，不带 namespace 前缀（前缀自身的十六进制会被
+    //         当成混合标识符）
+    //   namespace：ns_prefix 由本请求自己的 system prompt 决定；无 system 时为空串，
+    //         此时只允许与同样无 ns 的在途条目合并（报告 H2）
     const EntityTokens query_entities =
         cfg.cache.entity_veto ? extract_entity_tokens(user_msg) : EntityTokens{};
-    auto fut = sf->try_merge(ns_key, cached_embedding, query_entities,
+    auto fut = sf->try_merge(ns_key, cached_embedding, ns_prefix, query_entities,
                              cfg.cache.entity_veto);
     if (fut.has_value()) {
       auto status = fut->wait_for(
