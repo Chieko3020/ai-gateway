@@ -45,9 +45,12 @@ target_link_libraries(test_config ai_gateway_common nlohmann_json::nlohmann_json
 target_compile_definitions(test_config PRIVATE
     GATEWAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
-# 请求合并：取消/超时/顶替语义（报告 C2 回归）
+# 请求合并：取消/超时/顶替语义（报告 C2 回归）+ 实体一致性否决（第六轮）
+# 需要 ai_gateway_cache：singleflight 复用 cache/entity_tokens 的 extract_entity_tokens
+# / entity_mismatch（合并路径与缓存命中路径必须同一套实体规则）
 add_executable(test_singleflight test_singleflight.cpp)
-target_link_libraries(test_singleflight ai_gateway_common ai_gateway_test_check)
+target_link_libraries(test_singleflight ai_gateway_cache ai_gateway_common
+    ai_gateway_test_check)
 
 # HTTP 服务的连接生命周期（报告 H5 半关闭/空闲超时/连接上限、M12 drain）
 add_executable(test_http_server test_http_server.cpp)

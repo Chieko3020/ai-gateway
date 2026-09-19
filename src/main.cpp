@@ -17,6 +17,7 @@
 #include "cache/cache_engine.h"
 #include "cache/embedding_fingerprint.h"
 #include "cache/lru_store.h"
+#include "cache/entity_tokens.h"
 #include "cache/hnsw_index.h"
 #include "common/log_file.h"
 #include "cache/onnx_embedding.h"
@@ -604,7 +605,12 @@ static HandleOutcome handle_request(const std::string& request_body,
   // 这样"等待超时后被新 leader 顶替"的旧 leader 不会误写别人的 promise
   std::shared_ptr<std::promise<std::string>> sf_slot;
   if (!user_msg.empty() && !cached_embedding.empty()) {
-    auto fut = sf->try_merge(ns_key, cached_embedding);
+    // 合并候选的实体一致性校验用查询自己的实体标记（与缓存命中的口径一致：
+    // 从 user_msg 提，不带 namespace 前缀——前缀自身的十六进制会被当成混合标识符）
+    const EntityTokens query_entities =
+        cfg.cache.entity_veto ? extract_entity_tokens(user_msg) : EntityTokens{};
+    auto fut = sf->try_merge(ns_key, cached_embedding, query_entities,
+                             cfg.cache.entity_veto);
     if (fut.has_value()) {
       auto status = fut->wait_for(
           std::chrono::seconds(cfg.backend.timeout_seconds));
@@ -642,7 +648,7 @@ static HandleOutcome handle_request(const std::string& request_body,
         LOG_DEBUG("singleflight: wait timeout (src_len={})", ns_key.size());
       }
     }
-    sf_slot = sf->insert(ns_key, cached_embedding);
+    sf_slot = sf->insert(ns_key, cached_embedding, query_entities);
   }
 
   // 6. 缓存未命中 转发 LLM
