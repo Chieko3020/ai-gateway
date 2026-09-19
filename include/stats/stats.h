@@ -48,6 +48,11 @@ struct StatsSnapshot {
   int64_t bypass_p50_latency_ms = 0;
   int64_t bypass_p95_latency_ms = 0;
   size_t bypass_latency_samples = 0;
+  // 流式（SSE）流量构成：正常完成 / 提前中止 / 正常完成但上游未给 usage。
+  // M1 修复后"被中停"才与"正常完成"可区分，因此 streams_aborted 是有意义的信号。
+  size_t streams = 0;
+  size_t streams_aborted = 0;
+  size_t streams_without_usage = 0;
 };
 
 class Stats {

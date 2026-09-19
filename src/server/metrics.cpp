@@ -118,6 +118,19 @@ std::string render_metrics(const Stats& stats, int64_t uptime_seconds,
   e.gauge("ai_gateway_bypass_latency_samples", "旁路延迟样本数",
           static_cast<double>(s.bypass_latency_samples));
 
+  // 流式（SSE）流量构成，口径与 Stats::report() 的 streams / streams_abort /
+  // streams_no_usage 完全一致（避免"日志一个数、抓取端另一个数"）。
+  // streams_aborted 在本轮 M1 修复后才开始有意义——此前上游空闲中止会被
+  // 记成正常完成，这个计数因此恒为 0、信号消失。
+  e.counter("ai_gateway_streams_total", "流式请求完成数（含正常完成与中止）",
+            static_cast<double>(s.streams));
+  e.counter("ai_gateway_streams_aborted_total",
+            "流式请求提前中止数（上游空闲超时 / 客户端断开 / 写死线）",
+            static_cast<double>(s.streams_aborted));
+  e.counter("ai_gateway_streams_without_usage_total",
+            "正常完成但上游未返回 usage 的流式请求数",
+            static_cast<double>(s.streams_without_usage));
+
   // 本项目没有内存池；线程池队列深度是唯一的"内部资源排队"信号
   if (pool_pending >= 0)
     e.gauge("ai_gateway_thread_pool_pending_tasks", "线程池队列中待执行的任务数",

@@ -126,6 +126,24 @@ int main() {
     ok++;
     CHECK(m.find("ai_gateway_cache_merged_total 1") != std::string::npos);
     ok++;
+
+    // 流式（SSE）流量构成：用**独立的 Stats 实例**单独渲染一次。
+    // 不能借用上面的 st——record_stream() 会同时推进 bypassed_、旁路延迟池与
+    // token 计数，插进去会污染前面那些断言（第一版就是这么写错的，被测试逮住）。
+    // 口径：只有 record_stream 计"完成"，aborted 与 no_usage 各自单列。
+    {
+      Stats st2;
+      st2.record_stream(5, 800, 10, 20);  // 正常完成（TTFT 进旁路池）
+      st2.record_stream_no_usage();       // 完成但上游没给 usage
+      st2.record_stream_aborted();        // 被中停（M1 修复后才有意义）
+      const std::string ms = render_metrics(st2);
+      CHECK(ms.find("ai_gateway_streams_total 1") != std::string::npos);
+      ok++;
+      CHECK(ms.find("ai_gateway_streams_aborted_total 1") != std::string::npos);
+      ok++;
+      CHECK(ms.find("ai_gateway_streams_without_usage_total 1") != std::string::npos);
+      ok++;
+    }
     CHECK(m.find("ai_gateway_tokens_prompt_total 1100") != std::string::npos);
     ok++;  // 1000 + 旁路 100
     CHECK(m.find("ai_gateway_tokens_completion_total 2050") != std::string::npos);

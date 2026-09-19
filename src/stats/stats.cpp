@@ -231,6 +231,9 @@ StatsSnapshot Stats::snapshot() const {
   s.bypass_p50_latency_ms = bypass_percentile(50);
   s.bypass_p95_latency_ms = bypass_percentile(95);
   s.bypass_latency_samples = bypass_ring_count_;
+  s.streams = streams_;
+  s.streams_aborted = streams_aborted_;
+  s.streams_without_usage = streams_without_usage_;
   return s;
 }
 
