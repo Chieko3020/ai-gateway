@@ -54,6 +54,40 @@ CacheEngine::HitResult CacheEngine::try_hit(
   // 缓存 key: namespace:msg
   auto ns_key = ns.empty() ? user_message : ns + ":" + user_message;
 
+  // 0. 索引尚未就绪（后台建图中）：语义检索退化为**暴力扫描**，而不是直接放弃。
+  //    直接放弃的代价是这段时间**所有**请求都转成回源——一次几百毫秒、还真的花
+  //    token；而线性扫描万条实测约 8ms（LruStore::scan_topk 持锁但只做点积）。
+  //    判定走同一个 judge_candidates，所以降级期间的命中行为与索引正常时一致
+  if (!index_ready_.load(std::memory_order_acquire)) {
+    auto vec = embed_fn_(user_message, 5);
+    if (vec.empty()) {
+      // 连向量都算不出来：只剩"字符串完全相同"这一条路
+      auto exact = store_->get_exact(ns_key);
+      if (exact.has_value()) {
+        LOG_INFO_SAMPLED("cache: HIT (exact, no embedding) ns={}",
+                         ns.empty() ? "default" : ns);
+        return HitResult{true, std::move(exact.value()), 1.0f};
+      }
+      return HitResult{};
+    }
+    degraded_searches_.fetch_add(1, std::memory_order_relaxed);
+    auto scan = store_->scan_topk(vec, top_k_);
+    std::vector<Candidate> degraded_candidates;
+    degraded_candidates.reserve(scan.size());
+    for (const auto& h : scan)
+      degraded_candidates.push_back(Candidate{h.key, h.similarity});
+    auto degraded_hit = judge_candidates(degraded_candidates, ns, user_message,
+                                         /*count_ghosts=*/false);
+    if (degraded_hit.hit) {
+      LOG_INFO_SAMPLED("cache: HIT (degraded scan) key={} sim={:.3f}",
+                       degraded_hit.key, degraded_hit.similarity);
+      return degraded_hit;
+    }
+    LOG_INFO_SAMPLED("cache: MISS (degraded scan) top_sim={:.3f}",
+                     scan.empty() ? 0.0f : scan[0].similarity);
+    return HitResult{false, "", 0.0f, std::move(vec)};
+  }
+
   // 1. 向量化用户消息（不持锁 embed_fn_ 可能很慢）
   auto vec = embed_fn_(user_message, 5);
   if (vec.empty()) {
@@ -80,36 +114,34 @@ CacheEngine::HitResult CacheEngine::try_hit(
   }
   std::vector<HnswResult> results = idx->search(vec, top_k_);
 
-  // 3. 遍历结果，检查是否命中（相似度 ≥ 阈值，命名空间匹配，实体一致）
-  std::string ns_prefix = ns.empty() ? "" : ns + ":";
-  total_search_.fetch_add(1, std::memory_order_relaxed);
+  // 3. 判定候选（阈值 → 命名空间 → 实体一致性否决 → 取回复）。
+  //    判定逻辑与降级扫描路径共用同一个 judge_candidates，避免两条路径漂移
+  std::vector<Candidate> candidates;
+  candidates.reserve(results.size());
+  for (const auto& r : results) candidates.push_back(Candidate{r.key, r.similarity});
+  auto hit = judge_candidates(candidates, ns, user_message, /*count_ghosts=*/true);
+  if (hit.hit) return hit;
+  // 4. 未命中 带回 embedding 避免 cache_reply 重复计算
+  LOG_INFO_SAMPLED("cache: MISS top_sim={:.3f} threshold={:.3f}",
+                   results.empty() ? 0.0f : results[0].similarity, threshold_);
+  return HitResult{false, "", 0.0f, std::move(vec)};
+}
+
+// 候选判定：索引路径与降级扫描路径共用（改动这里等于同时改两条路径）
+CacheEngine::HitResult CacheEngine::judge_candidates(
+    const std::vector<Candidate>& candidates, const std::string& ns,
+    const std::string& user_message, bool count_ghosts) const {
+  const std::string ns_prefix = ns.empty() ? "" : ns + ":";
+  if (count_ghosts) total_search_.fetch_add(1, std::memory_order_relaxed);
   // 查询侧的实体标记只提取一次（候选侧每条条目各提一次）
   const EntityTokens query_entities =
       entity_veto_ ? extract_entity_tokens(user_message) : EntityTokens{};
-  for (auto& r : results) {
-    if (r.similarity >= threshold_) {
-      if (!ns.empty() && !r.key.starts_with(ns_prefix)) continue;
-
-      // 实体一致性否决：相似度只反映"整体语义接近"，对"只差一个数字/缩略语"的
-      // 句子几乎没有判别力（`继续下一题` ↔ `继续12题` 余弦 0.885；
-      // `什么是DMA` ↔ `什么是DNS` 旧配置下 1.0000）。这里用硬约束补上：
-      // 只要两边的数字/大写缩略语/混合标识符存在不对称差集，就否决这次命中，
-      // 继续看下一条候选（而不是直接判未命中——Top-K 里后面可能有一条实体一致的）。
-      //
-      // 候选侧文本取条目的 source（= "namespace:原始用户消息"），这是**当初
-      // 产生这个向量和这条回复的那段文本**；拿它比对才是同一条缓存记录的自洽比较。
-      // 注意必须查过 source 再比对：若 source 缺失（旧格式文件/未记录），
-      // 就退回"只按相似度判定"，即不做否决（不能凭缺失的文本判定不一致）
-      //
-      // 这里**不要求查询侧有实体**：查询没实体而候选有实体，恰恰是最危险的一类
-      // （`继续下一题` 命中 `继续12题` 的缓存——那条记录的向量与回答都是针对
-      // 另一个题号的）。代价是"问句里多一个数字的同义改写"会被判未命中，
-      // 该取舍在 LCQMC 3000 对上的量化见简报
+  for (const auto& c : candidates) {
+    if (c.similarity >= threshold_) {
+      if (!ns.empty() && !c.key.starts_with(ns_prefix)) continue;
       if (entity_veto_) {
-        auto source = store_->source_of(r.key);
+        auto source = store_->source_of(c.key);
         if (source.has_value()) {
-          // source 形如 "ns<hash>:<原始消息>"，剥掉命名空间前缀再提实体，
-          // 否则 ns 十六进制前缀自身会被当成"混合标识符"，让每条候选都被误否决
           std::string_view text = *source;
           if (!ns.empty()) {
             const std::string prefix = ns + ":";
@@ -119,26 +151,21 @@ CacheEngine::HitResult CacheEngine::try_hit(
             entity_veto_count_.fetch_add(1, std::memory_order_relaxed);
             LOG_INFO_SAMPLED(
                 "cache: VETO by entity mismatch key={} sim={:.3f} ns={}",
-                r.key, r.similarity, ns.empty() ? "default" : ns);
+                c.key, c.similarity, ns.empty() ? "default" : ns);
             continue;
           }
         }
       }
-
-      auto cached = store_->get(r.key);
+      auto cached = store_->get(c.key);
       if (cached.has_value()) {
-        LOG_INFO_SAMPLED("cache: HIT key={} sim={:.3f} ns={}", r.key,
-                         r.similarity, ns.empty() ? "default" : ns);
-        return HitResult{true, std::move(cached.value()), r.similarity, {}, r.key};
+        LOG_INFO_SAMPLED("cache: HIT key={} sim={:.3f} ns={}", c.key, c.similarity,
+                         ns.empty() ? "default" : ns);
+        return HitResult{true, std::move(cached.value()), c.similarity, {}, c.key};
       }
-      ghost_count_.fetch_add(1, std::memory_order_relaxed);
+      if (count_ghosts) ghost_count_.fetch_add(1, std::memory_order_relaxed);
     }
   }
-
-  // 4. 未命中 带回 embedding 避免 cache_reply 重复计算
-  LOG_INFO_SAMPLED("cache: MISS top_sim={:.3f} threshold={:.3f}",
-                   results.empty() ? 0.0f : results[0].similarity, threshold_);
-  return HitResult{false, "", 0.0f, std::move(vec)};
+  return HitResult{};
 }
 
 void CacheEngine::cache_reply(const std::string& user_message,
@@ -165,15 +192,78 @@ void CacheEngine::cache_reply(const std::string& user_message,
 
   store_->put_full(key, reply, sse_bytes, cached_embedding);
   store_->set_source(key, ns_key);
-  index_->add(next_id_ - 1, key, cached_embedding);
+  // 建图期间不写当前索引：那个索引马上会被后台构建结果交换掉，写进去等于丢。
+  // 这一条与 rebuild_index_impl() 的补插是一对——少了补插就会漏条目，
+  // 少了这个判断就会产生"索引里有、交换后消失"的假象
+  if (index_ready_.load(std::memory_order_acquire)) {
+    index_->add(next_id_ - 1, key, cached_embedding);
+    indexed_keys_.insert(key);
+  }
 
   // 不打印源消息原文（ns_key 含完整用户消息），只落长度（报告 M5）
   LOG_DEBUG("cache: stored key={} content_len={} src_len={} dims={} sse={}", key,
             reply.size(), ns_key.size(), cached_embedding.size(), sse_bytes.size());
 }
 
+CacheEngine::~CacheEngine() {
+  // 等后台建图跑完再销毁成员：detach 会让线程访问已析构的 index_/store_
+  if (rebuild_thread_.joinable()) rebuild_thread_.join();
+}
+
 void CacheEngine::rebuild_index() {
+  rebuild_index_impl();
+  index_ready_.store(true, std::memory_order_release);
+}
+
+void CacheEngine::rebuild_index_async() {
+  // 已有建图在跑 → 空操作。用 compare_exchange 而不是 load+store：
+  // 启动路径与 60s 定时器可能同时到达，`load` 后判空再置位会让两个线程都进来
+  bool expected = false;
+  if (!index_building_.compare_exchange_strong(expected, true,
+                                               std::memory_order_acq_rel)) {
+    LOG_DEBUG("cache: rebuild already in progress, skip");
+    return;
+  }
+  if (rebuild_thread_.joinable()) rebuild_thread_.join();  // 复用前先回收上一轮
+  // 先置"未就绪"再起线程：否则线程可能已经建完并置位，这里又把旧值覆盖回去
+  index_ready_.store(false, std::memory_order_release);
+  rebuild_thread_ = std::thread([this] {
+    rebuild_index_impl();
+    index_ready_.store(true, std::memory_order_release);
+    index_building_.store(false, std::memory_order_release);
+  });
+}
+
+void CacheEngine::rebuild_index_impl() {
   LOG_INFO("cache: rebuilding vector index...");
+
+  // 0. 补算缺失的向量（cache.store_vectors=false 落盘的缓存只有文本）。
+  //    必须在建图之前做——建图要靠向量。编码是重活（1 万条实测约 20s），
+  //    而本函数正是后台建图线程的入口，放这里不会占住请求路径
+  size_t encoded = 0;
+  store_->for_each_missing_embedding(
+      [&](const std::string& key, const std::string& source) {
+        // source 形如 "ns<hash>:<原始消息>"：编码要用**消息部分**，
+        // 与写入时保持一致（带上前缀会让同一个问题算出不同向量）。
+        // 前缀形状是 16 位十六进制 + ':'，按形状识别而不是找第一个冒号——
+        // 无 ns 时 source 就是原文，原文里完全可能有冒号（比如 URL）
+        std::string_view text = source;
+        if (source.size() > 17 && source[16] == ':') {
+          bool hex = true;
+          for (int i = 0; i < 16; ++i) {
+            if (!std::isxdigit(static_cast<unsigned char>(source[i]))) {
+              hex = false;
+              break;
+            }
+          }
+          if (hex) text = std::string_view(source).substr(17);
+        }
+        auto vec = embed_fn_(std::string(text), 5);
+        if (!vec.empty() && store_->set_embedding(key, std::move(vec))) ++encoded;
+      });
+  if (encoded > 0)
+    LOG_INFO("cache: re-encoded {} vectors from source (store_vectors=false)",
+             encoded);
 
   // 1. 锁外构建新索引：建图要对每个条目跑一次 O(ef_construction) 搜索，
   //    整个过程持 mutex_ 会让检索与写入全部阻塞，因此先构建、再交换。
@@ -185,14 +275,34 @@ void CacheEngine::rebuild_index() {
   // 的向量检索会命中旧节点、却取回新问题的答案）。这里取"存活键里 max(N) + 1"，
   // 保证新编号只前进、不与任何存活键冲突。
   int64_t max_id = 0;
+  std::unordered_set<std::string> built_keys;  // 本轮已进索引的 key
   store_->for_each_embedding(
       [&](const std::string& key, const std::vector<float>& emb) {
         int64_t id = 0;
         if (parse_msg_id(key, id) && id > max_id) max_id = id;
         new_idx.add(static_cast<int>(id), key, emb);
+        built_keys.insert(key);
+      });
+  const size_t built = built_keys.size();
+
+  // 2. 补插构建期间新写入的条目。
+  //    建图要跑几十秒到上百秒，这段时间里 cache_reply 因为 index_ready_=false
+  //    而**不写索引**（它写的那个 index_ 马上会被交换掉，写进去等于丢）；
+  //    如果不在这里补，这批条目就是"存储里有、索引里没有"的幽灵向量，
+  //    要等下一轮重建才可能被检索到。启动场景没有写入所以看不出来，
+  //    运行中的重建（幽灵率/过期清理触发）必然会遇到
+  size_t backfilled = 0;
+  store_->for_each_embedding(
+      [&](const std::string& key, const std::vector<float>& emb) {
+        if (built_keys.count(key)) return;
+        int64_t id = 0;
+        if (parse_msg_id(key, id) && id > max_id) max_id = id;
+        new_idx.add(static_cast<int>(id), key, emb);
+        built_keys.insert(key);
+        ++backfilled;
       });
 
-  // 2. 短临界区交换：与 try_hit 的取副本、cache_reply 的 add 互斥
+  // 3. 短临界区交换：与 try_hit 的取副本、cache_reply 的 add 互斥
   //    （日志用的两个值都在临界区内取出，避免锁外读 next_id_ 的竞争）
   size_t vectors = 0;
   int64_t next_id = 0;
@@ -200,11 +310,13 @@ void CacheEngine::rebuild_index() {
     std::lock_guard lock(mutex_);
     index_ = std::move(new_index_ptr);
     next_id_ = std::max(next_id_, max_id + 1);  // 单调不回退
+    indexed_keys_ = std::move(built_keys);      // 交接给索引态，供去重
     vectors = index_->size();
     next_id = next_id_;
   }
 
-  LOG_INFO("cache: index rebuilt, {} vectors, next_id={}", vectors, next_id);
+  LOG_INFO("cache: index rebuilt, {} vectors ({} built + {} backfilled), next_id={}",
+           vectors, built, backfilled, next_id);
 }
 
 size_t CacheEngine::index_size() const {
@@ -227,8 +339,10 @@ void CacheEngine::try_rebuild_if_ghosty() {
   if (rate > 5) {
     LOG_INFO("cache: ghost rate {}% ({}/{}), auto-rebuilding index", rate,
              ghost_count_.load(std::memory_order_relaxed), total);
-    // rebuild_index() 自带 mutex_：这里不能先取锁再调用（同线程递归加锁会死锁）
-    rebuild_index();
+    // 走异步：重建要跑几十秒（万条量级），同步会把 60s 定时器线程占满，
+    // 连带拖住同线程的 purge/save
+    // （rebuild_index() 自带 mutex_：这里不能先取锁再调用，同线程递归加锁会死锁）
+    rebuild_index_async();
     ghost_count_.store(0, std::memory_order_relaxed);
     total_search_.store(0, std::memory_order_relaxed);
   }

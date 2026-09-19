@@ -52,7 +52,9 @@ class TextEncoder {
 
 std::string render_metrics(const Stats& stats, int64_t uptime_seconds,
                            int64_t pool_pending, int64_t pool_active,
-                           int64_t pool_threads, int64_t connections_accepted) {
+                           int64_t pool_threads, int64_t connections_accepted,
+                           int64_t index_ready, int64_t index_building,
+                           int64_t index_vectors, int64_t degraded_searches) {
   const StatsSnapshot s = stats.snapshot();
   TextEncoder e;
 
@@ -140,6 +142,25 @@ std::string render_metrics(const Stats& stats, int64_t uptime_seconds,
   // 缓存"——回填要等下一次同义请求才可能体现为命中
   e.counter("ai_gateway_cache_writes_total", "缓存回填次数（含流式写回）",
             static_cast<double>(s.cache_writes));
+
+  // 向量索引的可用性：异步建图期间 index_ready=0（语义检索退化为精确匹配）。
+  // 这两个状态与命中率直接相关，缺了它们就只能看到"命中率莫名下降"
+  if (index_ready >= 0)
+    e.gauge("ai_gateway_index_ready",
+            "向量索引是否已就绪（1 = 语义检索可用，0 = 后台建图中）",
+            static_cast<double>(index_ready));
+  if (index_building >= 0)
+    e.gauge("ai_gateway_index_building", "是否有后台建图正在进行（1 = 是）",
+            static_cast<double>(index_building));
+  if (index_vectors >= 0)
+    e.gauge("ai_gateway_index_vectors", "当前向量索引中的向量数",
+            static_cast<double>(index_vectors));
+  // 索引不可用时走了暴力扫描降级的查询数：建图窗口内命中率不断崖，靠的就是它。
+  // 没有这个计数，"降级是否在生效"完全不可见
+  if (degraded_searches >= 0)
+    e.counter("ai_gateway_cache_degraded_searches_total",
+              "索引不可用时改用暴力扫描检索的查询数（建图窗口内的降级路径）",
+              static_cast<double>(degraded_searches));
 
   // 本项目没有内存池；线程池队列深度是唯一的"内部资源排队"信号
   if (pool_pending >= 0)

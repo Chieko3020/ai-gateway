@@ -14,6 +14,8 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <functional>
@@ -37,6 +39,10 @@ class CacheEngine {
               std::shared_ptr<LruStore> store,
               std::shared_ptr<HnswIndex> index,
               EmbedFn embed_fn);
+
+  // 析构要回收后台建图线程：若建图仍在进行会**等它跑完**再销毁成员
+  // （detach 会让线程访问已析构的成员，是 UAF）
+  ~CacheEngine();
 
   // 尝试从缓存中获取回复
   // user_message: 用户最新一条消息文本
@@ -69,10 +75,31 @@ class CacheEngine {
     return store_->sse_of(key);
   }
 
-  // 从 LruStore 重建向量索引（缓存恢复后调用）
+  // 从 LruStore 重建向量索引（缓存恢复后调用）——**同步**版本，调用线程会被
+  // 占住整段建图时间。产品路径请用 rebuild_index_async()，本函数保留给
+  // 单测与"确实需要阻塞等待"的场景。
   // 线程安全：函数内部自行加锁，调用方无需（也不得）持 mutex_——
   // 持锁调用会在同一线程递归加锁，直接死锁。
   void rebuild_index();
+
+  // 异步重建：立刻返回，建图在后台线程进行，构建完成后才原子交换。
+  //
+  // 为什么需要它：建图的耗时随规模超线性增长（实测 1 万条 117s，见 TODO L20）。
+  // 同步版本会让"启动"与"运行中重建"都占住调用线程；启动场景下这段时间进程
+  // 还没 listen，客户端连接会被直接拒绝——这就是 L33 的"建索引阻塞窗口"。
+  //
+  // 建图期间 is_index_ready() 为 false，try_hit 退化为精确匹配（语义检索暂时
+  // 不可用，但进程可用）；已有建图在跑时重复调用是**空操作**（不会并发建图）。
+  void rebuild_index_async();
+
+  // 索引是否已就绪。false = 正在后台建图，语义检索暂时不可用
+  bool index_ready() const {
+    return index_ready_.load(std::memory_order_acquire);
+  }
+  // 是否有后台建图正在进行
+  bool index_building() const {
+    return index_building_.load(std::memory_order_acquire);
+  }
 
   // 活动索引中的向量数。
   // 调用方不要再持有构造时传入的索引指针用于观察：rebuild_index() 会把 index_
@@ -92,6 +119,12 @@ class CacheEngine {
     return entity_veto_count_.load(std::memory_order_relaxed);
   }
 
+  // 索引不可用时走了**暴力扫描**降级的查询次数。单列计数：
+  // 建图窗口内命中率不再断崖，靠的就是这条路径，它生效与否必须看得见
+  size_t degraded_searches() const {
+    return degraded_searches_.load(std::memory_order_relaxed);
+  }
+
   // 幽灵向量观测：返回"搜到但取不到"的比例，用于判断是否需要 rebuild_index
   std::pair<int, size_t> ghost_stats() const;
 
@@ -103,6 +136,39 @@ class CacheEngine {
   // 构造时传入的索引构建参数：rebuild_index() 用它重建，
   // 避免重建出来的索引悄悄退回 HnswConfig 的默认值（与首个索引不一致）
   HnswConfig hnsw_cfg_;
+
+  // ---- 异步建图状态 ---------------------------------------------------------
+  // 索引是否已就绪（false = 后台建图中）。用 acquire/release 而不是 relaxed：
+  // 读取方（try_hit / cache_reply）要靠它决定"能不能用 index_"，必须与
+  // rebuild 线程的交换动作建立 happens-before
+  std::atomic<bool> index_ready_{true};
+  std::atomic<bool> index_building_{false};
+  std::thread rebuild_thread_;  // 析构时 join（不能 detach：会访问已销毁成员）
+
+  // 已进入当前索引的 key 集合：建图补插时用来算差集并去重。
+  // 归 mutex_ 保护（cache_reply 全程持锁，rebuild 的赋值在临界区内）
+  std::unordered_set<std::string> indexed_keys_;
+
+  // 真正的重建实现（构建 → 补插 → 交换）。由同步/异步两个入口共用
+  void rebuild_index_impl();
+
+  // 判定用的候选：索引路径与降级扫描路径统一成这一种形态
+  struct Candidate {
+    std::string key;
+    float similarity = 0.0f;
+  };
+
+  // 从候选集判定命中：阈值 → 命名空间 → 实体一致性否决 → 取回复。
+  // **两条路径共用**（HNSW 检索 / 索引不可用时的暴力扫描）：判定必须逐字一致，
+  // 否则会出现"索引正常时命中、降级时命中不了"这类最难查的漂移
+  // count_ghosts：只有索引路径计"搜到但取不到"（暴力扫描没有幽灵问题）
+  HitResult judge_candidates(const std::vector<Candidate>& candidates,
+                             const std::string& ns,
+                             const std::string& user_message,
+                             bool count_ghosts) const;
+
+  // 走了降级扫描的查询次数（见 degraded_searches()）
+  std::atomic<size_t> degraded_searches_{0};
   std::shared_ptr<LruStore> store_;
 
   // 索引由本引擎独占持有（调用方不应继续持有同一个 shared_ptr 用于观察）。
@@ -122,12 +188,13 @@ class CacheEngine {
   // 保护 next_id_ + HNSW add/search 并发（LruStore 自有锁）
   mutable std::mutex mutex_;
 
-  // 幽灵向量观测计数器：try_hit() 在 mutex_ 之外自增（原实现是裸 size_t，
+  // 幽灵向量观测计数器：try_hit()/judge_candidates() 在 mutex_ 之外自增
+  // （mutable：判定函数是 const，但观测计数本就该能改）（原实现是裸 size_t，
   // 与 ghost_stats()/try_rebuild_if_ghosty() 的读取构成数据竞争），故用原子量
-  std::atomic<size_t> ghost_count_{0};
-  std::atomic<size_t> total_search_{0};
+  mutable std::atomic<size_t> ghost_count_{0};
+  mutable std::atomic<size_t> total_search_{0};
   // 实体否决计数：同样是锁外自增的热路径计数器，用原子量
-  std::atomic<size_t> entity_veto_count_{0};
+  mutable std::atomic<size_t> entity_veto_count_{0};
 };
 
 }  // namespace ai_gateway

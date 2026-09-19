@@ -12,6 +12,8 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <cmath>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -147,6 +149,13 @@ int main() {
     // 幽灵率 100% > 5% 且样本 >= 10 -> 自动重建
     // （rebuild_index() 自带锁，这里若持锁调用会死锁，本用例即该回归）
     engine.try_rebuild_if_ghosty();
+    // 重建已改为**异步**（建图耗时随规模超线性增长，万条量级上百秒，同步会把
+    // 启动与 60s 定时器线程都占住）。因此这里必须等后台建图结束再断言：
+    // 调用返回时 index_size() 仍是旧索引的值
+    for (int i = 0; i < 1000 && engine.index_building(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(!engine.index_building()); ok++;
+    CHECK(engine.index_ready()); ok++;
     CHECK(engine.index_size() == 0); ok++;  // 重建后索引与已清空的 store 一致
     CHECK(engine.ghost_stats().second == 0); ok++;  // 计数已清零
   }
@@ -332,6 +341,89 @@ int main() {
       CHECK(hit4.reply == "B-dma"); ok++;  // 命中实体一致的那条，而不是先到的 A
       CHECK(engine.entity_veto_count() >= 1); ok++;
     }
+  }
+
+  // ── 异步建图：建图期间写入的条目必须被补插进新索引 ────────────────────
+  //
+  // 判别力（两种错误实现都会让下面的断言变红）：
+  //   ① 去掉 rebuild_index_impl() 的补插循环 → "midpoint505" 只在 store 里、
+  //      不在新索引里，交换后语义检索找不到它（幽灵向量），要等下一轮重建；
+  //   ② 去掉 cache_reply() 里的 index_ready_ 判断（照常写"当前"索引）→
+  //      写进的是马上要被交换掉的旧索引，交换后同样丢失。
+  //
+  // 两点数据设计上的取舍（都是实测踩出来的）：
+  //   ① 不用本文件其它用例的 one-hot（vec_of_text）：任意两条不同条目互相正交、
+  //      距离只有 0/1 两档，部分节点连自己都检索不到；
+  //   ② 用 **64 维**而不是 512 维：512 维随机向量有"集中现象"——归一化后任意
+  //      两向量内积集中在 0 附近、点与点近似等距，启发式邻居选择无法剪枝，
+  //      建图退化成接近全扫描（实测 3000 条 512 维要 41s，而 1000 条均匀随机
+  //      向量的基准只要 1.2s）。降到 64 维后距离计算快 8 倍且集中现象明显减轻。
+  // 本用例测的是"补插有没有发生"，与特征维度无关。
+  {
+    constexpr int kCaseDim = 64;
+    auto rand_embed = [](const std::string& text, int) {
+      std::seed_seq seed(text.begin(), text.end());
+      std::mt19937 rng(seed);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      std::vector<float> v(kCaseDim);
+      float norm = 0.0f;
+      for (auto& x : v) {
+        x = nd(rng);
+        norm += x * x;
+      }
+      norm = std::sqrt(norm);
+      for (auto& x : v) x /= norm;
+      return v;
+    };
+
+    auto lru = std::make_shared<LruStore>(8000, 0);  // 永不过期
+    CacheEngine engine(ec, cc, lru,
+                       std::make_shared<HnswIndex>(
+                           HnswConfig{kCaseDim, 16, 100, 50}),
+                       rand_embed);
+    // 存量条目要足够多，让建图耗时明显长于"第一次遍历"（几百毫秒 vs 几毫秒），
+    // 这样把写入排在 300ms 之后就是**确定性**地落在"遍历已结束、建图仍在进行"
+    // 的窗口里——否则建图太快，写入时它已经完成，补插路径根本不会执行
+    // （实测：500 条随机向量建图 <300ms，日志是 500 built + 0 backfilled）
+    for (int i = 0; i < 1500; ++i) {
+      const std::string q = "seed" + std::to_string(i);
+      engine.cache_reply(q, "answer-seed", rand_embed(q, 5), "");
+    }
+    CHECK(engine.index_size() == 1500); ok++;
+    CHECK(engine.index_ready()); ok++;
+
+    engine.rebuild_index_async();
+    // 先睡一下再写入：让"第一次遍历 store"必然结束。那次遍历只是内存拷贝
+    // （几百条 <1ms），而真正的建图要数秒；不这样排，写入会撞进遍历里被当成
+    // "存量条目"收进新索引，补插路径根本不会被执行（实测踩过：写成
+    // "async 之后立刻写入"时日志是 500 built + 0 backfilled）
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    const std::string mid_q = "midpoint505";
+    engine.cache_reply(mid_q, "answer-mid", rand_embed(mid_q, 5), "");
+    CHECK(!engine.index_ready()); ok++;  // 仍在建图
+
+    // ★ 建图期间的服务不中断：索引不可用时退化为**暴力扫描**（而不是放弃语义检索），
+    //   判定走同一个 judge_candidates，所以命中行为与索引正常时一致。
+    //   判别力：把 try_hit 的降级分支改回"只做 get_exact"或直接返回 miss，
+    //   这里要么 miss、要么 degraded_searches() 不增长
+    auto during_hit = engine.try_hit("seed7", "");
+    CHECK(during_hit.hit); ok++;
+    CHECK(during_hit.reply == "answer-seed"); ok++;
+    CHECK(!engine.index_ready()); ok++;           // 此刻仍在校建图
+    CHECK(engine.degraded_searches() > 0); ok++;  // ★ 确认走的是降级扫描路径
+
+    for (int i = 0; i < 30000 && engine.index_building(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(!engine.index_building()); ok++;
+    CHECK(engine.index_ready()); ok++;
+
+    // ★ 关键断言：建图期间写入的条目必须进了新索引（靠补插）
+    CHECK(engine.index_size() >= 1501); ok++;
+    auto mid_hit = engine.try_hit(mid_q, "");
+    CHECK(mid_hit.hit); ok++;
+    CHECK(mid_hit.reply == "answer-mid"); ok++;
+    // 存量条目也必须在（补插不能漏掉原有条目）
+    CHECK(engine.try_hit("seed7", "").hit); ok++;
   }
 
   return test_check::finish("test_cache_engine", ok);

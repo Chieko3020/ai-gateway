@@ -288,6 +288,8 @@ class HnswIndex {
     return std::sqrt(sum);
   }
 
+ public:
+  // 余弦相似度：HNSW 检索与 LruStore 的降级扫描共用同一套定义
   static float cosine(const std::vector<float>& a, const std::vector<float>& b) {
     float dot = 0.0f, na = 0.0f, nb = 0.0f;
     for (size_t i = 0; i < a.size(); ++i) {

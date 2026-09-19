@@ -100,6 +100,8 @@ int main(int argc, char* argv[]) {
   }
   const int64_t ttl_seconds = static_cast<int64_t>(cfg.cache.ttl_days) * 86400;
   auto lru = std::make_shared<LruStore>(cfg.cache.max_entries, ttl_seconds);
+  // 是否把向量一并落盘（false = 只存文本，启动时按 source 重算）
+  lru->set_store_vectors(cfg.cache.store_vectors);
 
   // 本地 ONNX 嵌入推理：模型路径与维度来自 embedding 配置段（不再硬编码，
   // 否则示例里的模型名永远不会生效，报告 M15）
@@ -193,17 +195,20 @@ int main(int argc, char* argv[]) {
     }
     // 加载后立即清理过期条目：落盘时仍有效、此后超过 TTL 的条目不应继续占用内存与索引
     size_t purged_on_load = lru->purge_expired();
-    // 索引由 LruStore 重建，无需独立加载;
-    engine->rebuild_index();
+    // 索引由 LruStore 重建，无需独立加载。
+    // 走**异步**：建图耗时随规模超线性增长（万条量级实测 117s），同步版本会把
+    // "缓存加载完"到"开始 listen"之间撑成一段进程完全不可用的窗口——客户端
+    // 连接被直接拒绝。异步之后启动即可服务，建图期间语义检索退化为精确匹配
+    engine->rebuild_index_async();
     if (lru->size() == 0) {
       LOG_INFO("cache restored: 0 entries (缓存为空或条目均已超过 ttl_days={})",
                cfg.cache.ttl_days);
     } else {
-      LOG_INFO("cache restored: {} entries, {} vectors{}", lru->size(),
-               engine->index_size(),
-               purged_on_load > 0
-                   ? std::format(", {} expired purged", purged_on_load)
-                   : "");
+      LOG_INFO(
+          "cache restored: {} entries{}（索引后台构建中，期间仅精确匹配可用）",
+          lru->size(),
+          purged_on_load > 0 ? std::format(", {} expired purged", purged_on_load)
+                             : "");
     }
   }
 
@@ -232,8 +237,9 @@ int main(int argc, char* argv[]) {
       if (cfg.cache.enabled) {
         size_t purged = lru->purge_expired();
         if (purged > 0) {
-          // HNSW 无删除接口：清理后重建索引，保持索引与 LruStore 一致
-          engine->rebuild_index();
+          // HNSW 无删除接口：清理后重建索引，保持索引与 LruStore 一致。
+          // 异步版本：重建期间旧索引仍在服务（try_hit 拿的是副本）
+          engine->rebuild_index_async();
           LOG_INFO("cache: purged {} expired entries, {} remaining", purged,
                    lru->size());
         }
@@ -292,7 +298,7 @@ int main(int argc, char* argv[]) {
   //   - 不读 active_connections()：conns_ 由 reactor 线程独占，worker 里读是数据竞争
   const auto process_start = std::chrono::steady_clock::now();
   server.add_route("GET", "/metrics",
-                   [stats, &server, process_start](const std::string&,
+                   [stats, &server, process_start, engine](const std::string&,
                                                    ResponseWriter&,
                                                    HttpRequestInfo&) {
                      auto uptime =
@@ -304,7 +310,14 @@ int main(int argc, char* argv[]) {
                          static_cast<int64_t>(server.pending_tasks()),
                          static_cast<int64_t>(server.active_tasks()),
                          static_cast<int64_t>(server.worker_threads()),
-                         static_cast<int64_t>(server.accepted_connections()));
+                         static_cast<int64_t>(server.accepted_connections()),
+                         // 索引状态：异步建图期间 ready=0、building=1，
+                         // 此时语义检索退化为精确匹配（命中率会明显下降）
+                         engine ? static_cast<int64_t>(engine->index_ready()) : -1,
+                         engine ? static_cast<int64_t>(engine->index_building()) : -1,
+                         engine ? static_cast<int64_t>(engine->index_size()) : -1,
+                         engine ? static_cast<int64_t>(engine->degraded_searches())
+                                : -1);
                      return HttpReply{200, kMetricsContentType, std::move(body)};
                    });
 
