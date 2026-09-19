@@ -75,6 +75,12 @@ std::string MessageFilter::sse_feed(SseFilterState& st, std::string_view chunk,
                                     bool final_chunk) const {
   std::string out;
   if (st.rejected) return out;  // 已判定拒绝：后续字节一律不放行
+  // 已达输出上限：粘性终止（理由见下方触发点）。这里必须与 rejected 同样"一票
+  // 否决后续所有字节"，否则下一个 chunk 又会被放行
+  if (st.truncated) {
+    st.pending.clear();
+    return out;
+  }
 
   st.pending.append(chunk);
 
@@ -130,8 +136,17 @@ std::string MessageFilter::sse_feed(SseFilterState& st, std::string_view chunk,
     // 输出长度上限：按事件整体丢弃后续事件（截断），保持事件边界完整
     if (config_.max_output_chars > 0 &&
         st.accepted_bytes >= static_cast<size_t>(config_.max_output_chars)) {
+      // 上限在事件边界上生效，且必须**粘性**：旧实现这里只 return 一次，
+      // 于是下一个 chunk 又从"处理它的第一个完整事件"开始放行，造成两个后果——
+      //   1) 输出上限形同虚设：每个后续 chunk 仍然泄漏一个事件；
+      //   2) 同一 chunk 里跟在这条事件后面的字节被 pending.clear() 吞掉，而真实
+      //      上游的终止事件 `data: [DONE]` 正是这样丢的 —— 客户端拿到一条永不
+      //      结束的流（keep-alive 下连接不关，SDK 只能挂到超时）。
+      // 2026-09 真上游复测实测：max_output_chars=4000 时客户端只收到 31,287/91,293
+      // 字节且没有 [DONE]；置 0 后字节数与上游完全相等且 [DONE] 齐全。
       st.truncated = true;
       st.pending.clear();
+      out += kSseDoneEvent;  // 截断也要给客户端一个明确的流结束标志
       return out;
     }
   }

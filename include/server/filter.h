@@ -21,6 +21,12 @@ struct FilterResult {
   std::string reject_msg;  // 拒绝原因
 };
 
+// 截断一条 SSE 流时补发的终止事件。
+// 与上游自己发的终止事件同名同形：客户端（含 OpenAI 兼容 SDK）只认这一个流结束
+// 标志，截断若只把后续字节丢掉而不补它，客户端会一直等下去（keep-alive 下连接
+// 不会关，只能等读超时）。2026-09 的真上游复测正是靠它发现"截断吞掉 [DONE]"的
+inline constexpr std::string_view kSseDoneEvent = "data: [DONE]\n\n";
+
 class MessageFilter {
  public:
   explicit MessageFilter(const FilterConfig& config);

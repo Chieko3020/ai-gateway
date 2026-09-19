@@ -184,6 +184,51 @@ int main() {
       CHECK(out == in);
       ok++;
     }
+
+    // 1.6 输出截断（max_output_chars > 0）：上限必须**粘性**，且截断要补发终止事件。
+    //     旧实现的两处缺陷：① 触发上限后每个后续 chunk 仍会泄漏它的第一个事件
+    //     （上限形同虚设）；② 同一 chunk 里跟在这条事件后面的字节被 pending.clear()
+    //     吞掉，真实上游的 `data: [DONE]` 正是这样丢的 —— 客户端拿到一条永不结束
+    //     的流（keep-alive 下连接不关，只能等读超时）。
+    {
+      auto count_of = [](const std::string& s, std::string_view sub) {
+        size_t n = 0, pos = 0;
+        while ((pos = s.find(sub, pos)) != std::string::npos) {
+          ++n;
+          pos += sub.size();
+        }
+        return n;
+      };
+
+      FilterConfig fc;
+      fc.max_output_chars = 40;  // 每条事件 25 字节，第二条后越界
+      MessageFilter trunc(fc);
+      MessageFilter::SseFilterState st;
+      std::string e1 = sse_event(R"({"delta":"aaaa"})");
+      std::string e2 = sse_event(R"({"delta":"bbbb"})");
+      std::string e3 = std::string(kSseDoneEvent);  // 上游自己的终止事件
+      std::string out = trunc.sse_feed(st, e1 + e2 + e3, false);
+
+      CHECK(st.truncated);
+      ok++;
+      CHECK(out.find("aaaa") != std::string::npos);  // 上限内的事件照常放行
+      ok++;
+      CHECK(out.find("bbbb") != std::string::npos);  // 触发上限的那条也放行
+      ok++;
+      CHECK(out.ends_with(std::string(kSseDoneEvent)));  // 必须补发流结束标志
+      ok++;
+      // 上游那个 [DONE] 与补发的那个不能都出现（客户端只应看到一次流结束）
+      CHECK(count_of(out, kSseDoneEvent) == 1);
+      ok++;
+
+      // 粘性：已达上限后后续 chunk 一个字节都不放行（旧实现这里会漏出 e4）
+      std::string out2 = trunc.sse_feed(st, sse_event(R"({"delta":"dddd"})"), false);
+      CHECK(out2.empty());
+      ok++;
+      std::string out3 = trunc.sse_feed(st, {}, /*final_chunk=*/true);
+      CHECK(out3.empty());
+      ok++;
+    }
   }
 
   // ── 2. ResponseWriter 的流式分帧 ─────────────────────────────────────
