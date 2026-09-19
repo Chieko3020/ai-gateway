@@ -274,9 +274,32 @@ else
 fi
 echo "$SILENT_BODY" | grep -q '\[DONE\]' && bad "静默流仍收到 [DONE]（不该完整结束）" \
   || ok "静默流未收到 [DONE]（符合'中停'预期）"
-grep -o 'stream: aborted.*' "$LOG" | tail -2 | sed 's/^/        /'
-grep -q 'write idle timeout' "$LOG" && ok "日志给出的原因是 'write idle timeout'" \
-  || info "日志里没有 'write idle timeout' 字样（见上面 aborted 行）"
+# ---- 归因断言（本轮修复：此处原来是 info，属于**假覆盖**） ----
+# 此前这一行写成 info，于是"日志给出 idle 原因"这条断言从未真正生效：修复前
+# SsePassthroughSink 用 `(void)reason` 丢掉了 StreamAbortReason，日志变成
+# "stream: done ... done_event=no keep_alive=yes"（不打 WARN、不计 aborted、
+# 还把超时值算进 TTFT 样本池）——而脚本照样打印一行 info 看起来"通过"。
+ABORT_LINE="$(grep -aE 'stream: aborted' "$LOG" | tail -1)"
+if [[ -n "$ABORT_LINE" ]]; then
+  info "中止日志：${ABORT_LINE}"
+  ok "日志给出 WARN 级中止记录（stream: aborted）"
+else
+  bad "日志里没有 'stream: aborted'（中止被当成正常完成）"
+fi
+echo "$ABORT_LINE" | grep -q 'upstream idle timeout' \
+  && ok "中止原因归因到上游空闲（upstream idle timeout）" \
+  || bad "中止原因未归因到上游空闲：${ABORT_LINE:-<无>}"
+grep -aq 'stream: done .*done_event=no' "$LOG" \
+  && bad "出现了 'stream: done ... done_event=no' 的正常完成日志（归因丢失）" \
+  || ok "没有把中止打成正常完成（无 done_event=no 的 done 行）"
+# TTFT 样本池不得被中止样本污染：A 段 1 条 + B 段 1 条正常流，C 段的中止流不计
+BSAMP="$(curl -sS "http://127.0.0.1:${GW_PORT}/metrics" 2>/dev/null \
+  | awk '/^ai_gateway_bypass_latency_samples/ {print $2}' | head -1)"
+if [[ -n "$BSAMP" ]]; then
+  info "TTFT/旁路样本数=${BSAMP}"
+  [[ "${BSAMP:-0}" -le 2 ]] && ok "中止流没有进入 TTFT 样本池（样本数=${BSAMP} ≤ 2）" \
+    || bad "中止流污染了 TTFT 样本池（样本数=${BSAMP} > 2）"
+fi
 
 # ---------------------------------------------------------------------------
 echo
