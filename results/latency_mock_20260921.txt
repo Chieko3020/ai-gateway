@@ -1,0 +1,11 @@
+# 延迟测量（mock 上游，量化网关自身处理开销）
+# 日期: 2026-09-21T03:51  环境: 2 vCPU / 1967MB, 同机环回, keep-alive 连接复用
+# 装置: build-retest/src/ai-gateway，缓存已灌满 10000 条（见 memory_20260921_base64.txt），
+#       mock 上游 scripts/mock_sse_upstream.py（本地 :45999），不触网
+# 脚本: scripts/latency_bench.py --port 4100 --n 200
+命中（同一问题，精确命中）: n=200 min=6.4 p50=6.7 p95=7.9 p99=8.9 max=8.9 avg=6.9 (ms)  _cache={'hit': 200}
+未命中（互不相同，回源+写缓存）: n=200 min=6.5 p50=7.7 p95=49.0 p99=50.1 max=50.5 avg=17.5 (ms)  _cache={'miss': 200}
+
+# 读法：命中路径 = 进程内向量化 + HNSW 检索 + 输出过滤（不含上游）；
+#       未命中路径 = 上述 + 本地 mock 上游往返 + 写缓存。p95 明显高于 p50 说明
+#       少数请求会撞上分配/淘汰抖动（满缓存时更明显）。

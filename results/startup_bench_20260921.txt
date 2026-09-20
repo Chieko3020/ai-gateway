@@ -1,30 +1,39 @@
-=== 启动耗时实测：「加载 10000 条缓存（31 MB）到可接受连接」 ===
-分支: main
-时间: 2026-09-21T01:39+08:00
-环境: 2 vCPU / Intel(R) Xeon(R) Gold 6148 CPU @ 2.40GHz × 2 / 1968 MB / Linux 6.8.0-90-generic
-环境-构建: cmake -DCMAKE_BUILD_TYPE=Release（build-parity）
-环境-binary: build-parity/src/ai-gateway（1,099,152 B）
-装置: 本机回环；上游用 scripts/mock_sse_upstream.py（端口 39801），不触网
-方法:
-  1) scripts/fill_cache_bench.py 灌入 10000 条（每条 user 消息不同 ⇒ 必 miss ⇒ 必写缓存），
-     SIGTERM 优雅停机触发落盘 → cache/lru_store.json = 31,416,805 B（31.4 MB）
-  2) 重启进程 ×5，从 exec 到「TCP 可接受连接」计时（curl 轮询、接受任意 HTTP 状态码）
+# 启动耗时实测：「加载 10000 条缓存到可接受连接」
+# 分支: main
+# 时间: 2026-09-21T03:51:41+08:00
+# 环境: 2 vCPU / 1967 MB / 6.8.0-90-generic
+# 环境-binary: build-retest/src/ai-gateway（1099152 B）
+# 装置: 本机回环；上游用 scripts/mock_sse_upstream.py（端口 45999），不触网
+# 方法: 灌入 10000 条后 SIGTERM 优雅停机触发落盘 → 重启 ×5，从 exec 到「TCP 可接受连接」计时
 ---
 灌缓存阶段:
-  REQUESTS 10000  ERRORS 0
-  稳态 RSS 178.5 MB / PEAK_MB 224.2
-  （与 results/memory_20260920_base64.txt 的 178.0 / 230.1 一致，互为旁证）
-  落盘 31,416,805 B（与 README 的「31 MB」一致）
+  92.5	5000	124.2	STEADY_MARK
+  185.3	10000	178.9	STEADY_MARK
+  275.3	-	179.1	final
+  PEAK_MB 223.9
+  REQUESTS 10000 ERRORS 0
+  落盘 31415709 B（定时落盘时 31416805 B）
 
 启动计时（5 轮，单位秒）:
-  轮次 1: 0.6427
-  轮次 2: 0.5744
-  轮次 3: 0.5967
-  轮次 4: 0.5746
-  轮次 5: 0.6624
-  中位数 0.597 s；范围 0.574–0.662 s
----
-结论: 「加载 10000 条（31 MB）到可接受连接」实测 **约 0.60 s（中位 0.597 s）**。
-      README 原先写的 0.70 s 在量级上成立但偏高，现已按本次实测更新。
-说明: 该耗时只测到「可接受连接」；语义检索可用还需叠加后台建图（约 7 s，见 README）。
-      本轮灌缓存同时是 README 内存数据（178.0 MB / 230.1 MB）的独立复现。
+  轮次 1: 0.5769
+  [建图窗口内] # HELP ai_gateway_index_ready 向量索引是否已就绪（1 = 语义检索可用，0 = 后台建图中） # TYPE ai_gateway_index_ready gauge ai_gateway_index_ready 0 # HELP ai_gateway_index_building 是否有后台建图正在进行（1 = 是） # TYPE ai_gateway_index_building gauge ai_gateway_index_building 1 # HELP ai_gateway_index_vectors 当前向量索引中的向量数 # TYPE ai_gateway_index_vectors gauge ai_gateway_index_vectors 0 
+  命中延迟 n=50 p50=15.2ms p95=19.3ms
+  轮次 2: 0.6588
+  轮次 3: 0.5752
+  轮次 4: 0.6844
+  轮次 5: 0.5754
+
+建图完成后对照:
+  [索引状态] # HELP ai_gateway_index_ready 向量索引是否已就绪（1 = 语义检索可用，0 = 后台建图中） # TYPE ai_gateway_index_ready gauge ai_gateway_index_ready 1 # HELP ai_gateway_index_building 是否有后台建图正在进行（1 = 是） # TYPE ai_gateway_index_building gauge ai_gateway_index_building 0 # HELP ai_gateway_index_vectors 当前向量索引中的向量数 # TYPE ai_gateway_index_vectors gauge ai_gateway_index_vectors 10000 # HELP ai_gateway_cache_degraded_searches_total 索引不可用时改用暴力扫描检索的查询数（建图窗口内的降级路径） # TYPE ai_gateway_cache_degraded_searches_total counter ai_gateway_cache_degraded_searches_total 0 
+  命中延迟 n=50 p50=6.7ms p95=8.0ms
+  ai_gateway_requests_total 50
+  ai_gateway_cache_hits_total 49
+  ai_gateway_cache_misses_total 1
+  ai_gateway_latency_avg_milliseconds 6
+  ai_gateway_latency_min_milliseconds 6
+  ai_gateway_latency_max_milliseconds 8
+  ai_gateway_latency_milliseconds{quantile="0.5"} 6
+  ai_gateway_latency_milliseconds{quantile="0.95"} 7
+  ai_gateway_latency_milliseconds{quantile="0.99"} 7
+  ai_gateway_latency_samples 50
+# 结束 2026-09-21T03:52:30+08:00
