@@ -3,7 +3,11 @@
 // 参考论文: Malkov // 参考: Malkov & Yashunin (2018) Yashunin (2018)
 // 构建参数: M=16, ef_construction=100, ef_search=50
 // 复杂度: 搜索 O(log N), 构建 O(N log N)
-// 精度: 10K 512d ≈ 99% recall vs 暴力搜索
+// 精度（实测口径见 tests/recall_bench 与 results/index_bench_20260920.txt）:
+//   自检索 top-1 = 100%（真实集 320 条 320/320；合成 1000/5000/10000 亦均 100%）
+//   top-3 召回 = 99.7% / 93.8% / 81.7%（规模增大时束搜索覆盖不足，属 HNSW 固有特性；
+//     缓存只取 top-1，故不影响命中）
+//   加速比 vs 暴力检索 = 1.17x / 2.73x / 4.70x（另真实集 320 为 1.31x）
 
 #pragma once
 

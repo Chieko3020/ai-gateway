@@ -196,16 +196,16 @@ int main(int argc, char* argv[]) {
     // 加载后立即清理过期条目：落盘时仍有效、此后超过 TTL 的条目不应继续占用内存与索引
     size_t purged_on_load = lru->purge_expired();
     // 索引由 LruStore 重建，无需独立加载。
-    // 走**异步**：建图耗时随规模超线性增长（万条量级实测 117s），同步版本会把
+    // 走**异步**：建图耗时随规模超线性增长（1 万条随机向量实测 117s、真实 embedding 约 7s），同步版本会把
     // "缓存加载完"到"开始 listen"之间撑成一段进程完全不可用的窗口——客户端
-    // 连接被直接拒绝。异步之后启动即可服务，建图期间语义检索退化为精确匹配
+    // 连接被直接拒绝。异步之后启动即可服务，建图期间语义检索退化为**线性扫描**
     engine->rebuild_index_async();
     if (lru->size() == 0) {
       LOG_INFO("cache restored: 0 entries (缓存为空或条目均已超过 ttl_days={})",
                cfg.cache.ttl_days);
     } else {
       LOG_INFO(
-          "cache restored: {} entries{}（索引后台构建中，期间仅精确匹配可用）",
+          "cache restored: {} entries{}（索引后台构建中，语义检索暂降级为线性扫描）",
           lru->size(),
           purged_on_load > 0 ? std::format(", {} expired purged", purged_on_load)
                              : "");
@@ -336,10 +336,10 @@ int main(int argc, char* argv[]) {
   //      （写缓存 + 记统计）根本不会执行 —— 客户端侧表现为连接被掐断
   //      （curl 52 Empty reply）、缓存与统计漏记；
   //   3) 之后才唤醒并 join bg_thread、输出统计、最终落盘。
-  // 第五轮"新增 drain() 排空在途请求后再统计落盘"的说法在文档里成立、在 main 里
-  // 不成立：那段修复只写了 drain() 的实现与单测，生产入口从未接线（grep 只命中
-  // 定义与 tests/）。这正是 ops-incident-log 第 13 条那类缺陷：接口支持了、调用方
-  // 忘了用。本次把它接上，并由 scripts/integration_pipeline_test.sh 的 A 段
+  // 第五轮"新增 drain() 排空在途请求后再统计落盘"曾只在文档与单测里成立、生产入口
+  // 没有接线（ops-incident-log 第 13 条那类缺陷：接口支持了、调用方忘了用）。
+  // e757b62 已把它接上——就是下面这行 server.drain()，并由
+  // scripts/integration_pipeline_test.sh 的 A 段
   // （真实二进制 + 在途请求 + SIGTERM）守着——回退这一行该用例必须失败。
   server.drain();
 

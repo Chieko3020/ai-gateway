@@ -84,12 +84,15 @@ class CacheEngine {
 
   // 异步重建：立刻返回，建图在后台线程进行，构建完成后才原子交换。
   //
-  // 为什么需要它：建图的耗时随规模超线性增长（实测 1 万条 117s，见 TODO L20）。
+  // 为什么需要它：建图的耗时随规模超线性增长（512 维**随机向量** 1 万条实测 117s；
+  // 真实 embedding 1 万条约 7s——评估建图性能必须用带簇结构的数据，见 README 实测性能章）。
   // 同步版本会让"启动"与"运行中重建"都占住调用线程；启动场景下这段时间进程
   // 还没 listen，客户端连接会被直接拒绝——这就是 L33 的"建索引阻塞窗口"。
   //
-  // 建图期间 is_index_ready() 为 false，try_hit 退化为精确匹配（语义检索暂时
-  // 不可用，但进程可用）；已有建图在跑时重复调用是**空操作**（不会并发建图）。
+  // 建图期间 is_index_ready() 为 false，try_hit 退化为**线性扫描**
+  // （LruStore::scan_topk + judge_candidates，见 cache_engine.cpp:61-89）；
+  // 只有 embedding 不可用时才退化为精确匹配。
+  // 已有建图在跑时重复调用是**空操作**（不会并发建图）。
   void rebuild_index_async();
 
   // 索引是否已就绪。false = 正在后台建图，语义检索暂时不可用
@@ -145,8 +148,9 @@ class CacheEngine {
   std::atomic<bool> index_building_{false};
   std::thread rebuild_thread_;  // 析构时 join（不能 detach：会访问已销毁成员）
 
-  // 已进入当前索引的 key 集合：建图补插时用来算差集并去重。
-  // 归 mutex_ 保护（cache_reply 全程持锁，rebuild 的赋值在临界区内）
+  // ⚠️ 死成员（注释与实现不符，待清理）：建图补插实际用的是 rebuild_index_impl()
+  // 的**局部** built_keys；本成员只写不读（写点 cache_engine.cpp:200/314，全仓无读取点）。
+  // 已知副作用：第二次 for_each_embedding 快照（:296）到取锁（:311）之间写入的条目仍会漏索引。
   std::unordered_set<std::string> indexed_keys_;
 
   // 真正的重建实现（构建 → 补插 → 交换）。由同步/异步两个入口共用
