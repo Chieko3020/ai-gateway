@@ -1,0 +1,30 @@
+=== 启动耗时实测：「加载 10000 条缓存（31 MB）到可接受连接」 ===
+分支: main
+时间: 2026-09-21T01:39+08:00
+环境: 2 vCPU / Intel(R) Xeon(R) Gold 6148 CPU @ 2.40GHz × 2 / 1968 MB / Linux 6.8.0-90-generic
+环境-构建: cmake -DCMAKE_BUILD_TYPE=Release（build-parity）
+环境-binary: build-parity/src/ai-gateway（1,099,152 B）
+装置: 本机回环；上游用 scripts/mock_sse_upstream.py（端口 39801），不触网
+方法:
+  1) scripts/fill_cache_bench.py 灌入 10000 条（每条 user 消息不同 ⇒ 必 miss ⇒ 必写缓存），
+     SIGTERM 优雅停机触发落盘 → cache/lru_store.json = 31,416,805 B（31.4 MB）
+  2) 重启进程 ×5，从 exec 到「TCP 可接受连接」计时（curl 轮询、接受任意 HTTP 状态码）
+---
+灌缓存阶段:
+  REQUESTS 10000  ERRORS 0
+  稳态 RSS 178.5 MB / PEAK_MB 224.2
+  （与 results/memory_20260920_base64.txt 的 178.0 / 230.1 一致，互为旁证）
+  落盘 31,416,805 B（与 README 的「31 MB」一致）
+
+启动计时（5 轮，单位秒）:
+  轮次 1: 0.6427
+  轮次 2: 0.5744
+  轮次 3: 0.5967
+  轮次 4: 0.5746
+  轮次 5: 0.6624
+  中位数 0.597 s；范围 0.574–0.662 s
+---
+结论: 「加载 10000 条（31 MB）到可接受连接」实测 **约 0.60 s（中位 0.597 s）**。
+      README 原先写的 0.70 s 在量级上成立但偏高，现已按本次实测更新。
+说明: 该耗时只测到「可接受连接」；语义检索可用还需叠加后台建图（约 7 s，见 README）。
+      本轮灌缓存同时是 README 内存数据（178.0 MB / 230.1 MB）的独立复现。
