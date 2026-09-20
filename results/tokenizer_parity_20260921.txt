@@ -1,0 +1,21 @@
+=== 分词器一致性对照：本实现 vs HuggingFace 官方 BertTokenizer ===
+分支: main
+时间: 2026-09-21T01:27:46+08:00
+环境-CPU: Intel(R) Xeon(R) Gold 6148 CPU @ 2.40GHz × 2
+环境-python: Python 3.12.3
+环境-transformers: 4.57.6
+环境-词表: model/vocab.txt（21128 条）
+环境-被测二进制: build-parity/tests/test_tokenizer（Release）
+命令: /tmp/parity-venv/bin/python3 scripts/tokenizer_parity.py --vocab model/vocab.txt --dump-bin build-parity/tests/test_tokenizer
+说明: 官方侧为 transformers 的 BertTokenizer（slow），样本 = 仓库压测数据集 412 条 + 300 条定种子随机串，去重后 711 条
+---
+样本合计 711 条（数据集 412 + 随机 300，去重后）
+
+[do_lower_case=false（官方默认）] 样本 711 条，一致 711 条 （100.00%），不一致 0 条
+
+[do_lower_case=true] 样本 711 条，一致 711 条 （100.00%），不一致 0 条
+
+合计不一致：0 条
+---
+结论: token 序列与官方实现逐条一致（不一致 0 条），do_lower_case 两种设置下均成立。
+备注: 仍存差异为 lowercase 只做 ASCII、未做 NFD/strip_accents（见 research/profile/factcheck_tokenizer.md）；本对照使用的样本不含需要 Unicode 小写的极端样例。
